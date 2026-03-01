@@ -135,6 +135,8 @@ def main():
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cuda', 'mps', 'cpu'],
                         help='Device to use (default: auto-detect)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Resume from checkpoint path')
     args = parser.parse_args()
 
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -206,6 +208,11 @@ def main():
         lambda_=0.95,
         horizon=15,
     )
+
+    # Resume from checkpoint if specified
+    if args.resume:
+        print(f"📂 Resuming from: {args.resume}")
+        agent.load(args.resume)
 
     print("\n" + "="*60)
     print("PHASE 1: Prefill Replay Buffer (Random Exploration)")
