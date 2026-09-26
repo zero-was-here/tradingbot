@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aurum"
+version = "2.0.0"
+description = "Institutional-style systematic trading research and execution stack for XAUUSD (spot gold)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "scipy>=1.11",
+    "scikit-learn>=1.4",
+    "pyyaml>=6.0",
+    "pyarrow>=14",
+    "matplotlib>=3.8",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+data = ["yfinance>=0.2.40"]
+rl = ["torch>=2.2", "gymnasium>=0.29", "stable-baselines3>=2.3"]
+agents = ["anthropic>=1.0"]
+mt5 = ["MetaTrader5>=5.0.45; platform_system == 'Windows'"]
+dev = ["pytest>=8", "ruff>=0.5"]
+all = ["aurum[data,rl,agents,dev]"]
+
+[project.scripts]
+aurum = "aurum.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["aurum*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "slow: long-running tests (deselect with -m 'not slow')",
+    "network: tests that hit the internet (deselect with -m 'not network')",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]

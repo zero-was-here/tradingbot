@@ -47,3 +47,13 @@ Thumbs.db
 .env
 *.key
 credentials.json
+
+# Local env / artifacts
+.venv/
+artifacts/
+runs/
+cache/
+*.parquet
+.pytest_cache/
+.ruff_cache/
+state/
