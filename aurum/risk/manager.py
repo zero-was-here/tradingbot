@@ -299,7 +299,13 @@ class StandardRiskManager:
             return
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_name(self.state_path.name + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, indent=2, sort_keys=True))
+            fh.flush()
+            try:  # durable before the rename: a power cut must not resurrect a pre-halt state
+                os.fsync(fh.fileno())
+            except OSError:  # pragma: no cover - fsync unsupported on some filesystems
+                pass
         os.replace(tmp, self.state_path)
         self._saved = data
 
@@ -633,11 +639,12 @@ class StandardRiskManager:
     # ------------------------------------------------------------------------------------
     # operator controls & reporting
     # ------------------------------------------------------------------------------------
-    def halt(self, reason: str, *, time: pd.Timestamp | None = None) -> None:
-        """Manual kill switch (operator, monitor or the LLM Risk Officer). Persisted."""
+    def halt(self, reason: str, *, time: pd.Timestamp | None = None, kind: str = "manual") -> None:
+        """Manual kill switch (operator, monitor, or the live runner's fail-safes such as
+        ``kind="state_file"``). Persisted; cleared only by ``reset_halt(confirm="RESET")``."""
         t = _utc(time) if time is not None else pd.Timestamp.now(tz="UTC")
         if not self.state.halted:
-            self._halt("manual", reason, t)
+            self._halt(str(kind), reason, t)
         self._persist()
 
     def reset_halt(self, confirm: str = "", *, equity: float | None = None) -> None:

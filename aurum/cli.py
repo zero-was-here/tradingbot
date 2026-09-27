@@ -7,9 +7,11 @@ Commands
     aurum data download [--start --end --timeframes all|M15,H1,... --no-macro --offline]
     aurum data info [--config C | --dir DIR]
     aurum config show|validate --config C [--set key=value ...]
-    aurum backtest --config C [--strategy ID ...] [--start --end] [--out DIR]
+    aurum backtest --config C [--strategy ID ...] [--start --end] [--out DIR] [--include-holdout]
     aurum walkforward --config C [--out DIR] [--jobs N] [--executor process|thread|serial]
+                      [--no-write] [--no-tearsheet]
     aurum train-final --config C --out DIR [--cutoff TS] [--from-run WF_DIR] [--overwrite]
+                      [--allow-config-mismatch]
     aurum report --run DIR [--json]
     aurum strategies list [--json]
     aurum features list [--json]
@@ -18,8 +20,8 @@ Commands
     aurum desk replay --config C --start S --end E [--every N] [--max-cost USD] [--yes] [--fake]
                       [--from-run WF_DIR]
     aurum rl train --config C
-    aurum live artifact --config C [--out DIR] [--from-run WF_DIR]
-    aurum live run --config C [--i-understand-real-money] [--max-cycles N]
+    aurum live artifact --config C [--out DIR] [--at TS] [--from-run WF_DIR]
+    aurum live run --config C [--i-understand-real-money] [--max-cycles N] [--until TS]
 
 Every command that takes ``--config`` also takes ``--set key.path=value`` (YAML-parsed,
 repeatable). Secrets come only from environment variables (``ANTHROPIC_API_KEY``,
@@ -198,8 +200,14 @@ def cmd_data_download(args: argparse.Namespace) -> int:
                 path = save_bars(bars, out / f"{args.symbol.lower()}_{tf}.parquet")
                 print(f"  {tf}: {len(bars)} bars {bars.index[0]} -> {bars.index[-1]} -> {path}")
     if not args.no_macro:
+        import importlib.util
+
         from aurum.data.macro import fetch_fred, fetch_yahoo_daily, save_macro_dir
 
+        if importlib.util.find_spec("yfinance") is None:
+            print("WARNING: yfinance is not installed (pip install 'aurum[data]'): the Yahoo series "
+                  "(dxy, us10y, vix, spx, silver, gold_fut, oil) are skipped unless already cached; "
+                  "macro_factor and risk_off need them")
         frames = fetch_yahoo_daily(start=args.macro_start, end=end, cache_dir=args.macro_cache)
         frames.update(fetch_fred(start=args.macro_start, end=end, cache_dir=args.macro_cache))
         path = save_macro_dir(frames, out / "macro")
@@ -536,6 +544,10 @@ def cmd_desk_replay(args: argparse.Namespace) -> int:
         print(f"hard budget for this replay: ${max_cost:,.2f} - every cycle may only spend what is left of it "
               "(an API call already in flight can overshoot by its own cost); once it is spent the desk is "
               "no longer called and the quant forecast is used for the remaining bars")
+        if expected > max_cost:
+            print(f"NOTE: the estimate exceeds the budget: expect the budget to run out after about "
+                  f"{int(max_cost // max(cfg.agents.expected_cost_per_cycle_usd, 1e-9))} of {n_cycles} cycles "
+                  "(use a larger --every, a shorter window or a higher --max-cost)")
     print(banner)
     if not args.yes:
         print("refusing to start without --yes")

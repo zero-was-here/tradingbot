@@ -38,6 +38,13 @@ class MarketData:
         return MarketData(bars=b, macro=self.macro, events=self.events)
 
 
+#: Default MT5 magic number identifying Aurum's orders/positions. Every entry point (config,
+#: runner, OMS) uses this so positions opened by one are recognised by the others. Run each
+#: live instance with its OWN magic (and its own state_dir) — two runners sharing a magic on
+#: one account would both reconcile the same book.
+DEFAULT_MAGIC = 20260926
+
+
 class Side(int, Enum):
     SELL = -1
     BUY = 1

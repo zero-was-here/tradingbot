@@ -16,7 +16,8 @@ data:
   end: null
   verify_hash: true
 
-instrument: {}                    # XAUUSD CFD defaults: 100 oz/lot, 0.01 lot step, swaps -45/+15 USD/lot/night
+instrument: {}                    # XAUUSD CFD defaults: 100 oz/lot, 0.01 lot step (the -45/+15 USD/lot/night
+                                  # swap table is only used by costs.financing.mode: fixed)
 
 costs:
   spread_multiplier: 1.0          # x the recorded Dukascopy spread
@@ -103,7 +104,7 @@ backtest:
   initial_equity: 100000
   stop_atr_mult: null
   take_profit_atr_mult: null
-  benchmark: true                 # buy-and-hold over the same span (pays CFD swap)
+  benchmark: true                 # buy-and-hold over the same span (pays the same costs.financing)
 
 walkforward:
   train: 3Y
@@ -133,7 +134,7 @@ live:
   broker: paper
   dry_run: true
   allow_live_real: false
-  magic: 20260927
+  magic: 20260926
 
 rl:
   train_start: "2013-01-01"

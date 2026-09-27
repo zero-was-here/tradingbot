@@ -22,7 +22,18 @@ write-ahead record (``status="sending"``) before each send:
   so already-filled legs are not resent. Legs left in ``"sending"`` by a crash are resolved
   through the venue's deal history (``Broker.find_deals`` on the client id);
 * a decision older than the newest one seen is ``"stale"`` and ignored, and a newer decision
-  supersedes any unfinished older one.
+  supersedes any unfinished older one;
+* if such an in-flight leg cannot be looked up (the deal history fails), nothing new is sent
+  for that decision (``status="unknown"``) until it can: the venue might not show the order
+  in its positions yet, and re-planning from them could send it twice.
+
+Ownership
+---------
+Only positions carrying OUR magic on OUR symbol are ever planned against. The adapter must
+filter, and the OMS verifies it: a foreign position in a filtered answer (a buggy adapter)
+makes the reconcile refuse (``status="conflict"``) rather than close another system's
+position or double ours. The account mode comes from the venue (strictly: only a genuine
+``True`` is hedging); ``hedging=True`` forced on a venue that reports netting is refused.
 
 Netting vs hedging accounts
 ---------------------------
@@ -70,13 +81,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from aurum.core.instrument import XAUUSD, Instrument
-from aurum.core.types import Fill, Side
+from aurum.core.types import (
+    DEFAULT_MAGIC,
+    Fill,
+    Side,
+)
 from aurum.live.broker import (
     RETRYABLE_STATUSES,
     Broker,
+    BrokerError,
     BrokerPosition,
     OrderRequest,
     OrderResult,
@@ -87,7 +104,7 @@ from aurum.live.state import StateCorruptError, atomic_write_json, read_json, ut
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ExecutionReport", "Leg", "LegReport", "OrderManager", "make_client_id"]
+__all__ = ["ExecutionReport", "ForeignPositionError", "Leg", "LegReport", "OrderManager", "make_client_id"]
 
 _STATE_FORMAT = "aurum.live.oms"
 _STATE_VERSION = 1
@@ -96,6 +113,18 @@ _EPS = 1e-9
 TERMINAL = frozenset({"complete", "rejected", "superseded", "conflict"})
 #: MT5 order comments (our idempotency key) are truncated by the venue beyond this length.
 MAX_CLIENT_ID_LEN = 31
+
+
+class ForeignPositionError(BrokerError):
+    """The venue adapter returned a position of another magic/symbol for OUR filtered query.
+
+    The OMS then refuses to trade: acting on it would either close another system's position
+    or (if it is ours but mislabelled) double the exposure. Subclasses :class:`BrokerError`, so
+    the runner treats it as venue trouble (alert, back off, retry)."""
+
+
+def _strict_true(x: Any) -> bool:
+    return x is True or (isinstance(x, np.bool_) and bool(x))
 
 
 def make_client_id(magic: int, decision_time: pd.Timestamp, seq: int) -> str:
@@ -234,7 +263,7 @@ class OrderManager:
         self,
         broker: Broker,
         instrument: Instrument = XAUUSD,
-        magic: int = 20260926,
+        magic: int = DEFAULT_MAGIC,
         *,
         symbol: str | None = None,
         state_path: str | Path | None = None,
@@ -249,6 +278,12 @@ class OrderManager:
     ) -> None:
         if max_retries < 0:
             raise ValueError("max_retries must be >= 0")
+        if int(keep_decisions) < 1:
+            # the newest decision record IS the idempotency key: pruning it would let a
+            # restart re-execute the bar and would drop the write-ahead record mid-send
+            raise ValueError("keep_decisions must be >= 1")
+        if hedging is not None and not isinstance(hedging, bool):
+            raise ValueError(f"hedging must be True, False or None (ask the venue), got {hedging!r}")
         if int(magic) <= 0:
             raise ValueError("magic must be a positive integer")
         longest = make_client_id(int(magic), pd.Timestamp("2099-12-31 23:59", tz="UTC"), 9_999)
@@ -271,7 +306,10 @@ class OrderManager:
             raise ValueError("max_order_lots must be >= instrument.min_lot")
         self.max_order_lots = cap
         self._hedging = hedging
-        self.dry_run = bool(dry_run)
+        self._hedging_arg = hedging
+        if not isinstance(dry_run, bool):
+            raise ValueError(f"dry_run must be a bool, got {dry_run!r}")
+        self.dry_run = dry_run
         self.keep_decisions = int(keep_decisions)
         self._state: dict[str, Any] = {"format": _STATE_FORMAT, "version": _STATE_VERSION,
                                        "symbol": self.symbol, "magic": self.magic, "decisions": {}}
@@ -308,8 +346,36 @@ class OrderManager:
     @property
     def hedging(self) -> bool:
         if self._hedging is None:
-            self._hedging = bool(self.broker.is_hedging())
+            # strict: anything but a genuine True (e.g. "False", 1, None) is a NETTING account,
+            # where the foreign-position check below protects other EAs
+            self._hedging = _strict_true(self.broker.is_hedging())
         return self._hedging
+
+    def _check_account_mode(self) -> str | None:
+        """An explicit ``hedging=True`` on a venue that is NOT hedging would skip the netting
+        conflict check, so our deals would net against other systems' positions."""
+        if self._hedging_arg is not True:
+            return None
+        try:
+            venue = _strict_true(self.broker.is_hedging())
+        except Exception as exc:  # noqa: BLE001 - venue specific
+            return f"cannot confirm the venue's account mode ({type(exc).__name__}: {exc}); refusing hedging=True"
+        if not venue:
+            return ("OrderManager(hedging=True) but the venue account is NETTING: our orders would net against "
+                    "other magics' positions; refusing to trade")
+        return None
+
+    def _own_positions(self) -> list[BrokerPosition]:
+        """This strategy's positions (symbol AND magic), verified: the adapter must filter, and
+        a foreign position in the answer is refused rather than traded against."""
+        pos = self.broker.positions(self.symbol, self.magic)
+        bad = [p for p in pos if p.magic != self.magic or p.symbol != self.symbol]
+        if bad:
+            raise ForeignPositionError(
+                f"venue returned {len(bad)} position(s) not owned by {self.symbol}/magic {self.magic} "
+                f"(tickets {[p.ticket for p in bad]}, magics {sorted({p.magic for p in bad})}) for a filtered "
+                "query: refusing to trade on an unreliable position list")
+        return pos
 
     def decision_status(self, decision_time: pd.Timestamp) -> str | None:
         rec = self._state["decisions"].get(_decision_key(decision_time))
@@ -483,21 +549,30 @@ class OrderManager:
                     r["status"] = "superseded"
                     logger.info("decision %s superseded by %s", k, key)
 
-        positions = self.broker.positions(self.symbol, self.magic)
+        def refuse(msg: str, cur: float) -> ExecutionReport:
+            logger.error(msg)
+            if not self.dry_run:
+                decisions[key] = {**(rec or {}), "decision_time": dt.isoformat(), "status": "conflict",
+                                  "target": target, "legs": (rec or {}).get("legs", {}),
+                                  "next_seq": (rec or {}).get("next_seq", 0), "error": msg}
+                self._persist()
+            return report("conflict", cur, cur, errors=[msg])
+
+        mode_problem = self._check_account_mode()
+        try:
+            positions = self._own_positions()
+        except ForeignPositionError as exc:
+            return refuse(str(exc), math.nan)
         actual = net_lots(positions)
+        if mode_problem is not None:
+            return refuse(mode_problem, actual)
 
         if not self.hedging:
             foreign = [p for p in self.broker.positions(self.symbol, None) if p.magic != self.magic]
             if foreign:
-                msg = (f"netting account holds {len(foreign)} foreign position(s) on {self.symbol} "
-                       f"(magic {sorted({p.magic for p in foreign})}): magic isolation impossible, refusing to trade")
-                logger.error(msg)
-                if not self.dry_run:
-                    decisions[key] = {**(rec or {}), "decision_time": dt.isoformat(), "status": "conflict",
-                                      "target": target, "legs": (rec or {}).get("legs", {}),
-                                      "next_seq": (rec or {}).get("next_seq", 0), "error": msg}
-                    self._persist()
-                return report("conflict", actual, actual, errors=[msg])
+                return refuse(f"netting account holds {len(foreign)} foreign position(s) on {self.symbol} "
+                              f"(magic {sorted({p.magic for p in foreign})}): magic isolation impossible, "
+                              "refusing to trade", actual)
 
         if not self.dry_run:
             if rec is None:
@@ -508,8 +583,17 @@ class OrderManager:
             else:
                 rec["status"] = "in_progress"
                 rec["target"] = target
-                self._resolve_sending(rec)
-                positions = self.broker.positions(self.symbol, self.magic)
+                unverified = self._resolve_sending(rec)
+                if unverified and not force:
+                    # An order from a previous run may or may not be at the venue and the deal
+                    # history cannot tell: re-planning now could send it a second time. Wait
+                    # (this bar's next attempt / the next bar re-reads the venue).
+                    msg = (f"in-flight order(s) {unverified} from a previous run could not be verified in the "
+                           "deal history: not sending on top of them")
+                    logger.critical(msg)
+                    self._persist()
+                    return report("unknown", actual, actual, errors=[msg])
+                positions = self._own_positions()
                 actual = net_lots(positions)
 
         legs = self.plan(target, positions, stop_loss=stop_loss, take_profit=take_profit,
@@ -564,7 +648,7 @@ class OrderManager:
                 break
         else:
             rec["status"] = "complete"
-        after = net_lots(self.broker.positions(self.symbol, self.magic))
+        after = net_lots(self._own_positions())
         if status == "filled" and abs(after - target) > _EPS:
             # e.g. a partial fill or a residual below min_lot
             errors.append(f"position {after:+.2f} differs from target {target:+.2f} after all legs")
@@ -582,23 +666,27 @@ class OrderManager:
         return self._reconcile(0.0, decision_time, stop_loss=None, take_profit=None, sl_distance=None,
                                tp_distance=None, reason=reason, force=True)
 
-    def _resolve_sending(self, rec: dict[str, Any]) -> None:
+    def _resolve_sending(self, rec: dict[str, Any]) -> list[str]:
         """Legs left in ``sending`` by a crash: look them up in the venue's deal history.
 
-        Only the audit label depends on this: the re-plan that follows is computed from the
-        venue's positions, which already reflect an order that executed."""
+        The re-plan that follows is computed from the venue's positions, which already reflect
+        an order that executed. Returns the client ids that could NOT be verified (lookup
+        failed); they are retried on the next call and block new sends until then."""
+        unverified: list[str] = []
         for cid, leg in rec.get("legs", {}).items():
-            if leg.get("status") != "sending":
+            if leg.get("status") not in ("sending", "unverified"):
                 continue
             try:
                 deals = self.broker.find_deals(cid, symbol=self.symbol, magic=self.magic)
                 leg["status"] = "filled" if deals else "not_executed"
                 leg["verified"] = True
-            except Exception as exc:  # pragma: no cover - venue specific
+            except Exception as exc:  # noqa: BLE001 - venue specific
                 logger.error("cannot verify in-flight order %s: %s", cid, exc)
                 leg["status"] = "unverified"
                 leg["verified"] = False
+                unverified.append(cid)
             logger.warning("in-flight order %s from a previous run resolved as %s", cid, leg["status"])
+        return unverified
 
     def _request(self, leg: Leg, cid: str, dt: pd.Timestamp, reason: str) -> OrderRequest:
         return OrderRequest(client_id=cid, symbol=self.symbol, side=leg.side, lots=leg.lots, time=dt,
@@ -607,7 +695,7 @@ class OrderManager:
                             position_ticket=leg.ticket, reason=reason)
 
     def _send(self, leg: Leg, cid: str, dt: pd.Timestamp, reason: str) -> LegReport:
-        before = net_lots(self.broker.positions(self.symbol, self.magic))
+        before = net_lots(self._own_positions())
         attempts = 0
         res: OrderResult | None = None
         while True:
@@ -689,7 +777,7 @@ class OrderManager:
                                            status=OrderStatusCode.FILLED if full else OrderStatusCode.PARTIAL,
                                            client_id=cid, position_ticket=d.position_ticket)
         try:
-            after = net_lots(self.broker.positions(self.symbol, self.magic))
+            after = net_lots(self._own_positions())
         except Exception as exc:
             logger.error("position lookup failed for %s: %s", cid, exc)
             return "inconclusive", None
@@ -712,8 +800,3 @@ class OrderManager:
         logger.error("order %s: net position moved %+.2f while a %+.2f leg was in flight: inconclusive",
                      cid, moved, want)
         return "inconclusive", None
-        if abs((after - before) - leg.signed_lots) < _EPS:
-            logger.warning("order %s with unknown outcome executed (net position moved %+.2f)", cid, after - before)
-            return OrderResult(ok=True, retcode="verified", message="executed (verified by position change)",
-                               status=OrderStatusCode.FILLED, client_id=cid, position_ticket=leg.ticket)
-        return None

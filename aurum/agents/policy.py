@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import math
+import numbers
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -81,6 +82,14 @@ def _finite_or_zero(x: float | None, what: str) -> float:
     return v
 
 
+def _is_confidence(x: object) -> bool:
+    """A usable confidence: a real (non-bool, non-string) number in [0, 1]."""
+    if isinstance(x, bool) or not isinstance(x, numbers.Real):
+        return False
+    v = float(x)
+    return math.isfinite(v) and 0.0 <= v <= 1.0
+
+
 @dataclass(frozen=True)
 class DecisionPolicy:
     mode: str = "overlay"
@@ -120,6 +129,11 @@ class DecisionPolicy:
             action = self.on_failure
             used_fallback = True
             notes.append(f"unknown action {decision.action!r}; on_failure={self.on_failure}")
+        elif not _is_confidence(getattr(decision, "confidence", None)):
+            # NaN compares False with everything: ``nan < min_confidence`` would ACCEPT it
+            action = self.on_failure
+            used_fallback = True
+            notes.append(f"invalid confidence {getattr(decision, 'confidence', None)!r}; on_failure={self.on_failure}")
         elif decision.confidence < self.min_confidence:
             action = self.on_failure
             used_fallback = True

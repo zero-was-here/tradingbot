@@ -8,33 +8,79 @@ __pycache__/
 dist/
 build/
 
-# Virtual Environment
-bin/
-lib/
-lib64/
-include/
-share/
-pyvenv.cfg
+# Virtual environments. The bare venv dirs are anchored to the repo root: unanchored `lib/` or
+# `include/` would silently drop a future `aurum/lib/` package or an MQL5 `Include/` folder
+# (git matches case-insensitively on macOS/Windows).
+.venv/
+venv/
+/bin/
+/lib/
+/lib64/
+/include/
+/share/
+/pyvenv.cfg
 
-# Data files (exclude large datasets)
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
+
+# Market data (large and licensed: rebuild it with `aurum data download`). Only the manifest,
+# which records the sha256 of every file behind docs/RESULTS.md, is versioned.
+/data_store/*
+!/data_store/manifest.json
+*.parquet
 *.csv
+!tests/**/*.csv
 data/*.json
 !data/.gitkeep
 
-# Model checkpoints - keep structure but exclude large files
+# Research runs, caches, trained artifacts
+runs/
+cache/
+artifacts/
 *.zip
 *.tar.gz
-train/ppo_*.zip
-train/dreamer*/
-train/dreamer_ultimate/
+*.pkl
+*.joblib
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.ex5
+
+# Live / paper / desk state and journals (default under runs/, but a custom state_dir or
+# --journal-dir can put them anywhere)
+state/
+*.jsonl
+risk_state.json
+oms_state.json
+runner_state.json
+heartbeat.json
+runner.lock
 
 # Logs
 *.log
-training.log
 
-# IDE
+# Secrets: Aurum reads them from the environment only (see .env.example)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials.json
+
+# IDE / assistants
 .vscode/
 .idea/
+.claude/settings.local.json
 *.swp
 *.swo
 *~
@@ -43,17 +89,6 @@ training.log
 .DS_Store
 Thumbs.db
 
-# Secrets
-.env
-*.key
-credentials.json
-
-# Local env / artifacts
-.venv/
-artifacts/
-runs/
-cache/
-*.parquet
-.pytest_cache/
-.ruff_cache/
-state/
+# legacy v1 training outputs
+train/ppo_*.zip
+train/dreamer*/

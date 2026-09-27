@@ -47,22 +47,22 @@ removed APIs like `fillna(method=...)`, `'H'`/`'T'` offset aliases; use `'h'`, `
 ```
 aurum/
   core/        timeframes.py instrument.py types.py interfaces.py config.py
-  data/        schema.py pit.py resample.py  (done)
-               loaders.py dukascopy.py macro.py synthetic.py calendar.py store.py
-  features/    base.py (done) technical.py volatility.py microstructure.py
+  data/        schema.py pit.py resample.py loaders.py dukascopy.py macro.py synthetic.py
+               calendar.py store.py
+  features/    base.py technical.py volatility.py microstructure.py
                multi_timeframe.py macro.py calendar.py regime.py pipeline.py
-  models/      volatility.py (ewma done; add garch/har) regime.py (HMM)
+  models/      volatility.py (EWMA / GARCH / HAR) regime.py (HMM)
   labels/      triple_barrier.py
-  strategies/  base.py (done) trend.py mean_reversion.py breakout.py macro.py
+  strategies/  base.py trend.py mean_reversion.py breakout.py macro.py
                seasonal.py ml.py rl.py
   portfolio/   combiner.py sizing.py
   risk/        manager.py var.py
   execution/   costs.py simulator.py
-  backtest/    result.py (done) engine.py metrics.py
+  backtest/    result.py engine.py metrics.py
   research/    splits.py stats.py report.py walkforward.py
   rl/          env.py train.py
   agents/      LLM trading desk (see §10)
-  live/        broker.py paper.py mt5.py oms.py runner.py monitor.py
+  live/        broker.py paper.py mt5.py oms.py runner.py monitor.py state.py
   cli.py
 ```
 
@@ -80,16 +80,21 @@ aurum/
 
 ### 3.2 `dukascopy.py`  (primary free source of real bid/ask history)
 - `download_dukascopy(symbol="XAUUSD", start, end, timeframe="M1", *, cache_dir="cache/dukascopy",
-  price_scale=None, max_workers=8, session=None) -> bars`
+  price_scale=None, max_workers=8, session=None, source_resolution="M1", offline=False, ...) -> bars`
   Fetches daily candle files `https://datafeed.dukascopy.com/datafeed/{SYM}/{YYYY}/{MM-1:02d}/{DD:02d}/{BID|ASK}_candles_min_1.bi5`
-  (LZMA-compressed, month is ZERO-based, 24-byte big-endian records
-  `>IIIIIf` = seconds-from-midnight-UTC, open, close, low, high, volume — note O,C,L,H order).
-  Price = int / price_scale (XAUUSD point scale is 1000; verify empirically against
-  plausible gold prices and auto-detect if `price_scale=None`). Builds mid OHLC =
-  (bid+ask)/2 per field, `spread = ask_close - bid_close` averaged sensibly (use mean of
-  open & close spreads, floor at 0), volume = bid volume. Skips empty (weekend) files.
+  (or monthly `{BID|ASK}_candles_hour_1.bi5` files with `source_resolution="H1"`, ~24x
+  fewer requests) (LZMA-compressed, month is ZERO-based, 24-byte big-endian records
+  `>IIIIIf` = seconds-from-period-start-UTC, open, close, low, high, volume — note O,C,L,H
+  order). Price = int / price_scale (XAUUSD point scale is 1000; auto-detected if
+  `price_scale=None`). Builds mid OHLC = (bid+ask)/2 per field,
+  `spread = max(0, ((ask_o - bid_o) + (ask_c - bid_c)) / 2)`, volume = bid volume. Drops
+  the flat zero-volume filler candles (weekends, daily break, holidays).
   Caches raw files on disk; resamples to `timeframe` with `resample_bars` if not M1.
-  Retries with backoff; polite rate (max_workers <= 8).
+  Retries with backoff (honouring `Retry-After`); at most 8 workers with an adaptive
+  concurrency limit (the free feed throttles hard).
+- `prefetch_cache(...)` (time-budgeted, resumable, newest-first cache fill) and
+  `build_dataset(out_dir, ...)` (writes `{sym}_M15/H1/H4/D1/D1_nyclose` parquet files and a
+  `manifest.json` with hashes and a quality report) back `aurum data download`.
 - `decode_bi5_candles(raw: bytes, day: date, price_scale) -> DataFrame` (pure; unit-tested
   with a synthetic LZMA blob).
 
@@ -102,8 +107,14 @@ aurum/
   via `https://fred.stlouisfed.org/graph/fredgraph.csv?id=SERIES`.
 - Every returned frame: index = observation date (UTC midnight, tz-aware), column
   `value` (close / level) plus optional extras, and `available_at`:
-  Yahoo US markets: date + 21:30 UTC (after the US close, conservative across DST);
-  FRED: date + 1 day + 21:30 UTC (publication lag). Both configurable via `availability_lag`.
+  Yahoo cash indices (`^GSPC`, `^VIX`, `^TNX`): date + 21:30 UTC (after the US close,
+  conservative across DST); Yahoo futures (`=F`) and ICE (`.NYB`, the dollar index):
+  date + 22:30 UTC (their session ends 17:00 New York = 22:00 UTC in winter);
+  FRED: the NEXT US federal business day + 21:30 UTC (publication lag; a Friday print is
+  usable on Monday). Rows still provisional at fetch time are dropped. Configurable via
+  `availability_lag` (for FRED the days part counts business days).
+- Yahoo needs the optional `yfinance` dependency (`pip install aurum[data]`); without it the
+  Yahoo series are skipped with a warning.
 - `load_macro_dir(path) -> dict[str, DataFrame]` / `save_macro_dir(dict, path)` (parquet).
 
 ### 3.4 `synthetic.py`
@@ -123,12 +134,16 @@ aurum/
   `currency`, `importance` (1..3), `source`, `approximate` (bool). Index = RangeIndex.
   Scheduled times are published in advance, so using *future scheduled times* is not
   leakage; using *outcomes* (actual/surprise) is only allowed from `time` onward.
-- `load_calendar_csv(path)` (generic: time,name,currency,importance[,actual,forecast]).
-- `generate_rule_based_calendar(start, end)`: NFP = first Friday of each month 08:30
-  America/New_York (DST-aware → UTC), marked `approximate=True` (holiday shifts exist);
-  FOMC statement days at 14:00 America/New_York from a hard-coded list — ONLY include dates
-  you can verify (try fetching federalreserve.gov FOMC calendars; if you cannot verify a
-  year, omit it and document). CPI is not rule-based; leave it to CSV import.
+- `load_calendar_csv(path, *, tz="UTC", source=None)` (generic:
+  time,name,currency,importance[,actual,forecast,previous]).
+- `generate_rule_based_calendar(start, end, *, include=("NFP", "FOMC"), nfp_rule="first_friday")`:
+  NFP at 08:30 America/New_York (DST-aware → UTC) on the rule's date, marked
+  `approximate=True` (holiday shifts exist); FOMC statement releases from the hard-coded
+  `FOMC_STATEMENTS` list (2012–2027, federalreserve.gov calendars retrieved 2026-09-26):
+  times verified from the press releases for 2016-01 .. 2026-09 (`approximate=False`),
+  Fed practice before 2016 and 14:00 ET for future meetings (`approximate=True`);
+  unscheduled actions excluded; outside 2012–2027 no FOMC rows (warning). CPI is not
+  rule-based; leave it to CSV import.
 
 ### 3.6 `store.py`
 - `save_bars(bars, path)` / `load_bars(path) -> bars` (parquet; preserves UTC tz,
@@ -170,9 +185,10 @@ Scaler stats come ONLY from `raw_train`; columns constant in train are dropped; 
 columns at transform time raise.
 
 ## 5. Models (`aurum.models`)
-- `volatility.py`: keep `ewma_volatility`; add `Garch11` (`fit(returns)`, `forecast(returns)`
-  → causal conditional vol series annualised, params stored; MLE via scipy with
-  stationarity constraints) and `har_rv_forecast(daily_rv)`; `blend_vol(*series, weights)`.
+- `volatility.py`: `ewma_volatility(close, *, halflife_bars=48, ...)`; `Garch11`
+  (`fit(returns)`, `forecast(returns)` → causal conditional vol series annualised, params
+  stored; MLE via scipy with stationarity constraints); `har_rv_forecast(daily_rv)`;
+  `blend_vol(*series, weights)`.
 - `regime.py`: `GaussianHMM(n_states=2, seed=0)` with `fit(x)` (Baum–Welch on TRAIN),
   `filter(x) -> DataFrame` of forward-filtered state probabilities (causal: uses x[:t+1]
   only), `predict_next(x)`; states ordered by variance (state 0 = calm).
@@ -197,11 +213,16 @@ long/short unless noted. Required families (each file may hold several classes):
   grid; costs from the TRAIN bars' spreads/ranges via `params.costs`, default `CostModel()`;
   `cost_multiplier` = required edge/cost margin, default 2; `dead_zone="auto"`).
   `cost_aware=False` or `cost_multiplier=0` gives the frictionless table.
-- `ml.py`: `ml_gbm` (HistGradientBoosting on FeaturePipeline features predicting sign of
-  forward vol-normalised return with purged training, probability → forecast via
-  `2p-1` with calibration & dead-zone), `meta_label` (triple-barrier meta-labelling of a
-  primary strategy: ML model predicts whether the primary signal will hit TP before SL,
-  forecast = primary * size-from-probability). Both trainable, both use `aurum.labels`.
+- `ml.py`: `ml_gbm` (HistGradientBoosting on its own per-fold FeaturePipeline features —
+  the 10 price groups plus `macro`/`calendar` when available — predicting the
+  triple-barrier label by default (`target="triple_barrier"`; or the sign of the forward
+  vol-normalised return) with purged, uniqueness-weighted training, probability → forecast
+  via calibrated `2p-1` with dead-zone and Carver scaling), `meta_label` (triple-barrier
+  meta-labelling of a primary strategy, default `tsmom`: ML model predicts whether the
+  primary signal will hit TP before SL, forecast = primary * size-from-probability). Both
+  trainable, both use `aurum.labels`, and both have a validation **skill gate**
+  (`skill_gate_z=2`): unless the validation AUC beats 0.5 by 2 standard errors the
+  forecast is 0.
 - `rl.py`: `rl_ppo` adapter that loads a trained SB3 policy from `aurum.rl` (lazy torch
   import — importing `aurum.strategies.rl` must NOT require torch). Attaching an artifact
   embeds its files' bytes + SHA-256 fingerprint in the strategy (self-contained pickles;
@@ -219,7 +240,9 @@ long/short unless noted. Required families (each file may hold several classes):
   `weights_` attribute; `explain()` dict for agents/reports. With `allow_unallocated=True`
   (config `combiner.allow_unallocated`, default) strategies with a non-positive NET Sharpe get
   zero weight and the cap never forces weight onto them, so weights may sum to < 1 (less
-  risk; no positive net Sharpe -> flat book); `False` restores sum-to-1.
+  risk; no positive net Sharpe -> flat book); `False` restores sum-to-1. The config also
+  accepts `combiner.method: fixed` (weights from `strategies[].weight`, handled by
+  `aurum.core.config` / `aurum.research.walkforward`, not by `ForecastCombiner`).
 - `portfolio/sizing.py`: `VolTargetSizer(target_vol=0.10, max_leverage=2.0, max_lots=None,
   rebalance_band=0.10, kelly_cap=None, drawdown_derisk=((0.10, 0.5), (0.15, 0.25)))`
   implementing `aurum.core.interfaces.PositionSizer`:
@@ -228,17 +251,22 @@ long/short unless noted. Required families (each file may hold several classes):
   `|target-current| < rebalance_band*max(|target|,|current|)` keep `current` (turnover
   control). Also `FixedFractionalSizer(risk_per_trade=0.005, stop_atr=2.0)` for stop-based
   sizing.
-- `risk/manager.py`: `RiskLimits` dataclass (`max_lots`, `max_leverage`, `max_daily_loss=0.03`,
-  `max_drawdown=0.20` (hard kill), `max_spread=None` (price units; block NEW risk when
-  exceeded), `event_blackout_before_min=30`, `event_blackout_after_min=30`,
+- `risk/manager.py`: `RiskLimits` dataclass (`max_lots=None`, `max_leverage=3.0`,
+  `max_daily_loss=0.03`, `max_drawdown=0.20` (hard kill), `max_spread=None` (price units;
+  block NEW risk when exceeded), `event_blackout_before_min=30`, `event_blackout_after_min=30`,
   `event_min_importance=3`, `blackout_mode="no_new_risk"|"flatten"`, `max_trades_per_day=None`,
-  `stale_data_seconds=None`, `max_margin_utilisation=0.5`) and `StandardRiskManager(limits,
-  instrument, state_path=None)` implementing `aurum.core.interfaces.RiskManager`.
+  `stale_data_seconds=None`, `max_margin_utilisation=0.5`, `daily_reset="utc"|"rollover"`,
+  `daily_loss_persistent=True`, `event_lookahead_min=0`) and `StandardRiskManager(limits,
+  instrument, state_path=None, *, events=None)` implementing
+  `aurum.core.interfaces.RiskManager`.
   Semantics: risk can only move `approved_lots` toward 0 relative to `target_lots` and never
   beyond `current_lots` in the risk-increasing direction when a "no new risk" rule fires.
   Daily loss uses equity at the first bar of each UTC day (or broker rollover — configurable).
   Hard kill (max drawdown from peak, daily loss) sets `halted=True` → approved 0; `halted`
-  persists (JSON state file if `state_path`) until `reset_halt(confirm="RESET")`.
+  persists (JSON state file if `state_path`) until `reset_halt(confirm="RESET")`. With
+  `daily_loss_persistent=False` a daily-loss halt clears at the next day instead. Research
+  runs use `RESEARCH_RISK_DEFAULTS` (`aurum.core.config`: `daily_loss_persistent=False`,
+  `max_drawdown=None`; the kill switch is a live control), live runs the `risk.live` limits.
 - `risk/var.py`: historical / Gaussian / Cornish–Fisher VaR & ES, stress scenarios
   (`gap_shock(position_lots, price, pct)`), `risk_report(result) -> dict`.
 
@@ -284,6 +312,10 @@ def run_backtest(md, forecast: pd.Series, *, sizer, risk=None, instrument=XAUUSD
                  financing=None, rates=None) -> BacktestResult
 def run_target_lots(md, target_lots: pd.Series, ...) -> BacktestResult   # for pre-sized paths
 ```
+  Further keyword arguments: `take_profit_atr_mult`, `atr_period=14`, `stop_cooldown_bars=0`
+  (same-side re-entry block after a stop), `event_horizon_hours=24`, `bars_per_year`,
+  `compute_metrics=True`, and (`run_backtest` only) `forecast_hook` / `hook_every` (a
+  callback that may replace the forecast at each close; used by the LLM-desk replay).
   `financing=` overrides `costs.financing` (model, kwargs or mode name); `rates=` defaults to
   `md.macro` (read as of each rollover). Same for `buy_and_hold_benchmark` (frictionless =
   no financing). The RL env (`GoldTradingEnv(..., rates=)`) and `PaperBroker(..., rates=)`
@@ -311,11 +343,16 @@ def run_target_lots(md, target_lots: pd.Series, ...) -> BacktestResult   # for p
   single self-contained HTML (inline base64 PNGs via matplotlib Agg): equity vs benchmark
   (log), underwater drawdown, rolling 6-month Sharpe, monthly return table, return
   histogram, position/exposure, cost attribution, metrics table, trade stats, notes/extra.
-- `walkforward.py` (wave 2): orchestrates features → strategies → combiner → backtest per
+- `walkforward.py`: orchestrates features → strategies → combiner → backtest per
   fold with refits; stitches OOS forecasts; runs ONE continuous backtest on the stitched
   OOS; returns `WalkForwardReport` with per-strategy OOS metrics, combined metrics, DSR/PBO.
-  `Strategy.fit` gets macro rows published by the last training bar's close only. The
-  combiner is fitted net of costs (bars + `costs` + `instrument` of the config). Holdout
+  `purge: auto` = the largest label horizon of the trainable strategies (24 bars for
+  `ml_gbm` / `meta_label`, 0 without them). `Strategy.fit` gets macro rows published by the
+  last training bar's close only. The combiner is fitted net of costs (bars + `costs` +
+  `instrument` of the config); with `walkforward.combiner_fit: oos` (default) fold k's
+  combiner is fitted on the stitched OOS forecasts of EARLIER folds (equal weights until
+  `combiner_min_obs` OOS bars exist), with `train` on the in-sample training-window
+  forecasts (biased toward trainable strategies; noted in the report). Holdout
   evaluations are appended to the holdout ledger (`<output root>/holdout_ledger.jsonl`:
   timestamp, config/data hash, window, strategies, metrics); it is read BEFORE the holdout
   is evaluated, and overlapping windows evaluated by OTHER config hashes raise a WARNING +
@@ -339,7 +376,12 @@ parallel) and return memos. The Chief ends every cycle by calling `submit_decisi
   into a forecast/scale that goes through the SAME sizer and risk manager — the LLM cannot
   bypass `RiskManager`. Default mode `overlay` (Chief may scale the quant forecast in [0, 1]
   or veto; may not flip direction or add risk). `discretionary` allows a bounded forecast in
-  `[-max_abs_forecast, max_abs_forecast]`.
+  `[-max_abs_forecast, max_abs_forecast]`. API failures, refusals and budget overruns
+  resolve to `on_failure` (`follow_quant` default, or `veto` / `hold`).
+- Models default to `claude-opus-5` (Chief effort `high`, specialists `medium`); caps per
+  cycle: `max_specialists_per_cycle` (consulted + created), `max_cost_usd_per_cycle`
+  (default $3) / `max_tokens_per_cycle`, with a share reserved for the Chief. Ad-hoc agents
+  get only whitelisted read-only data tools and cannot create further agents.
 - All data reaches agents through a `DeskDataProvider` protocol (JSON-serialisable
   snapshots: market, quant signals, risk, macro, calendar, backtest stats, positions). A
   point-in-time `HistoricalDeskDataProvider` enables replay backtests (with the documented
@@ -357,6 +399,11 @@ parallel) and return memos. The Chief ends every cycle by calling `submit_decisi
   `mt5.py` `MT5Broker` (lazy `import MetaTrader5`; magic-number isolation; broker-side SL;
   retcode handling; server-time → UTC).
 - `oms.py`: idempotent client ids, reconciliation (target vs actual), retries, rejects.
+- `state.py`: atomic (fsync + `os.replace`) JSON state files and JSONL logs; an unreadable
+  state file raises `StateCorruptError` instead of silently starting empty.
+- Paper data: `paper.data: replay` (default) replays `paper.bars_path` on a simulated clock
+  from `paper.start` or after `paper.warmup_bars`; `paper.data: mt5` paper-trades on live
+  MT5 bars and quotes.
 - `runner.py`: bar-close scheduler; builds `MarketData` from the broker, runs the SAME
   feature pipeline (loaded from artifact), strategies, combiner, optional LLM desk, sizer,
   risk manager, OMS. `dry_run=True` default; refuses real (non-demo) accounts unless

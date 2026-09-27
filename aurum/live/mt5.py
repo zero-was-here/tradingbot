@@ -456,11 +456,26 @@ class MT5Broker:
             server=_get(a, "server"), name=None,  # the account holder's name is PII: not exported
         )
 
+    @staticmethod
+    def _mode(a: Any, name: str) -> int | None:
+        """An integer account-mode field, or None when missing/garbled (never raises: an
+        unreadable ``trade_mode`` must read as a REAL account, not crash or pass as demo)."""
+        v = _get(a, name)
+        if isinstance(v, (bool, np.bool_)) or not isinstance(v, (int, np.integer)):
+            return None  # MT5 reports these as ints; anything else is garbled
+        return int(v)
+
     def _is_demo(self, a: Any) -> bool:
-        return int(_get(a, "trade_mode", -1)) == self._c("ACCOUNT_TRADE_MODE_DEMO")
+        """Demo ONLY for ``trade_mode == ACCOUNT_TRADE_MODE_DEMO``; contest, real, unknown,
+        missing or garbled modes are all treated as REAL money (the guard then applies)."""
+        mode = self._mode(a, "trade_mode")
+        return mode is not None and mode == self._c("ACCOUNT_TRADE_MODE_DEMO")
 
     def _is_hedging(self, a: Any) -> bool:
-        return int(_get(a, "margin_mode", -1)) == self._c("ACCOUNT_MARGIN_MODE_RETAIL_HEDGING")
+        """Hedging only when MT5 says so; unknown modes are netting (the conservative side:
+        the OMS then refuses to trade next to foreign positions)."""
+        mode = self._mode(a, "margin_mode")
+        return mode is not None and mode == self._c("ACCOUNT_MARGIN_MODE_RETAIL_HEDGING")
 
     def is_demo(self) -> bool:
         return self._is_demo(self._account_raw())

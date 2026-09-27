@@ -25,12 +25,24 @@ Safety
 * ``dry_run=True`` by default: intended orders are planned and logged, nothing is sent.
 * Real-money guard: a non-demo account is refused unless the config sets
   ``live.allow_live_real: true`` AND the operator passes ``--i-understand-real-money``;
-  a loud banner is logged/printed when real trading is enabled.
+  a loud banner is logged/printed when real trading is enabled. Every input is read strictly
+  (only a genuine ``True`` is a demo flag or an opt-in; ``dry_run``/``allow_live_real`` must be
+  YAML booleans, so ``dry_run:`` left empty or ``"false"`` quoted is an error, not a flip).
+  The guard is re-checked before every decision: an account that turns non-demo mid-run
+  (terminal switched/re-logged) stops the runner without sending anything, not even the
+  shutdown flatten. Real-money order sending also requires both kill-switch limits.
 * Kill switch: the risk manager's state file persists halts across restarts; only
-  ``StandardRiskManager.reset_halt(confirm="RESET")`` clears them.
+  ``StandardRiskManager.reset_halt(confirm="RESET")`` clears them. An unreadable state file
+  starts HALTED, and so does a MISSING one when the directory holds a previous session's
+  runner/OMS state (deleting the file is not a reset). A halted book skips the LLM desk.
 * Idempotency: the OMS never executes the same bar twice; the runner also remembers the
-  last processed bar. One runner per ``state_dir``: an OS lock (``runner.lock``) refuses a
-  second process (two runners would both trade every bar).
+  last processed bar. One runner per ``state_dir``: an OS lock (``runner.lock``), taken
+  before the venue is even queried, refuses a second process (two runners would both trade
+  every bar). The lock does not cover two state directories trading ONE magic number: give
+  every runner its own magic.
+* LLM desk: its forecast is re-bounded here by the policy mode (the desk's and the
+  configured ``desk.mode``, the stricter wins; ``overlay`` when unknown) before sizing and
+  risk, so a misbehaving desk object cannot flip or enlarge the quant forecast.
 * Stale data: a new bar older than ``max_bar_age_seconds`` is skipped (and the risk manager
   blocks new risk above ``stale_data_seconds``); insufficient history refuses to trade. A
   HALTED book is still flattened on such bars (the kill switch must not depend on data).
@@ -96,7 +108,10 @@ from aurum.backtest.engine import OUTCOME_COLUMNS, average_true_range
 from aurum.core.instrument import XAUUSD, Instrument
 from aurum.core.interfaces import RiskContext
 from aurum.core.timeframes import get_timeframe
-from aurum.core.types import MarketData
+from aurum.core.types import (
+    DEFAULT_MAGIC,
+    MarketData,
+)
 from aurum.execution.costs import CostModel
 from aurum.execution.simulator import intrabar_exit
 from aurum.live.broker import Broker, BrokerError, Clock, SimulatedClock, SystemClock, net_lots
@@ -428,6 +443,27 @@ def load_artifact(path: str | Path, *, verify: bool = True, require_hmac: bool =
 # configuration
 # =============================================================================================
 _SECTIONS = ("risk", "sizer", "costs", "desk", "monitor", "paper", "mt5", "oms")
+#: safety switches that must be real booleans: ``bool("false")`` is True and ``bool(None)`` is
+#: False, so a quoted YAML value or an empty ``dry_run:`` would silently flip them
+_STRICT_BOOLS = ("dry_run", "allow_live_real", "flatten_on_shutdown")
+#: OrderManager arguments the runner owns (``dry_run``/``magic``/``symbol``/``state_path``) or
+#: that only the venue may decide (``hedging``: forcing it on a netting account would net our
+#: orders against other EAs' positions)
+_OMS_RESERVED = ("dry_run", "magic", "symbol", "state_path", "sleep", "broker", "instrument", "hedging")
+
+
+def _is_true(x: Any) -> bool:
+    """Strict truth for safety inputs: only ``True`` (or ``numpy.bool_(True)``) counts.
+
+    ``bool("False")``, ``bool(1)`` or a mock's truthiness must never make an account look like
+    a demo or grant a real-money opt-in."""
+    return x is True or (isinstance(x, np.bool_) and bool(x))
+
+
+def _strict_bool(name: str, value: Any) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    raise ValueError(f"{name} must be true or false (a YAML boolean), got {type(value).__name__} {value!r}")
 
 
 @dataclass
@@ -449,7 +485,7 @@ class LiveConfig:
     artifact_dir: str | None = None
     symbol: str = "XAUUSD"
     timeframe: str = "H1"
-    magic: int = 20260926
+    magic: int = DEFAULT_MAGIC
     broker: str = "paper"
     dry_run: bool = True
     allow_live_real: bool = False
@@ -484,6 +520,15 @@ class LiveConfig:
     oms: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        for name in _STRICT_BOOLS:
+            setattr(self, name, _strict_bool(name, getattr(self, name)))
+        for sec in _SECTIONS:
+            if not isinstance(getattr(self, sec), Mapping):
+                raise ValueError(f"{sec} must be a mapping, got {type(getattr(self, sec)).__name__}")
+        reserved = sorted(set(self.oms) & set(_OMS_RESERVED))
+        if reserved:
+            raise ValueError(f"oms section may not set {reserved}: dry_run/magic/symbol come from the live "
+                             "config, the state file from state_dir and the account mode (hedging) from the venue")
         get_timeframe(self.timeframe)
         if self.spread_source not in ("bar", "quote"):
             raise ValueError("spread_source must be 'bar' or 'quote'")
@@ -512,12 +557,20 @@ class LiveConfig:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> LiveConfig:
-        """Flat mapping or ``{"live": {...}, "risk": {...}, ...}``. Unknown keys raise."""
+        """Flat mapping or ``{"live": {...}, "risk": {...}, ...}``. Unknown keys raise, and so
+        does a key given both inside ``live:`` and at the top level (which one wins would be an
+        accident of the parser — e.g. a stray top-level ``allow_live_real: true``)."""
         d = dict(data)
         base = dict(d.pop("live", {}) or {})
+        dup = sorted(set(base) & set(d))
+        if dup:
+            raise ValueError(f"live config keys given both under 'live:' and at the top level: {dup}")
         for sec in _SECTIONS:
             if sec in d:
-                base[sec] = dict(d.pop(sec) or {})
+                raw = d.pop(sec)
+                if raw is not None and not isinstance(raw, Mapping):
+                    raise ValueError(f"{sec} must be a mapping, got {type(raw).__name__}")
+                base[sec] = dict(raw or {})
         base.update(d)
         known = {f.name for f in dataclasses.fields(cls)}
         unknown = sorted(set(base) - known)
@@ -543,14 +596,18 @@ class RealMoneyGuardError(RuntimeError):
 
 
 def check_real_money_guard(is_demo: bool, *, allow_live_real: bool, i_understand_real_money: bool) -> bool:
-    """Raise unless the account is a demo or BOTH opt-ins are given. Returns True for real money."""
-    if is_demo:
+    """Raise unless the account is a demo or BOTH opt-ins are given. Returns True for real money.
+
+    Every input is read STRICTLY (:func:`_is_true`): an unknown/garbled demo flag (``None``,
+    ``"False"``, ``1``) means a REAL account, and only a genuine ``True`` counts as an opt-in."""
+    if _is_true(is_demo):
         return False
-    if not allow_live_real or not i_understand_real_money:
+    allow, understand = _is_true(allow_live_real), _is_true(i_understand_real_money)
+    if not allow or not understand:
         missing = []
-        if not allow_live_real:
+        if not allow:
             missing.append("config live.allow_live_real: true")
-        if not i_understand_real_money:
+        if not understand:
             missing.append("CLI flag --i-understand-real-money")
         raise RealMoneyGuardError("broker account is NOT a demo account; refusing to run. Real-money trading "
                                   "requires " + " AND ".join(missing))
@@ -772,6 +829,8 @@ class LiveRunner:
         self.clock: Clock = clock or getattr(broker, "clock", None) or SystemClock()
         self.tf = get_timeframe(config.timeframe)
         self.state_dir = Path(config.state_dir)
+        if not isinstance(i_understand_real_money, (bool, np.bool_)):
+            raise TypeError(f"i_understand_real_money must be a bool, got {type(i_understand_real_money).__name__}")
         self._i_understand = bool(i_understand_real_money)
         self._artifact = artifact
         self._desk = desk
@@ -801,6 +860,7 @@ class LiveRunner:
         self.max_consecutive_failures = 5
         self.n_decisions = 0
         self.real_money = False
+        self._guard_tripped = False  # the account turned non-demo mid-run: never touch it again
         self.mode = "unknown"
         self.cycles: list[CycleResult] = []
         self.keep_cycles = 1000
@@ -836,19 +896,22 @@ class LiveRunner:
         if self._started:
             return
         cfg = self.config
-        account = self.broker.account()
-        is_demo = bool(self.broker.is_demo()) and bool(account.is_demo)
-        self.real_money = check_real_money_guard(is_demo, allow_live_real=cfg.allow_live_real,
-                                                 i_understand_real_money=self._i_understand)
-        if self.real_money:
-            banner = real_money_banner(account, dry_run=cfg.dry_run)
-            for line in banner.splitlines():
-                logger.critical(line)
-        if account.currency and account.currency.upper() != "USD":
-            logger.warning("account currency %s: sizing and PnL assume USD", account.currency)
+        # Lock FIRST: even reading the account can write state (the paper broker settles and
+        # saves its book), and a second process must not touch this state directory at all.
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._lock_fh = _lock_state_dir(self.state_dir / "runner.lock")
         try:
+            account = self.broker.account()
+            # strict: a demo only when BOTH the adapter and the account snapshot say exactly True
+            is_demo = _is_true(self.broker.is_demo()) and _is_true(getattr(account, "is_demo", None))
+            self.real_money = check_real_money_guard(is_demo, allow_live_real=cfg.allow_live_real,
+                                                     i_understand_real_money=self._i_understand)
+            if self.real_money:
+                banner = real_money_banner(account, dry_run=cfg.dry_run)
+                for line in banner.splitlines():
+                    logger.critical(line)
+            if account.currency and account.currency.upper() != "USD":
+                logger.warning("account currency %s: sizing and PnL assume USD", account.currency)
             self._start_locked(account)
         except BaseException:
             _unlock_state_dir(self._lock_fh)
@@ -876,8 +939,22 @@ class LiveRunner:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         limits = {"stale_data_seconds": max(120.0, 0.5 * cfg.tf_seconds) + cfg.bar_close_delay_seconds,
                   **cfg.risk}
-        self.risk = StandardRiskManager(RiskLimits(**limits), self.instrument,
-                                        state_path=self.state_dir / "risk_state.json")
+        risk_path = self.state_dir / "risk_state.json"
+        # Every decision persists the risk state BEFORE the runner/OMS state, so a previous
+        # session's runner/OMS state without a risk state means it was deleted or lost (e.g. to
+        # "reset" a kill switch by hand): fail safe and start HALTED.
+        previous = [p.name for p in (self.runner_state_path, self.state_dir / "oms_state.json") if p.exists()]
+        risk_missing = not risk_path.exists() and bool(previous)
+        self.risk = StandardRiskManager(RiskLimits(**limits), self.instrument, state_path=risk_path)
+        if risk_missing:
+            self.risk.halt(f"risk state file {risk_path.name} is missing although {' and '.join(previous)} "
+                           f"exist in {self.state_dir}: the kill-switch state is unknown", kind="state_file")
+        if self.real_money and not cfg.dry_run:
+            lim = self.risk.limits
+            off = [k for k in ("max_drawdown", "max_daily_loss") if getattr(lim, k) is None]
+            if off:
+                raise RealMoneyGuardError(f"real-money trading requires the kill switch: risk limits {off} "
+                                          "are disabled (set them in risk.live)")
         if self.risk.halted:
             logger.critical("risk manager starts HALTED (%s): the runner will only flatten until "
                             "reset_halt(confirm='RESET')", self.risk.halt_reason)
@@ -1208,7 +1285,7 @@ class LiveRunner:
         except Exception:  # never mask the exception that brought us here
             logger.exception("broker time unavailable during shutdown")
             now = self.clock.now()
-        if self.config.flatten_on_shutdown and not self.config.dry_run:
+        if self.config.flatten_on_shutdown and not self.config.dry_run and not self._guard_tripped:
             try:
                 rep = self.oms.flatten(now.floor("min"), reason="shutdown")
                 self._log({"type": "shutdown_flatten", "time": now, "execution": rep.to_dict()})
@@ -1269,10 +1346,34 @@ class LiveRunner:
                 self.monitor.alerts.alert("critical", "forming_bar", msg, time=now)
                 bars = bars.loc[closed]
         if len(bars) and (self._last_bar is None or bars.index[-1] > self._last_bar):
+            self._check_account_guard()
             return self._decide(bars, now)
         if self._pending is not None:
+            self._check_account_guard()
             self._try_pending(now)
         return None
+
+    def _check_account_guard(self) -> None:
+        """Re-check the real-money guard before anything can be sent.
+
+        The guard at :meth:`start` is not enough: a terminal can be switched to another
+        account (or re-login to different credentials on reconnect) while the runner keeps
+        going. A non-demo account that was not authorised at start stops the runner, and it
+        will not even flatten on shutdown (it never had permission to touch that account)."""
+        if self.real_money:
+            return
+        account = self.broker.account()
+        if _is_true(self.broker.is_demo()) and _is_true(getattr(account, "is_demo", None)):
+            return
+        self._guard_tripped = True
+        msg = (f"broker account switched to a NON-demo account (server {getattr(account, 'server', '?')}) while "
+               "running without the real-money opt-ins: stopping, nothing will be sent")
+        logger.critical(msg)
+        try:
+            self.monitor.alerts.alert("critical", "real_money_guard", msg, time=self.clock.now())
+        except Exception:  # pragma: no cover - alerting must not mask the refusal
+            logger.exception("alert failed")
+        raise RealMoneyGuardError(msg)
 
     def _decide(self, bars: pd.DataFrame, now: pd.Timestamp) -> CycleResult:
         cfg = self.config
@@ -1361,7 +1462,11 @@ class LiveRunner:
 
         # ---- LLM desk --------------------------------------------------------------------
         final = combined
-        if signal_error is None and self.desk is not None:
+        if signal_error is None and self.desk is not None and self.risk.halted:
+            # a halted book goes flat whatever the desk says: do not pay for (or expose the
+            # kill-switch state to) an LLM cycle whose outcome cannot matter
+            rec["desk"] = res.desk = {"status": "skipped_halted", "quant_forecast": combined}
+        elif signal_error is None and self.desk is not None:
             final, desk_info = self._run_desk(md, t_dec, combined, fc_frame, combined_series, vol_series,
                                               positions, account)
             res.desk = desk_info
@@ -1639,6 +1744,36 @@ class LiveRunner:
                    "attempts": p.attempts, "execution": report.to_dict(),
                    "equity_after": self.broker.account().equity})
 
+    def _bound_desk_forecast(self, raw: float, q: float) -> tuple[float, list[str]]:
+        """Defence in depth: re-apply the policy bounds to whatever the desk returned.
+
+        The desk's :class:`~aurum.agents.policy.DecisionPolicy` already bounds its output; this
+        makes the runner independent of that (an injected desk object, a desk whose policy was
+        swapped, a bug). Both the desk's own policy mode and the configured ``desk.mode`` are
+        enforced (the stricter wins); without either, ``overlay`` applies: never flip the quant
+        direction, never exceed its magnitude."""
+        dc = self.config.desk
+        pol = getattr(self.desk, "policy", None)
+        modes = [str(m) for m in (getattr(pol, "mode", None), dc.get("mode")) if m is not None] or ["overlay"]
+        caps = [_finite(c) for c in (getattr(pol, "max_abs_forecast", None), dc.get("max_abs_forecast"))
+                if c is not None]
+        cap = min([c for c in caps if math.isfinite(c) and c > 0] or [1.0])
+        notes: list[str] = []
+        f = float(np.clip(raw, -1.0, 1.0))
+        if f != raw:
+            notes.append(f"forecast {raw:+.4f} clipped to [-1, 1]")
+        for mode in modes:
+            if mode == "advisory":
+                g = q
+            elif mode == "discretionary":
+                g = float(np.clip(f, -min(cap, 1.0), min(cap, 1.0)))
+            else:  # overlay (and anything unrecognised): scale toward zero or veto only
+                g = min(max(0.0, q), max(min(0.0, q), f))
+            if g != f:
+                notes.append(f"{mode} bound: {f:+.4f} -> {g:+.4f} (quant {q:+.4f})")
+            f = g
+        return (0.0 if f == 0 else f), notes
+
     def _run_desk(self, md: MarketData | None, t_dec: pd.Timestamp, combined: float, fc_frame: pd.DataFrame,
                   combined_series: pd.Series | None, vol_series: pd.Series, positions: list[Any],
                   account: Any) -> tuple[float, dict[str, Any]]:
@@ -1661,7 +1796,13 @@ class LiveRunner:
                                               "n_tickets": len(positions)})
             out = self.desk.run_cycle(t_dec, combined, previous_forecast=self._prev_final,
                                       context={"mode": self.mode, "dry_run": self.config.dry_run})
-            final = float(np.clip(_finite(out.final_forecast, combined), -1.0, 1.0))
+            raw = _finite(getattr(out, "final_forecast", None), combined)
+            final, bound_notes = self._bound_desk_forecast(raw, combined)
+            if bound_notes:
+                info["runner_bound"] = bound_notes
+                logger.error("desk forecast %r outside its policy: %s", getattr(out, "final_forecast", None),
+                             "; ".join(bound_notes))
+                self.monitor.alerts.alert("critical", "desk_policy_violation", "; ".join(bound_notes), time=t_dec)
             info.update(status=out.status, final_forecast=final, failure_reason=out.failure_reason,
                         action=out.policy.action if out.policy is not None else None,
                         decision=out.decision.to_dict() if out.decision is not None else None,
@@ -1772,7 +1913,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_dry_run:
         cfg.dry_run = False
     broker, clock, replay_end = _build_broker(cfg, XAUUSD)
-    runner = LiveRunner(cfg, broker=broker, clock=clock, i_understand_real_money=args.i_understand_real_money)
+    # the venue's lot grid / max volume (MT5 refreshes them from symbol_info; never looser than
+    # XAUUSD's) so risk caps and order splitting use the limits the venue will enforce
+    venue_inst = getattr(broker, "instrument", None)
+    instrument = (venue_inst if isinstance(venue_inst, Instrument)
+                  and venue_inst.contract_size == XAUUSD.contract_size else XAUUSD)
+    runner = LiveRunner(cfg, broker=broker, clock=clock, instrument=instrument,
+                        i_understand_real_money=args.i_understand_real_money)
     try:
         runner.start()
     except RealMoneyGuardError as exc:
@@ -1783,7 +1930,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"aurum live runner [{runner.mode}] {cfg.symbol} {cfg.timeframe} magic={cfg.magic} "
           f"state={cfg.state_dir}", file=sys.stderr)
     until = _as_utc(args.until) if args.until else replay_end
-    runner.run(until=until, max_cycles=args.max_cycles)
+    try:
+        runner.run(until=until, max_cycles=args.max_cycles)
+    except RealMoneyGuardError as exc:  # the account turned non-demo mid-run
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 

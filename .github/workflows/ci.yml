@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, aurum-v2]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MPLBACKEND: Agg
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1"
+
+# The suite never needs secrets, market data (data_store/, cache/ and runs/ are gitignored) or
+# the internet: tests/conftest.py refuses outbound connections outside @pytest.mark.network.
+jobs:
+  core:
+    name: core · py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install (core + dev, no optional extras)
+        run: python -m pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check aurum tests
+      - name: Import without optional dependencies
+        run: |
+          python - <<'EOF'
+          import sys
+          import aurum.agents, aurum.cli, aurum.live, aurum.research.walkforward, aurum.strategies
+          from aurum.strategies.base import list_strategies
+          assert len(list_strategies()) >= 15 and "rl_ppo" in list_strategies()
+          heavy = {"torch", "gymnasium", "stable_baselines3", "anthropic", "yfinance"} & set(sys.modules)
+          assert not heavy, f"optional deps imported eagerly: {sorted(heavy)}"
+          EOF
+      - name: CLI smoke
+        run: |
+          aurum --help
+          aurum strategies list
+          aurum desk demo
+      - name: Tests (offline, fast)
+        run: python -m pytest -m "not network and not slow" -ra --durations=15
+
+  all-extras:
+    name: all extras · py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install CPU-only torch (the default Linux wheel pulls GBs of CUDA libraries)
+        run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install (all extras)
+        run: python -m pip install -e ".[all]"
+      - name: Tests (offline, fast)
+        run: python -m pytest -m "not network and not slow" -ra --durations=15
+
+  min-deps:
+    name: minimum dependency versions · py3.10
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - name: Install the lowest versions allowed by pyproject.toml
+        run: |
+          python -m pip install uv
+          uv pip install --system --resolution lowest-direct -e ".[dev]"
+          python -c "import numpy, pandas, scipy, sklearn; print(numpy.__version__, pandas.__version__, scipy.__version__, sklearn.__version__)"
+      - name: Tests (offline, fast)
+        run: python -m pytest -m "not network and not slow" -ra

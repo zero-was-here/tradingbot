@@ -1,5 +1,6 @@
 # Smoke / CI configuration: a small strategy subset on recent data, short windows.
-# Runs the real walk-forward end to end in about a minute on H1.
+# Runs the real walk-forward end to end in about 10 seconds on H1. Its holdout (2026) overlaps the
+# protocol's 2025-26 holdout: a smoke test, never evidence.
 extends: default.yaml
 name: fast
 

@@ -61,6 +61,7 @@ from typing import Any, Union
 
 from aurum.core.instrument import XAUUSD
 from aurum.core.timeframes import get_timeframe
+from aurum.core.types import DEFAULT_MAGIC
 
 logger = logging.getLogger(__name__)
 
@@ -647,7 +648,7 @@ class LiveConfig:
     broker: str = "paper"                  # "paper" | "mt5"
     dry_run: bool = True
     allow_live_real: bool = False
-    magic: int = 20260927
+    magic: int = DEFAULT_MAGIC
     poll_seconds: float = 30.0             # retry poll while the market is closed
     symbol: str | None = None              # broker symbol (default: instrument.symbol)
     history_bars: int | None = None        # None: runner uses 3x the artifact's lookback

@@ -502,7 +502,7 @@ class _Runner:
         return fut
 
 
-def _resolve_executor(cfg: AurumConfig, n_bars: int, n_tasks: int) -> tuple[str, int]:
+def _resolve_executor(cfg: AurumConfig, n_bars: int, n_tasks: int, *, heavy: bool = False) -> tuple[str, int]:
     wf = cfg.walkforward
     n_jobs = wf.n_jobs or min(os.cpu_count() or 1, 8)
     n_jobs = max(1, min(n_jobs, max(1, n_tasks)))
@@ -510,7 +510,9 @@ def _resolve_executor(cfg: AurumConfig, n_bars: int, n_tasks: int) -> tuple[str,
     if kind == "auto":
         if n_jobs <= 1:
             kind = "serial"
-        elif n_bars >= _PROCESS_MIN_BARS:
+        elif n_bars >= _PROCESS_MIN_BARS or heavy:
+            # ``heavy``: per-fold ML fits use OpenMP; threads would oversubscribe the cores
+            # (measured 5-10x slower than processes, whose initializer caps OMP threads).
             kind = "process"
         else:
             kind = "thread"
@@ -1251,7 +1253,9 @@ def _run(md: MarketData, cfg: AurumConfig, strategies: dict[str, Strategy], plan
     n_research = settings["n_research"]
     ctx = _Ctx(md=md, n_research=n_research)
     n_tasks = sum(len(plans) + (holdout is not None) if s.trainable else 1 for s in strategies.values())
-    exec_kind, n_jobs = _resolve_executor(cfg, n_research, max(n_tasks, len(strategies) + 2))
+    heavy = any(getattr(s, "fit_history_bars", 0) > 0 or s.name in ("ml_gbm", "meta_label", "rl_ppo")
+                for s in strategies.values() if s.trainable)
+    exec_kind, n_jobs = _resolve_executor(cfg, n_research, max(n_tasks, len(strategies) + 2), heavy=heavy)
     logger.info("%s: %d strategies, %d folds, executor=%s(%d)", kind, len(strategies), len(plans), exec_kind, n_jobs)
     spec = _book_spec(cfg)
     # DSR trials: strategy configurations evaluated in THIS run (one config x N strategies, or

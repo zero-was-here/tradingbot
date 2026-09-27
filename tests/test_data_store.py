@@ -120,7 +120,9 @@ def test_save_bars_harmonises_mixed_datetime_units(tmp_path: Path):
     assert out.index.unit == pd.DatetimeIndex(out["available_at"]).unit
     assert frame_hash(out) == h  # values unchanged
     left = pd.DataFrame({"t": out.index})
-    right = pd.DataFrame({"t": out["available_at"].to_numpy(), "c": out["close"].to_numpy()})
+    # ``.array`` keeps the stored unit; on pandas 2.x a tz-aware ``.to_numpy()`` is an object
+    # array of Timestamps that re-infers as ``ns`` and would mask (or fake) a unit mismatch
+    right = pd.DataFrame({"t": out["available_at"].array, "c": out["close"].to_numpy()})
     merged = pd.merge_asof(left, right, on="t")  # raised "incompatible merge keys" before
     assert merged["c"].iloc[1] == out["close"].iloc[0]
 
