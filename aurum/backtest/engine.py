@@ -34,6 +34,27 @@ Loop per bar ``t = start .. end-1``::
 Risk interventions (approved != requested, halts, or any reasons returned) are recorded in
 ``BacktestResult.risk_events``. The engine additionally *enforces* the reduce-only rule:
 an approval outside ``[min(0, requested), max(0, requested)]`` is clamped and logged.
+
+Forecast hook (LLM-desk replay)
+-------------------------------
+``run_backtest(..., forecast_hook=fn, hook_every=k)`` calls
+``fn(bar_index, decision_time, forecast, state)`` at the close of every ``k``-th bar of the
+window (starting with its first bar) and uses the returned value — clipped to [-1, 1] — as
+the forecast *before* sizing; between calls the last returned value is held (a desk decision
+stands until the next cycle). ``state`` is a fresh dict with the book as seen at that close
+(``equity``, ``position``, ``drawdown``, ``peak_equity``, ``halted``, ``price``, ``spread``,
+``vol``, ``bar_time``, ``window_bar``). The hook sees only the past (it is called at the
+decision time with the causal forecast) and its output goes through the SAME sizer and risk
+manager, so it can shape exposure but never bypass risk: while the risk manager is halted
+the approved position is 0 whatever the hook returns (SPEC §0.3, §10). Without a hook the
+engine's arithmetic is unchanged.
+
+Holding a *forecast* between calls is only right for overlays whose output is itself a
+forecast. A policy expressed RELATIVE to the causal forecast (the LLM desk's ``overlay``
+mode: scale toward zero or veto) must be re-applied to the current forecast at every bar,
+otherwise a held value can outlive a reversal of the underlying signal (flip direction or
+add risk). Such callers use ``hook_every=1`` and decide the cadence of their expensive
+calls inside the hook (``aurum desk replay`` does).
 """
 
 from __future__ import annotations
@@ -227,9 +248,13 @@ class _Window:
     bars: pd.DataFrame            # bars_full.iloc[lo:hi+1]
     vol: list[float]              # causal vol forecast per window bar
     close: list[float]            # mid close per window bar
+    forecast: list[float] | None = None   # per-bar forecast used for reporting (writable)
+    state: dict[str, Any] | None = None   # live loop state (risk halted flag, equity peak)
 
 
 DecideFn = Callable[[int, float, float, float], float]
+#: ``hook(bar_index, decision_time, forecast, state) -> forecast`` (see module docstring).
+ForecastHook = Callable[[int, pd.Timestamp, float, dict], float]
 
 
 def _simulate(
@@ -290,7 +315,9 @@ def _simulate(
     atr_arr = atr_full[sl].tolist() if atr_full is not None else None
     fc_arr = forecast[sl].tolist() if forecast is not None else None
     close = bars["close"].to_numpy(dtype=float).tolist()
-    decide = make_decide(_Window(lo=lo, hi=hi, bars=bars, vol=vol_arr, close=close))
+    loop_state: dict[str, Any] = {"halted": False, "peak_equity": float(initial_equity)}
+    decide = make_decide(_Window(lo=lo, hi=hi, bars=bars, vol=vol_arr, close=close, forecast=fc_arr,
+                                 state=loop_state))
 
     sim = ExecutionSimulator(bars, instrument, costs, initial_equity)
     n = sim.n_bars
@@ -320,6 +347,9 @@ def _simulate(
         if eq > peak:
             peak = eq
         dd = max(0.0, 1.0 - eq / peak) if peak > 0 else 0.0
+        loop_state["peak_equity"] = peak
+        if risk is not None:
+            loop_state["halted"] = bool(getattr(risk, "halted", loop_state["halted"]))
 
         req = float(decide(t, eq, cur, dd))
         if not math.isfinite(req):
@@ -352,6 +382,7 @@ def _simulate(
             )
             decision = risk.evaluate(ctx)
             halted = bool(decision.halted)
+            loop_state["halted"] = halted
             reasons.extend(str(r) for r in decision.reasons)
             approved = 0.0 if halted else float(decision.approved_lots)
             approved, clamped = _clamp_reduce_only(order, approved)
@@ -454,6 +485,8 @@ def run_backtest(
     bars_per_year: float | None = None,
     event_horizon_hours: float = 24.0,
     compute_metrics: bool = True,
+    forecast_hook: ForecastHook | None = None,
+    hook_every: int = 1,
 ) -> BacktestResult:
     """Backtest a forecast series through sizer, risk manager and the execution simulator.
 
@@ -475,30 +508,86 @@ def run_backtest(
         decisions (recorded as ``stop_cooldown`` risk events). 0 = re-enter immediately.
     start, end : inclusive window (bar positions or timestamps). Inputs are computed on the
         full history first, so the window starts with warmed-up vol/ATR.
+    forecast_hook : optional ``hook(bar_index, decision_time, forecast, state) -> forecast``
+        called at the close of every ``hook_every``-th window bar (first bar included); the
+        returned value (clipped to [-1, 1]; non-finite -> 0) replaces the forecast before
+        sizing and is held until the next call. ``bar_index`` is the position in the FULL
+        bars frame, ``decision_time`` is ``available_at`` of that bar, and ``state`` holds
+        ``equity``, ``position``, ``drawdown``, ``peak_equity``, ``halted``, ``price``,
+        ``spread``, ``vol``, ``bar_time`` and ``window_bar``. Used to replay the LLM desk
+        through the SAME sizer and risk manager (it cannot bypass risk). ``result.forecast``
+        then holds the forecasts actually used; ``result.meta["hook"]`` summarises the calls.
     """
+    if isinstance(hook_every, bool) or int(hook_every) != hook_every or hook_every < 1:
+        raise ValueError(f"hook_every must be a positive integer, got {hook_every!r}")
+    if forecast_hook is not None and not callable(forecast_hook):
+        raise TypeError("forecast_hook must be callable")
     bars_full, _ = _unpack(md)
     fc = _align(forecast, pd.DatetimeIndex(bars_full.index), "forecast", fill=0.0, ffill=False)
     assert fc is not None
     np.clip(fc, -1.0, 1.0, out=fc)
+    hook_stats = {"calls": 0, "overrides": 0, "invalid": 0}
 
     def make_decide(w: _Window) -> DecideFn:
         f = fc[w.lo:w.hi + 1].tolist()
         v, c = w.vol, w.close
 
-        def decide(t: int, equity: float, current: float, dd: float) -> float:
-            return sizer.target_lots(f[t], v[t], equity, c[t], instrument,
+        if forecast_hook is None:
+            def decide(t: int, equity: float, current: float, dd: float) -> float:
+                return sizer.target_lots(f[t], v[t], equity, c[t], instrument,
+                                         current_lots=current, drawdown=dd)
+
+            return decide
+
+        dtimes = list(pd.DatetimeIndex(w.bars["available_at"]))
+        btimes = list(w.bars.index)
+        spreads = w.bars["spread"].to_numpy(dtype=float).tolist()
+        every = int(hook_every)
+        loop = w.state if w.state is not None else {}
+        held = [0.0]
+
+        def decide_hooked(t: int, equity: float, current: float, dd: float) -> float:
+            if t % every == 0:
+                state = {
+                    "equity": equity, "position": current, "drawdown": dd,
+                    "peak_equity": loop.get("peak_equity", equity), "halted": bool(loop.get("halted", False)),
+                    "price": c[t], "spread": spreads[t], "vol": v[t], "bar_time": btimes[t],
+                    "window_bar": t,
+                }
+                out = forecast_hook(w.lo + t, dtimes[t], f[t], state)
+                hook_stats["calls"] += 1
+                try:
+                    x = float(out)
+                except (TypeError, ValueError):
+                    x = math.nan
+                if not math.isfinite(x):
+                    hook_stats["invalid"] += 1
+                    if hook_stats["invalid"] <= 5:
+                        logger.warning("forecast_hook returned %r at bar %d; using 0 (flat)", out, w.lo + t)
+                    x = 0.0
+                held[0] = min(1.0, max(-1.0, x))
+            fe = held[0]
+            if fe != f[t]:
+                hook_stats["overrides"] += 1
+            if w.forecast is not None:
+                w.forecast[t] = fe  # report (and show risk) the forecast actually used
+            return sizer.target_lots(fe, v[t], equity, c[t], instrument,
                                      current_lots=current, drawdown=dd)
 
-        return decide
+        return decide_hooked
 
-    return _simulate(
+    meta: dict[str, Any] = {"engine": "run_backtest", "sizer": repr(sizer)}
+    result = _simulate(
         md, make_decide, risk=risk, instrument=instrument, costs=costs,
         initial_equity=initial_equity, vol=vol, forecast=fc, stop_atr_mult=stop_atr_mult,
         take_profit_atr_mult=take_profit_atr_mult, atr_period=atr_period,
         stop_cooldown_bars=stop_cooldown_bars, start=start, end=end, bars_per_year=bars_per_year,
         event_horizon_hours=event_horizon_hours, compute_metrics=compute_metrics,
-        meta={"engine": "run_backtest", "sizer": repr(sizer)},
+        meta=meta,
     )
+    if forecast_hook is not None:
+        result.meta["hook"] = {"hook": repr(forecast_hook), "every": int(hook_every), **hook_stats}
+    return result
 
 
 def run_target_lots(

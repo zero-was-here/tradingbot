@@ -1,0 +1,31 @@
+# Paper trading through aurum.live.runner: paper broker, dry-run, LIVE (conservative) risk
+# limits, the same costs/sizing/strategies as research. Workflow:
+#   aurum live artifact --config configs/live_paper.yaml     # fit on the latest data
+#   aurum live run      --config configs/live_paper.yaml     # bar-close loop
+# Real-money trading additionally requires `allow_live_real: true` AND the CLI flag
+# `--i-understand-real-money`; never enable it in this file. MT5 credentials are read from
+# MT5_LOGIN / MT5_PASSWORD / MT5_SERVER / MT5_PATH by the broker, never from YAML.
+extends: default.yaml
+name: live_paper
+
+live:
+  broker: paper
+  dry_run: true                   # plan + log orders only; set false to fill on the paper broker
+  allow_live_real: false
+  magic: 20260927
+  poll_seconds: 30.0
+  history_bars: null              # runner default: 3x the artifact's max lookback (EWM parity)
+  state_dir: runs/live/paper
+  artifact_dir: artifacts/live_paper
+  use_desk: false
+  options:                        # passed through to aurum.live.runner.LiveConfig
+    bar_close_delay_seconds: 5.0
+    on_error: hold
+    paper:
+      data: replay                # replay stored bars on a simulated clock
+      bars_path: data_store/xauusd_H1.parquet
+      warmup_bars: 6000
+      initial_equity: 100000
+
+agents:
+  enabled: false

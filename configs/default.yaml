@@ -1,0 +1,137 @@
+# Aurum v2 - default RESEARCH configuration.
+# H1 bars, the full rule-based + ML strategy set, research risk limits, LLM desk disabled.
+# Every other config in this directory `extends:` this file (deep merge; lists replace).
+# Secrets never go here: ANTHROPIC_API_KEY / MT5_PASSWORD / AURUM_ALERT_WEBHOOK_URL / AURUM_ARTIFACT_KEY
+# are read from the environment only.
+name: default
+seed: 7
+
+data:
+  dir: data_store                 # built by `aurum data download`
+  symbol: XAUUSD
+  timeframe: H1
+  macro: true                     # data_store/macro/*.parquet (joined point-in-time)
+  events: rule_based              # NFP + FOMC schedule (public in advance); or a CSV path; or none
+  start: "2013-01-01"             # 2012 Dukascopy data has zero spreads / flat bars
+  end: null
+  verify_hash: true
+
+instrument: {}                    # XAUUSD CFD defaults: 100 oz/lot, 0.01 lot step, swaps -45/+15 USD/lot/night
+
+costs:
+  spread_multiplier: 1.0          # x the recorded Dukascopy spread
+  min_spread: 0.10                # USD/oz floor
+  slippage_fixed: 0.02            # USD/oz per fill
+  slippage_range_frac: 0.02       # + 2% of the execution bar's high-low range
+  impact_coef: 0.0
+  commission_per_lot: null        # -> instrument.commission_per_lot
+
+features:
+  enabled: auto                   # auto: only strategies declaring uses_features get the config pipeline;
+  groups: null                    #       ml_gbm / meta_label fit their own FeaturePipeline per fold
+  overrides: {}
+  scaler: robust
+  clip: 5.0
+
+strategies:
+  # trend (Moskowitz-Ooi-Pedersen 2012; Hurst-Ooi-Pedersen 2017)
+  - {name: tsmom}
+  - {name: ema_cross}
+  - {name: donchian}
+  - {name: kalman_trend}
+  # mean reversion (short-horizon liquidity provision)
+  - {name: zscore_fade}
+  - {name: rsi2}
+  - {name: bollinger_revert}
+  # breakout
+  - {name: vol_squeeze}
+  - {name: orb}
+  # macro (dollar / real yields; risk-off)
+  - {name: macro_factor}
+  - {name: risk_off}
+  # learned (trainable -> refit every fold on training bars only)
+  - {name: intraday_seasonality}
+  - {name: ml_gbm}
+  - {name: meta_label}
+  # rl_ppo is NOT in the default set: it trains a PPO policy inside every fold (hours).
+  # Train once with `aurum rl train` and add {name: rl_ppo, params: {artifact_dir: ...}} -
+  # a pre-trained artifact is only out-of-sample AFTER its validation end date.
+
+combiner:
+  method: sharpe_shrink           # sharpe_shrink | equal | inverse_vol | hrp | fixed (uses strategies[].weight)
+  shrinkage: 0.5
+  max_weight: 0.4
+  fdm_cap: 2.5
+
+sizing:
+  method: vol_target
+  target_vol: 0.10                # 10% annualised for a +/-1 forecast
+  max_leverage: 2.0
+  rebalance_band: 0.10
+  drawdown_derisk: [[0.10, 0.5], [0.15, 0.25]]
+
+risk:
+  enabled: true
+  research:                       # layered over RESEARCH_RISK_DEFAULTS (see aurum/core/config.py)
+    max_daily_loss: 0.03
+    daily_loss_persistent: false  # a -3% day halts for the rest of THAT day only (halts are reported)
+    max_drawdown: null            # the permanent kill switch is a live control; research reports drawdowns
+    max_leverage: 3.0
+    max_spread: 2.0               # USD/oz: block new risk on abnormal spreads
+    blackout_mode: no_new_risk
+  live:                           # layered over RiskLimits defaults (conservative)
+    max_daily_loss: 0.03
+    daily_loss_persistent: true   # needs a human reset_halt(confirm="RESET")
+    max_drawdown: 0.20
+    max_leverage: 3.0
+    max_spread: 1.5
+    stale_data_seconds: 7200
+    blackout_mode: no_new_risk
+
+backtest:
+  initial_equity: 100000
+  stop_atr_mult: null
+  take_profit_atr_mult: null
+  benchmark: true                 # buy-and-hold over the same span (pays CFD swap)
+
+walkforward:
+  train: 3Y
+  test: 6M
+  step: null                      # = test (contiguous OOS blocks)
+  anchored: false
+  purge: auto                     # >= max label horizon of trainable strategies
+  embargo: 24                     # bars (1 trading day on H1)
+  holdout_start: "2025-01-01"     # final holdout: excluded from every fold, evaluated ONCE
+  min_train_bars: 500
+  n_trials: null                  # DSR trials; null = number of strategy configs
+  pbo_splits: 16
+  n_boot: 1000
+  on_strategy_error: raise
+  n_jobs: 0                       # 0 = auto
+  executor: auto
+
+agents:
+  enabled: false
+  policy: {mode: overlay, max_abs_forecast: 1.0, on_failure: follow_quant, min_confidence: 0.0}
+  desk: {}
+  anonymise: true
+  replay_every: 24
+  replay_max_cost_usd: 25.0
+
+live:
+  broker: paper
+  dry_run: true
+  allow_live_real: false
+  magic: 20260927
+
+rl:
+  train_start: "2013-01-01"
+  train_end: "2019-12-31"
+  val_end: "2021-12-31"
+  out_dir: runs/rl/ppo
+  params: {total_timesteps: 200000, n_envs: 4}
+
+output:
+  dir: runs
+  save_results: true
+  tearsheet: true

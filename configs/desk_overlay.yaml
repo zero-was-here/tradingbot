@@ -1,0 +1,29 @@
+# LLM desk as an OVERLAY on the quant book (SPEC §10): the Chief may scale the quant
+# forecast in [0, 1] or veto it, never flip direction or add risk; its output goes through
+# the same sizer and risk manager. `aurum desk run` / `aurum desk replay` read this.
+# Needs ANTHROPIC_API_KEY in the environment (never in this file).
+extends: default.yaml
+name: desk_overlay
+
+agents:
+  enabled: true
+  policy:
+    mode: overlay
+    max_abs_forecast: 1.0
+    on_failure: follow_quant      # API failure / refusal -> the quant forecast stands
+    min_confidence: 0.0
+  desk:                           # aurum.agents.config.DeskConfig (models: desk defaults)
+    chief: {effort: high, max_turns: 8}
+    specialist: {effort: medium, max_turns: 5}
+    max_specialists_per_cycle: 4
+    max_parallel_agents: 4
+    max_cost_usd_per_cycle: 2.0
+    cache_ttl: 1h                 # keeps the static prompt prefix warm across H1 cycles
+  anonymise: true                 # replay: shift dates / rebase prices (mitigates memorisation)
+  lookback_bars: 250
+  replay_every: 24                # one desk cycle per trading day on H1
+  replay_max_cost_usd: 25.0
+  expected_cost_per_cycle_usd: 0.60
+
+live:
+  use_desk: true

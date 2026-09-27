@@ -1,0 +1,22 @@
+# Smoke / CI configuration: a small strategy subset on recent data, short windows.
+# Runs the real walk-forward end to end in about a minute on H1.
+extends: default.yaml
+name: fast
+
+data:
+  start: "2019-01-01"
+
+strategies:
+  - {name: tsmom}
+  - {name: ema_cross}
+  - {name: donchian}
+  - {name: zscore_fade}
+  - {name: rsi2}
+  - {name: macro_factor}
+  - {name: intraday_seasonality}  # one trainable strategy: exercises per-fold refits
+
+walkforward:
+  train: 2Y
+  test: 6M
+  holdout_start: "2026-01-01"
+  n_boot: 300
