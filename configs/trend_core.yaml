@@ -1,0 +1,17 @@
+# Pre-registered alternative (docs/RESEARCH_PROTOCOL.md): the literature-backed, low-turnover
+# core — multi-speed trend following, breakout from compression, and the dollar/real-yield
+# macro linkage. Everything else is inherited from default.yaml.
+extends: default.yaml
+name: trend_core
+
+strategies:
+  - {name: tsmom}
+  - {name: ema_cross}
+  - {name: donchian}
+  - {name: kalman_trend}
+  - {name: vol_squeeze}
+  - {name: macro_factor}
+  - {name: risk_off}
+
+walkforward:
+  n_trials: 23

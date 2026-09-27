@@ -362,7 +362,9 @@ def test_transform_of_slice_equals_slice_of_transform(raw: pd.DataFrame) -> None
     the rows of the full transform (row-wise scaling, no hidden state from earlier rows)."""
     pipe = FeaturePipeline().fit(raw.iloc[:2500])
     a = 2700
-    assert raw.iloc[a].notna().all()
+    # every FITTED column is past its warm-up at ``a`` (``regime``'s bounded 1-year vol rank
+    # is still warming up on this 4,000-bar history; all-NaN in train, it is dropped at fit)
+    assert raw.iloc[a][pipe.columns].notna().all()
     pd.testing.assert_frame_equal(pipe.transform(raw.iloc[a:]), pipe.transform(raw).iloc[a:])
 
 

@@ -62,7 +62,7 @@ TIME_ONLY = frozenset({"intraday_seasonality"})
 #: keep the expensive learners small, and switch off skill gates / pre-tests that would make
 #: the forecast identically 0 on synthetic data (a zero forecast makes the check vacuous).
 TEST_PARAMS: dict[str, dict[str, Any]] = {
-    "intraday_seasonality": {"significance": None, "shrinkage": 500.0, "min_obs": 5},
+    "intraday_seasonality": {"significance": None, "shrinkage": 500.0, "min_obs": 5, "cost_multiplier": 0.0},
     # the synthetic VIX path has no spike above +1.5 sd: lower the thresholds so the regime
     # machinery (EWMA baseline, hysteresis, DXY filter, as-of join) is actually exercised.
     "risk_off": {"entry_z": 0.0, "exit_z": -1.0},

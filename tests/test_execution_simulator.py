@@ -11,11 +11,16 @@ import pytest
 from aurum.core.instrument import XAUUSD
 from aurum.data.schema import make_bars
 from aurum.data.synthetic import make_synthetic_bars
-from aurum.execution.costs import CostModel
+from aurum.execution.costs import CostModel, FinancingModel
 from aurum.execution.simulator import ExecutionSimulator
 
-NO_SLIP = CostModel(min_spread=0.0, slippage_fixed=0.0, slippage_range_frac=0.0, commission_per_lot=0.0)
-FIXED_SLIP = CostModel(min_spread=0.0, slippage_fixed=0.02, slippage_range_frac=0.0, commission_per_lot=0.0)
+# These scenarios pin the per-lot ("fixed") swap model they were written for (rate-based
+# financing is the CostModel default; it is covered in tests/test_financing_*.py).
+FIXED = FinancingModel.fixed()
+NO_SLIP = CostModel(min_spread=0.0, slippage_fixed=0.0, slippage_range_frac=0.0, commission_per_lot=0.0,
+                    financing=FIXED)
+FIXED_SLIP = CostModel(min_spread=0.0, slippage_fixed=0.02, slippage_range_frac=0.0, commission_per_lot=0.0,
+                       financing=FIXED)
 NO_SWAP = dataclasses.replace(XAUUSD, swap_long_per_lot=0.0, swap_short_per_lot=0.0)
 
 
@@ -469,7 +474,7 @@ def test_equity_matches_independent_reference_model(seed: int) -> None:
     bars = make_synthetic_bars(24 * 9, seed=seed, spread=0.4, start="2024-01-09 15:00")  # 2 weekends
     inst = dataclasses.replace(XAUUSD, swap_long_per_lot=-40.0, swap_short_per_lot=12.0)
     cm = CostModel(spread_multiplier=1.1, min_spread=0.2, slippage_fixed=0.03,
-                   slippage_range_frac=0.04, impact_coef=0.05, commission_per_lot=3.5)
+                   slippage_range_frac=0.04, impact_coef=0.05, commission_per_lot=3.5, financing=FIXED)
     steps: list[tuple[float, float | None, float | None]] = []
     sim = ExecutionSimulator(bars, instrument=inst, costs=cm, initial_equity=150_000.0)
     tgt = 0.0

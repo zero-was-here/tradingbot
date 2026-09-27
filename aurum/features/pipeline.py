@@ -35,9 +35,12 @@ function, so overriding a window moves it while non-window parameters (``bars_pe
 DAYS whatever the bar size, so their bar count scales with ``bar_minutes`` (recorded by
 ``compute``, settable in the constructor, persisted in JSON; H1 is assumed until known).
 It is the bars needed until values are *defined*; EWM-based features (EMAs, EWMA vol, the
-D1 EWM vol in ``mtf``) keep a decaying dependence on their seed, and the expanding vol rank
-in ``regime`` on the whole history — a live runner must compute on a long history (and
-check ``parity_report`` against research) for bit-level parity.
+D1 EWM vol in ``mtf``) keep a decaying dependence on their seed — a live runner must compute
+on a long history (and check ``parity_report`` against research) for bit-level parity. The
+``regime`` group is fully window-bounded (its bounded vol rank is NaN until its window of
+``rank_years`` is full, so its warm-up — about one year of bars, e.g. 5,820 H1 bars — is also
+the history after which its values no longer depend on where the history starts); the
+legacy expanding rank (``expanding=True``) is not.
 
 Group order
 -----------

@@ -31,10 +31,11 @@ TRAIN_FRAC = 0.6
 RULES = ("tsmom", "ema_cross", "donchian", "kalman_trend", "zscore_fade", "rsi2",
          "bollinger_revert", "vol_squeeze", "orb", "macro_factor", "risk_off",
          "intraday_seasonality")
-#: extra null cases: seasonality with its pre-test disabled (so a non-trivial table is traded)
-#: and risk_off with low thresholds (the default rarely fires on synthetic VIX).
+#: extra null cases: seasonality with its pre-test and cost gate disabled (so a non-trivial
+#: table is traded: with costs the fitted positions on noise are flat) and risk_off with low
+#: thresholds (the default rarely fires on synthetic VIX).
 EXTRA_NULL = {
-    "intraday_seasonality/forced": ("intraday_seasonality", {"significance": None}),
+    "intraday_seasonality/forced": ("intraday_seasonality", {"significance": None, "cost_multiplier": 0.0}),
     "risk_off/active": ("risk_off", {"entry_z": 0.5, "exit_z": -0.5}),
 }
 

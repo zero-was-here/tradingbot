@@ -92,7 +92,9 @@ def test_variance_ratio_orders_processes() -> None:
 
 
 def test_regime_group_values(h1: pd.DataFrame) -> None:
-    out = regime_features(MarketData(bars=h1))
+    # the expanding rank is opt-in (not sliding-window-stable); the default rank is bounded
+    out = regime_features(MarketData(bars=h1), expanding=True, rank_window=1000)
+    assert "regime_vol_pctrank_exp" not in regime_features(MarketData(bars=h1)).columns
     rank = out["regime_vol_pctrank_exp"]
     assert rank.dropna().between(0, 1).all()
     # expanding rank at t equals the empirical CDF of past vols (incl. t)
@@ -101,6 +103,14 @@ def test_regime_group_values(h1: pd.DataFrame) -> None:
     past = rv.iloc[: t + 1].dropna()
     assert rank.iloc[t] == pytest.approx((past < past.iloc[-1]).mean() + 0.5 * (past == past.iloc[-1]).mean()
                                          + 0.5 / len(past), abs=1e-12)
+    # bounded rank at t: the same statistic over the last 1000 vols only, NaN until full
+    bounded = out["regime_vol_pctrank"]
+    win = rv.iloc[t - 999: t + 1]
+    assert bounded.iloc[t] == pytest.approx((win < win.iloc[-1]).mean() + 0.5 * (win == win.iloc[-1]).mean()
+                                            + 0.5 / len(win), abs=1e-12)
+    assert bounded.iloc[: 24 + 1000 - 1].isna().all() and bounded.iloc[24 + 1000 - 1:].notna().all()
+    np.testing.assert_array_equal(out["regime_high_vol"].dropna(), (bounded.dropna() > 0.8).astype(float))
+    np.testing.assert_array_equal(out["regime_low_vol"].dropna(), (bounded.dropna() < 0.2).astype(float))
     hurst = out["regime_hurst_16"]
     np.testing.assert_allclose(hurst.dropna(), 0.5 * (1 + np.log(out["regime_vr_16"].dropna()) / math.log(16)))
     assert set(out["regime_trend_state"].dropna().unique()) <= {-1.0, 0.0, 1.0}

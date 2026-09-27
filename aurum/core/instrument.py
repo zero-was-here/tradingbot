@@ -3,6 +3,14 @@
 Defaults describe a typical retail/prime-broker XAUUSD CFD:
 1 lot = 100 troy ounces, price quoted in USD per ounce with 2 decimals.
 All money amounts are in the account currency (assumed USD).
+
+Overnight financing is modelled by :class:`aurum.execution.costs.FinancingModel`
+(``CostModel.financing``). Its default ``"rate"`` mode charges the USD benchmark rate +/- a
+broker markup on the notional and only uses ``triple_swap_weekday`` / ``rollover_hour_utc``
+from here; the per-lot ``swap_long_per_lot`` / ``swap_short_per_lot`` quotes below are used
+by the ``"fixed"`` mode only (a broker's quoted swap table). The -45/+15 USD defaults are
+roughly 9%/yr of a $1,800 notional for a long, far above the 2012-2021 benchmark rates, so
+they are kept for backward compatibility, not as a realistic default.
 """
 
 from __future__ import annotations
@@ -21,8 +29,8 @@ class Instrument:
     max_lot: float = 50.0
     margin_rate: float = 0.01               # 1% => 1:100 leverage; margin = notional * margin_rate
     commission_per_lot: float = 0.0         # USD per lot per side (ECN accounts often ~3.5)
-    swap_long_per_lot: float = -45.0        # USD per lot per night held long (negative = you pay)
-    swap_short_per_lot: float = 15.0        # USD per lot per night held short
+    swap_long_per_lot: float = -45.0        # "fixed" financing: USD/lot/night held long (negative = you pay)
+    swap_short_per_lot: float = 15.0        # "fixed" financing: USD/lot/night held short
     triple_swap_weekday: int = 2            # 0=Mon ... 2=Wed charges 3 nights (weekend financing)
     rollover_hour_utc: int = 21             # broker "server midnight" in UTC (approx 17:00 New York)
     tags: dict = field(default_factory=dict, compare=False, hash=False)

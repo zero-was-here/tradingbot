@@ -148,7 +148,7 @@ feature groups; each group returns many columns prefixed with its family.
 | multi_timeframe.py | `mtf` | for each of `htfs=("H4","D1")`: resample with `resample_bars`, compute compact trend/momentum/vol features on the HTF bars, then `align_htf`. Also previous completed day's high/low/close & distance to them in ATR |
 | macro.py | `macro` | requires `md.macro`; per series: 1/5/20-day changes (log returns for prices, bp changes for yields), 250-day rolling z of level; rolling 60-day correlation & beta of daily gold returns vs dxy/real10y (gold daily built from bars via `resample_bars(...,"D1")` so it is point-in-time); all aligned with `asof_join(bars.available_at, ...)`. Missing series → skip those columns (log at INFO); no macro at all → empty frame with the right index |
 | calendar.py | `calendar` | requires `md.events`; hours until next event (importance>=3, capped 72), hours since last, in-window flags (±30 min, ±2 h), next-event-type one-hots (NFP/CPI/FOMC) |
-| regime.py | `regime` | expanding-window percentile rank of realised vol (causal), Kaufman efficiency ratio, rolling variance-ratio / Hurst proxy, trend-strength regime; NO fitted models here (HMM lives in `aurum.models.regime`) |
+| regime.py | `regime` | BOUNDED rolling percentile rank of realised vol over `rank_years` years of bars (default 1.0; `rank_window=<bars>` overrides; NaN until the window is full, so the group's warm-up `vol_window + W` is also where values stop depending on the history start — live/research parity), high/low-vol flags from it (`expanding=True` adds the legacy expanding rank `regime_vol_pctrank_exp`), Kaufman efficiency ratio, rolling variance-ratio / Hurst proxy, trend strength normalised by the RMS of the same window (`vol_halflife=` restores the EWMA normaliser); NO fitted models here (HMM lives in `aurum.models.regime`) |
 
 ### 4.1 `pipeline.py`
 ```python
@@ -192,21 +192,34 @@ long/short unless noted. Required families (each file may hold several classes):
 - `macro.py`: `macro_factor` (gold vs DXY and real-yield momentum: long gold when dollar
   and real yields fall; uses `md.macro`, point-in-time), `risk_off` (VIX spike regime).
 - `seasonal.py`: `intraday_seasonality` (learned hour-of-week mean returns on TRAIN with
-  shrinkage; trainable).
+  shrinkage; trainable). Positions are chosen NET of costs (`cost_aware=True`): a periodic
+  mean-variance problem with proportional costs over the weekly cycle (DP on a position
+  grid; costs from the TRAIN bars' spreads/ranges via `params.costs`, default `CostModel()`;
+  `cost_multiplier` = required edge/cost margin, default 2; `dead_zone="auto"`).
+  `cost_aware=False` or `cost_multiplier=0` gives the frictionless table.
 - `ml.py`: `ml_gbm` (HistGradientBoosting on FeaturePipeline features predicting sign of
   forward vol-normalised return with purged training, probability → forecast via
   `2p-1` with calibration & dead-zone), `meta_label` (triple-barrier meta-labelling of a
   primary strategy: ML model predicts whether the primary signal will hit TP before SL,
   forecast = primary * size-from-probability). Both trainable, both use `aurum.labels`.
 - `rl.py`: `rl_ppo` adapter that loads a trained SB3 policy from `aurum.rl` (lazy torch
-  import — importing `aurum.strategies.rl` must NOT require torch).
+  import — importing `aurum.strategies.rl` must NOT require torch). Attaching an artifact
+  embeds its files' bytes + SHA-256 fingerprint in the strategy (self-contained pickles;
+  `aurum.rl.train.read_artifact_bytes` / `load_artifact_bytes`); tampered bytes are refused.
 
 ## 7. Portfolio & risk
 - `portfolio/combiner.py`: `ForecastCombiner(method="sharpe_shrink"|"equal"|"inverse_vol"|"hrp",
-  shrinkage=0.5, max_weight=0.4, fdm_cap=2.5)`; `fit(forecasts: DataFrame, close: Series)`
-  computes each strategy's unit-vol return stream `f_i[t] * r[t+1] / vol[t]` on TRAIN,
-  weights by method, and a forecast diversification multiplier; `combine(forecasts) ->
-  Series` in [-1,1]; `weights_` attribute; `explain()` dict for agents/reports.
+  shrinkage=0.5, max_weight=0.4, fdm_cap=2.5, ..., allow_unallocated=True, cost_multiplier=1.0)`;
+  `fit(forecasts, close, *, bars=None, spread=None, costs=None, instrument=None,
+  cost_per_turnover=None)` computes each strategy's unit-vol return stream
+  `f_i[t] * r[t+1] / vol[t]` on TRAIN, NET of `c_t * |f_i[t] - f_i[t-1]|` with
+  `c_t = (spread_eff/2 + slippage + commission/oz) / (close[t] * vol[t])` from the cost model
+  when cost information is given (gross otherwise, noted), weights by method, and a forecast
+  diversification multiplier (`sum(w)/sqrt(w'Hw)`); `combine(forecasts) -> Series` in [-1,1];
+  `weights_` attribute; `explain()` dict for agents/reports. With `allow_unallocated=True`
+  (config `combiner.allow_unallocated`, default) strategies with a non-positive NET Sharpe get
+  zero weight and the cap never forces weight onto them, so weights may sum to < 1 (less
+  risk; no positive net Sharpe -> flat book); `False` restores sum-to-1.
 - `portfolio/sizing.py`: `VolTargetSizer(target_vol=0.10, max_leverage=2.0, max_lots=None,
   rebalance_band=0.10, kelly_cap=None, drawdown_derisk=((0.10, 0.5), (0.15, 0.25)))`
   implementing `aurum.core.interfaces.PositionSizer`:
@@ -231,33 +244,50 @@ long/short unless noted. Required families (each file may hold several classes):
 
 ## 8. Execution & backtest
 - `execution/costs.py`: `CostModel(spread_multiplier=1.0, min_spread=0.10, slippage_fixed=0.02,
-  slippage_range_frac=0.02, impact_coef=0.0, commission_per_lot=None (→ instrument))`
-  with `fill_price(side, mid, spread, bar_range, lots)` → (price, spread_cost, slippage_cost),
-  `commission(lots)`, `swap(lots, nights)` (uses instrument swap per lot, triple on
+  slippage_range_frac=0.02, impact_coef=0.0, commission_per_lot=None (→ instrument),
+  financing=FinancingModel())` with `fill_price(side, mid, spread, bar_range, lots)` →
+  (price, spread_cost, slippage_cost), `commission(lots)`, `swap(lots, nights, *, instrument,
+  price=None, rate_nights=None)` and `swap_between(lots, start, end, *, instrument, price=None,
+  rates=None)` (delegate to the financing model; nights are triple-weighted on
   `triple_swap_weekday`). Rollover happens when a position is held across
-  `instrument.rollover_hour_utc` on a weekday.
+  `instrument.rollover_hour_utc` on a weekday. `CostModel.zero()` has no financing either.
+  `FinancingModel(mode="rate"|"fixed"|"none", markup_long=0.025, markup_short=0.025,
+  lease_rate=0.0, rate_series="fedfunds", rate_unit="percent", fallback_rate=0.03,
+  day_count=360)`: `"rate"` (default) charges per financing night
+  `-lots * contract_size * P * (r - lease ± markup) / day_count` (long `+markup_long`, short
+  `-markup_short`), `P` the mid at the rollover, `r` the benchmark from `md.macro[rate_series]`
+  read POINT-IN-TIME as of the rollover instant `R` (`RateCurve`: latest `available_at <= R`,
+  `fallback_rate` before the first print / without a series, warned once); `"fixed"` = the
+  instrument's per-lot swaps (legacy, bit-identical); `"none"`. Config: `costs.financing`.
 - `execution/simulator.py`:
 ```python
 class ExecutionSimulator:
-    def __init__(self, bars, instrument=XAUUSD, costs=CostModel(), initial_equity=100_000.0): ...
+    def __init__(self, bars, instrument=XAUUSD, costs=CostModel(), initial_equity=100_000.0,
+                 *, validate=True, rates=None): ...   # rates: md.macro / frame / Series / RateCurve
     def reset(self, start: int = 0, equity: float | None = None) -> None
     index: int; equity: float; position: float; done: bool; cash etc.
     def step(self, target_lots: float, *, stop_price: float | None = None,
              take_profit: float | None = None) -> StepResult
         # Called at the close of bar `index`. Trades to target at open of index+1, applies
         # costs, checks intrabar stop/TP on bar index+1 (stop first if both touched; a gap
-        # through the stop fills at the open), applies swap on rollover, marks to market at
-        # close of index+1, advances index. StepResult has equity, pnl, costs dict, fills,
-        # position, done, exit_reason.
+        # through the stop fills at the open; `intrabar_exit`, shared with the paper broker and
+        # the live runner), applies financing on rollover (rate mode: notional at close[t+1],
+        # close[t] for a rollover in the gap), marks to market at close of index+1, advances
+        # index. StepResult has equity, pnl, costs dict, fills, position, done, exit_reason.
     def result(self) -> BacktestResult   # assemble series/trades so far
 ```
 - `backtest/engine.py`:
 ```python
 def run_backtest(md, forecast: pd.Series, *, sizer, risk=None, instrument=XAUUSD,
                  costs=CostModel(), initial_equity=100_000.0, vol=None,
-                 stop_atr_mult: float | None = None, start=None, end=None) -> BacktestResult
+                 stop_atr_mult: float | None = None, start=None, end=None,
+                 financing=None, rates=None) -> BacktestResult
 def run_target_lots(md, target_lots: pd.Series, ...) -> BacktestResult   # for pre-sized paths
 ```
+  `financing=` overrides `costs.financing` (model, kwargs or mode name); `rates=` defaults to
+  `md.macro` (read as of each rollover). Same for `buy_and_hold_benchmark` (frictionless =
+  no financing). The RL env (`GoldTradingEnv(..., rates=)`) and `PaperBroker(..., rates=)`
+  must get the same rate source to stay in parity with the engine.
   Loop over bars: `vol` defaults to `ewma_volatility(close)`; at each close compute
   sizer target → risk.evaluate → sim.step. Record risk events.
 - `backtest/metrics.py`: `compute_metrics(result_or_returns, *, bars_per_year=None, trades=None,
@@ -284,6 +314,19 @@ def run_target_lots(md, target_lots: pd.Series, ...) -> BacktestResult   # for p
 - `walkforward.py` (wave 2): orchestrates features → strategies → combiner → backtest per
   fold with refits; stitches OOS forecasts; runs ONE continuous backtest on the stitched
   OOS; returns `WalkForwardReport` with per-strategy OOS metrics, combined metrics, DSR/PBO.
+  `Strategy.fit` gets macro rows published by the last training bar's close only. The
+  combiner is fitted net of costs (bars + `costs` + `instrument` of the config). Holdout
+  evaluations are appended to the holdout ledger (`<output root>/holdout_ledger.jsonl`:
+  timestamp, config/data hash, window, strategies, metrics); it is read BEFORE the holdout
+  is evaluated, and overlapping windows evaluated by OTHER config hashes raise a WARNING +
+  report note and add to the DSR `n_trials` (= `walkforward.n_trials` or #strategies +
+  distinct prior other-config looks). Holdout OOS forecasts are saved
+  (`holdout/oos_forecasts.parquet`).
+- `aurum train-final --config C --out DIR [--cutoff TS] [--from-run WF_DIR]`: production
+  artifact fitted on data closed at/before the cutoff (macro truncated point-in-time); the
+  combiner weights come from the stitched OUT-OF-SAMPLE forecasts (research + holdout) of a
+  walk-forward run with the same config hash (or one run in-process); loadable by
+  `aurum.live.runner.load_artifact` (with the TRAIN-window `feature_reference`).
 
 ## 10. LLM trading desk (`aurum.agents`)
 Multi-agent layer driven by the Claude API (`anthropic` SDK). A **Chief Investment Officer**
@@ -308,13 +351,18 @@ parallel) and return memos. The Chief ends every cycle by calling `submit_decisi
 ## 11. Live (`aurum.live`)
 - `broker.py`: `Broker` protocol (`account()`, `positions(symbol, magic)`, `place_order(order)`,
   `close_all(symbol, magic)`, `latest_bars(symbol, timeframe, n)` returning CLOSED bars only,
-  `is_demo()`); `paper.py` `PaperBroker` backed by `ExecutionSimulator` semantics;
+  `is_demo()`); `paper.py` `PaperBroker` backed by `ExecutionSimulator` semantics (same
+  `intrabar_exit`, same financing valuation; `rates=` / `set_rates()` — the runner passes and
+  refreshes `macro_dir` frames);
   `mt5.py` `MT5Broker` (lazy `import MetaTrader5`; magic-number isolation; broker-side SL;
   retcode handling; server-time → UTC).
 - `oms.py`: idempotent client ids, reconciliation (target vs actual), retries, rejects.
 - `runner.py`: bar-close scheduler; builds `MarketData` from the broker, runs the SAME
   feature pipeline (loaded from artifact), strategies, combiner, optional LLM desk, sizer,
   risk manager, OMS. `dry_run=True` default; refuses real (non-demo) accounts unless
-  `allow_live_real=True` in config AND `--i-understand-real-money` CLI flag.
+  `allow_live_real=True` in config AND `--i-understand-real-money` CLI flag. The final
+  forecast of the last decision is persisted (`runner_state.json` `prev_final_forecast`) and
+  passed to the desk as `previous_forecast` (so `on_failure="hold"` survives restarts);
+  `backtest.stop_cooldown_bars` is honoured live.
 - `monitor.py`: feature drift (PSI) vs training stats, live vs backtest slippage, heartbeat,
   optional webhook alerts.

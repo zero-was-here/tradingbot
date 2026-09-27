@@ -159,16 +159,25 @@ def test_shared_out_dir_never_swaps_a_fitted_policy(two_folds) -> None:
 
 
 def test_modified_artifact_is_refused(two_folds, tmp_path: Path) -> None:
-    """A strategy never silently runs a policy other than the one it attached."""
+    """A strategy never silently runs a policy other than the one it attached: the attached
+    files are embedded, so overwriting the directory afterwards changes nothing, tampered
+    embedded bytes are refused, and only an explicit ``load`` attaches new files."""
     import shutil
 
-    md, s1, _, _, s2 = two_folds
+    md, s1, f1, _, s2 = two_folds
     art = tmp_path / "art"
     shutil.copytree(s1.artifact_dir_, art)
     s = RLPolicyStrategy.from_artifact(art)
     shutil.copy(s2.artifact_dir_ / "policy.zip", art / "policy.zip")  # overwritten on disk
-    with pytest.raises(RuntimeError, match="changed on disk"):
-        s.generate(md)
+    pd.testing.assert_series_equal(s.generate(md), f1)                # still the attached policy
+    tampered = pickle.loads(pickle.dumps(s1))
+    tampered._bundle["policy.zip"] = (s2.artifact_dir_ / "policy.zip").read_bytes()
+    with pytest.raises(RuntimeError, match="fingerprint"):
+        tampered.generate(md)
+    old_fp = s.artifact_fingerprint_
+    s.load(art)                                                         # explicit re-attach
+    assert s.artifact_fingerprint_ != old_fp
+    assert s._bundle["policy.zip"] == (s2.artifact_dir_ / "policy.zip").read_bytes()
 
 
 def test_generate_rejects_a_different_bar_size(fitted) -> None:

@@ -84,6 +84,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ARTIFACT_FILES",
     "DEFAULT_FEATURE_GROUPS",
+    "POLICY_FILES",
     "EvalOutcome",
     "PreparedData",
     "RLArtifact",
@@ -93,8 +94,10 @@ __all__ = [
     "check_bar_size",
     "evaluate_policy",
     "load_artifact",
+    "load_artifact_bytes",
     "make_predictor",
     "prepare_data",
+    "read_artifact_bytes",
     "resolve_device",
     "rollout_artifact",
     "train_ppo",
@@ -293,10 +296,12 @@ def _make_env(data: PreparedData, env_cfg: EnvConfig, *, train: bool,
         lo, hi = 0, data.n_train - 1
     else:
         lo, hi = data.val_range
+    # rates=md.macro: the same point-in-time benchmark run_backtest reads (backtest_forecast
+    # passes data.md), so training rewards, rollouts and the engine agree under rate financing
     return GoldTradingEnv(
         data.md.bars, data.features, env_cfg, events=data.md.events, vol=data.vol,
         start=lo if start is None else start, end=hi if end is None else end,
-        random_start=train)
+        random_start=train, rates=data.md.macro)
 
 
 # -----------------------------------------------------------------------------------------
@@ -658,9 +663,13 @@ def train_ppo(
 # -----------------------------------------------------------------------------------------
 @dataclass
 class RLArtifact:
-    """A trained policy with everything needed to reproduce its observations."""
+    """A trained policy with everything needed to reproduce its observations.
 
-    path: Path
+    ``path`` is where it was loaded from — informational only (``None`` or a directory that
+    no longer exists when it was rebuilt from embedded bytes, see
+    :func:`load_artifact_bytes`)."""
+
+    path: Path | None
     model: Any
     pipeline: FeaturePipeline
     config: RLTrainConfig
@@ -674,20 +683,47 @@ class RLArtifact:
         return self._predict(obs)
 
 
-def load_artifact(path: str | Path, *, device: str = "cpu") -> RLArtifact:
-    """Load ``policy.zip`` + ``pipeline.json`` + ``config.json`` (+ ``metrics.json``)."""
-    from stable_baselines3 import PPO
+#: Files that define a policy's behaviour (network, feature scaling, env config); together
+#: with the optional ``metrics.json`` they are what :func:`read_artifact_bytes` returns.
+POLICY_FILES = ("policy.zip", "pipeline.json", "config.json")
 
+
+def read_artifact_bytes(path: str | Path) -> dict[str, bytes]:
+    """The artifact's defining files (``POLICY_FILES`` + ``metrics.json`` when present) as
+    bytes, e.g. to embed a policy in a pickled strategy so it no longer depends on the
+    directory (see ``aurum.strategies.rl``)."""
     p = Path(path)
-    missing = [f for f in ("policy.zip", "pipeline.json", "config.json") if not (p / f).exists()]
+    missing = [f for f in POLICY_FILES if not (p / f).exists()]
     if missing:
         raise FileNotFoundError(f"RL artifact {p} is missing {missing}")
-    cfg = RLTrainConfig.from_dict(json.loads((p / "config.json").read_text(encoding="utf-8")))
-    pipe = FeaturePipeline.load(p / "pipeline.json")
-    model = PPO.load(p / "policy.zip", device=resolve_device(device))
-    mpath = p / "metrics.json"
-    metrics = json.loads(mpath.read_text(encoding="utf-8")) if mpath.exists() else {}
-    return RLArtifact(path=p, model=model, pipeline=pipe, config=cfg, metrics=metrics)
+    names = [*POLICY_FILES, *(["metrics.json"] if (p / "metrics.json").exists() else [])]
+    return {name: (p / name).read_bytes() for name in names}
+
+
+def load_artifact_bytes(files: Mapping[str, bytes], *, device: str = "cpu",
+                        path: str | Path | None = None) -> RLArtifact:
+    """Rebuild an :class:`RLArtifact` from the bytes of its files (no filesystem access):
+    ``policy.zip`` (SB3 accepts a file object), ``pipeline.json``, ``config.json`` and the
+    optional ``metrics.json``. ``path`` is recorded for provenance only."""
+    import io
+
+    from stable_baselines3 import PPO
+
+    missing = [f for f in POLICY_FILES if f not in files]
+    if missing:
+        raise ValueError(f"RL artifact bytes are missing {missing}")
+    cfg = RLTrainConfig.from_dict(json.loads(files["config.json"].decode("utf-8")))
+    pipe = FeaturePipeline.from_dict(json.loads(files["pipeline.json"].decode("utf-8")))
+    model = PPO.load(io.BytesIO(files["policy.zip"]), device=resolve_device(device))
+    raw_metrics = files.get("metrics.json")
+    metrics = json.loads(raw_metrics.decode("utf-8")) if raw_metrics else {}
+    return RLArtifact(path=None if path is None else Path(path), model=model, pipeline=pipe,
+                      config=cfg, metrics=metrics)
+
+
+def load_artifact(path: str | Path, *, device: str = "cpu") -> RLArtifact:
+    """Load ``policy.zip`` + ``pipeline.json`` + ``config.json`` (+ ``metrics.json``)."""
+    return load_artifact_bytes(read_artifact_bytes(path), device=device, path=path)
 
 
 def rollout_artifact(
@@ -726,7 +762,7 @@ def rollout_artifact(
     raw = artifact.pipeline.compute(md)
     x = artifact.pipeline.transform(raw)
     env = GoldTradingEnv(md.bars, x, artifact.config.env, events=md.events, start=start,
-                         end=end, random_start=False)
+                         end=end, random_start=False, rates=md.macro)
     starts = episode_anchor_mask(md.bars.index, episode_anchor) if episode_anchor else None
     return rollout(env, artifact.predict, compute_metrics=compute_metrics,
                    restart_on_termination=not kill_switches, episode_starts=starts)

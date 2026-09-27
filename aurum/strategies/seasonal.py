@@ -1,4 +1,4 @@
-"""Seasonal strategy: ``intraday_seasonality`` (learned hour-of-week drift, shrunk).
+"""Seasonal strategy: ``intraday_seasonality`` (learned hour-of-week drift, shrunk, cost-aware).
 
 Economic rationale
 ------------------
@@ -10,7 +10,8 @@ periodic return patterns: Heston, Korajczyk & Sadka (2010) show that returns at 
 half-hour predict returns at the same half-hour on subsequent days for weeks, driven by
 systematic institutional trading and liquidity provision; Cai, Cheung & Wong (2001)
 document pronounced intraday periodicity in COMEX gold. Such patterns are small relative
-to noise, so the estimates MUST be shrunk hard to avoid fitting noise.
+to noise, so the estimates MUST be shrunk hard to avoid fitting noise — and they are small
+relative to a retail CFD's spread, so the positions MUST be chosen net of costs.
 
 Estimator
 ---------
@@ -32,14 +33,59 @@ level ``significance``, the table is flat. (A pooled-variance Cochran Q rejected
 time at a nominal 5% on real 2012-15 gold labels under a sign-flip null; Welch rejected
 6.5%.) With ``demean=False`` the null is "all means zero" and ``Q = sum m_b^2 / se_b^2 ~
 chi2(k)``. A fixed ``shrinkage`` (prior strength in observations, ``B_b = n_b / (n_b +
-lambda)``) is also supported (the pre-test still applies unless ``significance=None``). The
-(demeaned) effects are then Carver-scaled to an average |forecast| of 0.5 on the training
-distribution and capped. Note that this rescaling undoes the *overall* level of
-shrinkage: shrinkage sets the relative sizes of the buckets, and the pre-test decides
-whether there is a table at all.
+lambda)``) is also supported (the pre-test still applies unless ``significance=None``).
 
-``generate`` is a pure function of the bar timestamps and the fitted table (no price
-input), so it is trivially point-in-time.
+Cost-aware positions (``cost_aware=True``, default)
+----------------------------------------------------
+The shrunk effects ``alpha_b`` (vol units per bar) flip sign from one hour to the next,
+and a bar's edge is typically a few hundredths of a sigma while a retail gold CFD costs
+~0.1 sigma PER SIDE on H1 (half-spread + slippage). Trading the raw table therefore turns
+the book over thousands of times a year and pays far more in costs than it can earn (on
+2016-19 gold, fitted on 2012-15, frictionless table: ~2,550 trades/yr and ~$46k of costs on
+$100k for a gross daily Sharpe of ~0.5 — net Sharpe about -7).
+
+``fit`` therefore chooses the positions by solving, on the TRAINING estimates, the periodic
+mean-variance problem with proportional transaction costs over the weekly cycle of buckets
+(dynamic programming on a position grid, average-reward relative value iteration)::
+
+    max  sum_b [ f_b alpha_b - (gamma / 2) f_b^2 - lambda kappa_b |f_b - f_{b-1}| ],  |f| <= 1
+
+* ``kappa_b`` — expected cost of trading one unit of forecast at bucket ``b``, in the same
+  vol units as ``alpha_b``: ``(half effective spread + slippage + commission) / price /
+  sigma`` of the EXECUTION bar, averaged over the bucket's TRAINING rows with the ``costs``
+  model (``aurum.execution.costs.CostModel``, default parameters unless given). Sizing is
+  vol-targeted, so edge and cost scale identically with the position: the comparison is
+  sizing-invariant.
+* ``gamma`` — set so that WITHOUT costs the solution ``f_b = alpha_b / gamma`` is exactly
+  the classic table (Carver-scaled to an average |forecast| of 0.5, capped at 1): with zero
+  costs (or ``cost_aware=False``) the strategy is unchanged.
+* ``lambda`` = ``cost_multiplier`` (default 2): the margin by which the expected gross edge
+  of a trade must exceed its expected round-trip cost (``lambda = 2`` <=> a 50% haircut on
+  the in-sample edge; McLean & Pontiff (2016) find published anomaly returns ~58% lower
+  post-publication, and spreads widen around the data releases seasonal effects cluster on).
+
+What the solution looks like (Constantinides 1986; Davis & Norman 1990; Garleanu &
+Pedersen 2013 for the discrete-time analogue): a no-trade band around the frictionless
+position. A position CHANGE is made only if the edge it adds over the run of buckets it is
+held for exceeds ``lambda`` x its cost — so (a) a lone bucket gets a round trip only if
+``|alpha_b| > lambda (kappa_b + kappa_{b+1})``, i.e. it clears the round-trip cost per bar
+by the margin (``fit_summary_["n_buckets_single_bar_feasible"]``); (b) adjacent same-sign
+buckets are held as ONE position (minimum holding), and small opposite-sign buckets inside
+a run are held through; (c) the implied dead zone is scaled to costs
+(``dead_zone="auto"``): a lone bucket's forecast is soft-thresholded by ``lambda x round
+trip`` (``fit_summary_["dead_zone_single_bar"]``, in forecast units). Because a small
+position costs little risk (quadratic) but a lot to flatten and rebuild (linear), the band
+around zero can carry a small position through edge-free stretches instead of flattening
+it. Turnover is bounded by construction: along the fitted weekly orbit, ``lambda x`` the
+expected costs never exceed the risk-adjusted expected gross edge (``fit_summary_`` reports
+turnover, gross and cost per week, and the frictionless turnover for comparison).
+
+The fitted positions form the steady-state weekly orbit of the optimal policy from a flat
+start, stored as a table keyed by bucket: ``generate`` is still a pure function of the bar
+timestamps and the fitted table (no price input), so it is trivially point-in-time and
+live/backtest parity is exact. A bucket not seen in training (a holiday-shifted session)
+holds the position of the preceding bucket of the cycle (the optimal action at zero edge
+when trading costs something). Financing (swap) is NOT modelled in the fit.
 
 References
 ----------
@@ -53,12 +99,20 @@ References
   Clinical Trials 7(3) — method-of-moments between-group variance.
 * Welch, B. L. (1951). "On the Comparison of Several Mean Values: An Alternative
   Approach". Biometrika 38(3/4), 330-336 — heteroskedastic one-way ANOVA.
-* Carver, R. (2015). *Systematic Trading* — forecast scaling.
+* Constantinides, G. (1986). "Capital Market Equilibrium with Transaction Costs". JPE 94(4);
+  Davis, M. & Norman, A. (1990). "Portfolio Selection with Transaction Costs". Math. OR
+  15(4) — no-trade regions under proportional costs.
+* Garleanu, N. & Pedersen, L. H. (2013). "Dynamic Trading with Predictable Returns and
+  Transaction Costs". J. Finance 68(6).
+* McLean, R. D. & Pontiff, J. (2016). "Does Academic Research Destroy Stock Return
+  Predictability?". J. Finance 71(1).
+* Carver, R. (2015). *Systematic Trading* — forecast scaling, trading-cost "speed limits".
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -66,6 +120,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats as sps
 
+from aurum.core.instrument import XAUUSD
 from aurum.core.types import MarketData
 from aurum.features.volatility import safe_div
 from aurum.strategies.base import Strategy, register_strategy
@@ -73,7 +128,11 @@ from aurum.strategies.trend import TARGET_ABS_FORECAST, bar_volatility, check_pa
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["IntradaySeasonality", "bucket_keys"]
+__all__ = ["IntradaySeasonality", "bucket_keys", "periodic_cost_aware_positions"]
+
+#: Position grid of the cost-aware dynamic programme (step 1/40 = 0.025 of a full forecast).
+_GRID = np.linspace(-1.0, 1.0, 81)
+_MAX_SWEEPS = 400
 
 
 def bucket_keys(times: pd.DatetimeIndex | pd.Series, tz: str, bucket_minutes: int) -> np.ndarray:
@@ -89,39 +148,104 @@ def bucket_keys(times: pd.DatetimeIndex | pd.Series, tz: str, bucket_minutes: in
     return np.asarray(loc.weekday).astype(np.int64) * 1440 + (minute // b) * b
 
 
+def periodic_cost_aware_positions(alpha: np.ndarray, kappa: np.ndarray, gamma: float,
+                                  grid: np.ndarray = _GRID) -> tuple[np.ndarray, dict[str, Any]]:
+    """Steady-state positions of ``max sum_b f_b a_b - gamma/2 f_b^2 - k_b |f_b - f_{b-1}|``
+    over a CYCLE of slots (``b = 0..L-1``, slot ``L`` = slot 0), ``f`` on ``grid``.
+
+    Average-reward relative value iteration: one sweep runs the Bellman recursion backwards
+    once around the cycle; it stops when the policy of a full sweep repeats. The returned
+    positions are the orbit of that policy from a FLAT start at slot 0, iterated until the
+    weekly orbit repeats (a unique orbit unless costs make several positions equally good,
+    in which case flat-start is the conservative choice). Ties prefer the smaller |f|.
+    """
+    a = np.asarray(alpha, dtype=float)
+    k = np.asarray(kappa, dtype=float)
+    g = np.asarray(grid, dtype=float)
+    n_slots, n_grid = len(a), len(g)
+    i0 = int(np.argmin(np.abs(g)))
+    if n_slots == 0:
+        return np.zeros(0), {"sweeps": 0, "converged": True, "orbit_cycles": 0}
+    move = np.abs(g[None, :] - g[:, None])                    # [prev i, new j]
+    tiny = 1e-12 * (np.abs(g) + 1e-3 * move)                  # tie-break: small |f|, then stay
+    reward = a[:, None] * g[None, :] - 0.5 * gamma * g[None, :] ** 2   # [slot, j]
+    v_next = np.zeros(n_grid)
+    policy = np.zeros((n_slots, n_grid), dtype=np.int64)
+    prev_policy = None
+    sweeps, converged = 0, False
+    while sweeps < _MAX_SWEEPS and not converged:
+        sweeps += 1
+        for b in range(n_slots - 1, -1, -1):
+            q = reward[b][None, :] - k[b] * move - tiny + v_next[None, :]
+            policy[b] = np.argmax(q, axis=1)
+            v_next = q[np.arange(n_grid), policy[b]]
+        v_next = v_next - v_next[i0]                          # relative values stay bounded
+        converged = prev_policy is not None and np.array_equal(policy, prev_policy)
+        prev_policy = policy.copy()
+    # orbit from flat at slot 0, iterated until one week repeats the previous one
+    i = i0
+    orbit_prev = None
+    orbit = np.zeros(n_slots, dtype=np.int64)
+    cycles, repeated = 0, False
+    while cycles < 50 and not repeated:
+        cycles += 1
+        for b in range(n_slots):
+            i = int(policy[b, i])
+            orbit[b] = i
+        repeated = orbit_prev is not None and np.array_equal(orbit, orbit_prev)
+        orbit_prev = orbit.copy()
+    return g[orbit], {"sweeps": int(sweeps), "converged": bool(converged), "orbit_cycles": int(cycles),
+                      "orbit_periodic": bool(repeated)}
+
+
+def _cost_model(spec: Any) -> Any:
+    from aurum.execution.costs import CostModel
+
+    if spec is None:
+        return CostModel()
+    if isinstance(spec, CostModel):
+        return spec
+    if isinstance(spec, Mapping):
+        return CostModel(**dict(spec))
+    raise ValueError("costs must be None, a CostModel or a mapping of CostModel parameters")
+
+
 @register_strategy
 class IntradaySeasonality(Strategy):
-    """Learned hour-of-week mean returns with empirical-Bayes shrinkage (trainable).
+    """Learned hour-of-week mean returns, empirical-Bayes shrunk, traded net of costs.
 
     Rationale: recurring time-of-day liquidity demand (Asian physical flows, London fixes,
     COMEX open / US data, rollover, weekend de-risking) produces periodic drift in gold
     returns; Heston, Korajczyk & Sadka (2010) show such intraday periodicity is persistent.
     The effects are tiny relative to noise, so bucket means are shrunk with a James–Stein /
     empirical-Bayes estimator (Efron & Morris 1975) and vanish when the data show no
-    between-bucket dispersion beyond sampling error. See the module docstring for the
-    estimator.
+    between-bucket dispersion beyond sampling error; they are also tiny relative to costs,
+    so positions solve a mean-variance problem with proportional costs over the weekly
+    cycle (no-trade bands; hold across adjacent buckets). See the module docstring.
 
     Parameters: ``tz`` (clock for the buckets, default America/New_York — the broker day
     and US data are on NY time), ``bucket_minutes`` (60), ``shrinkage``
     (``"empirical_bayes"`` or a prior strength in observations), ``demean`` (remove the
     training-period average drift so the rule is a pure timing signal, default True),
-    ``min_obs`` (buckets seen fewer times in training forecast 0), ``significance`` (level
-    of the Welch heterogeneity pre-test; ``None`` disables it), ``dead_zone`` (buckets
-    whose scaled |forecast| is below it are set to 0 — a turnover control, default 0 = off)
-    and the volatility normaliser (EWMA half-life 240 H1 bars).
-
-    Costs: an hour-of-week table changes sign from one hour to the next, so the standalone
-    rule turns over its whole position many times a day; its per-bar edge is far below the
-    round-trip cost of a retail gold CFD. It is meant as a (netted) input to the
-    ``ForecastCombiner``; standalone use needs a ``dead_zone`` or a slower bucket.
+    ``min_obs`` (buckets seen fewer times in training forecast 0 / are held through),
+    ``significance`` (level of the Welch heterogeneity pre-test; ``None`` disables it),
+    ``cost_aware`` (default True: cost-aware positions; False = the frictionless table),
+    ``costs`` (``CostModel`` or its kwargs used to estimate costs from the TRAINING bars'
+    spreads and ranges; default ``CostModel()``), ``cost_multiplier`` (margin ``lambda``
+    of edge over cost, default 2), ``dead_zone`` (``"auto"`` = the cost-implied soft
+    threshold only; a number in [0, 1) additionally zeroes |forecast| below it, the only
+    turnover control when ``cost_aware=False``) and the volatility normaliser (EWMA
+    half-life 240 H1 bars).
 
     References: Heston, Korajczyk & Sadka (2010) JF 65(4); Cai, Cheung & Wong (2001) JFM
-    21(3); Efron & Morris (1975) JASA 70; Carver (2015).
+    21(3); Efron & Morris (1975) JASA 70; Garleanu & Pedersen (2013) JF 68(6); McLean &
+    Pontiff (2016) JF 71(1); Carver (2015).
     """
 
     name = "intraday_seasonality"
     description = ("Hour-of-week (New York clock) drift learned on training data with "
-                   "empirical-Bayes shrinkage; forecasts the bar about to be held.")
+                   "empirical-Bayes shrinkage; positions chosen net of trading costs "
+                   "(no-trade bands over the weekly cycle).")
     trainable = True
 
     @classmethod
@@ -133,7 +257,10 @@ class IntradaySeasonality(Strategy):
             "demean": True,
             "min_obs": 30,
             "significance": 0.05,
-            "dead_zone": 0.0,
+            "cost_aware": True,
+            "costs": None,
+            "cost_multiplier": 2.0,
+            "dead_zone": "auto",
             "vol_halflife": 240.0,
             "vol_min_periods": 120,
         }
@@ -152,10 +279,16 @@ class IntradaySeasonality(Strategy):
         sig = p["significance"]
         if sig is not None and not 0.0 < float(sig) < 1.0:
             raise ValueError("significance must be in (0, 1) or None")
-        if not 0.0 <= float(p["dead_zone"]) < 1.0:
-            raise ValueError("dead_zone must be in [0, 1)")
+        dz = p["dead_zone"]
+        if dz != "auto" and not (isinstance(dz, (int, float)) and 0.0 <= float(dz) < 1.0):
+            raise ValueError("dead_zone must be 'auto' or a number in [0, 1)")
+        if not float(p["cost_multiplier"]) >= 0.0:
+            raise ValueError("cost_multiplier must be >= 0")
+        _cost_model(p["costs"])
         self.table_: dict[int, float] = {}
         self.fit_summary_: dict[str, Any] = {}
+        self._cycle_keys: np.ndarray = np.zeros(0, dtype=np.int64)
+        self._cycle_pos: np.ndarray = np.zeros(0)
 
     @property
     def warmup_bars(self) -> int:
@@ -163,8 +296,11 @@ class IntradaySeasonality(Strategy):
 
     # ------------------------------------------------------------------------------------
     def training_targets(self, md: MarketData) -> pd.DataFrame:
-        """Rows ``(key, y)`` used by :meth:`fit`: bucket of ``available_at[t]`` and the
-        vol-normalised open-to-close return of bar ``t+1`` (a TRAINING label)."""
+        """Rows ``(key, y, cost)`` used by :meth:`fit`: bucket of ``available_at[t]``, the
+        vol-normalised open-to-close return of bar ``t+1`` (a TRAINING label) and the cost
+        of trading one unit of forecast at ``t`` (filled at the open of ``t+1``) in the same
+        vol units: ``(half effective spread + slippage + commission per oz) / close_t /
+        sigma_t`` with the spread and range of bar ``t+1``."""
         p = self.params
         bars = md.bars
         lc = log_close(bars)
@@ -172,13 +308,26 @@ class IntradaySeasonality(Strategy):
         oc = lc - np.log(bars["open"].to_numpy(dtype=float))
         y = pd.Series(safe_div(oc.shift(-1), sigma), index=bars.index)  # label: needs bar t+1
         keys = bucket_keys(bars["available_at"], p["tz"], p["bucket_minutes"])
-        frame = pd.DataFrame({"key": keys, "y": y.to_numpy()}, index=bars.index)
+        cm = _cost_model(p["costs"])
+        spread = bars["spread"].to_numpy(dtype=float) if "spread" in bars else np.zeros(len(bars))
+        spread = np.where(np.isfinite(spread) & (spread >= 0), spread, 0.0)
+        eff = np.maximum(spread * cm.spread_multiplier, cm.min_spread)
+        rng = (bars["high"].to_numpy(dtype=float) - bars["low"].to_numpy(dtype=float))
+        rng = np.where(np.isfinite(rng) & (rng >= 0), rng, 0.0)
+        comm = cm.commission_per_lot if cm.commission_per_lot is not None else XAUUSD.commission_per_lot
+        per_side = 0.5 * eff + cm.slippage_fixed + cm.slippage_range_frac * rng
+        per_side_next = pd.Series(per_side, index=bars.index).shift(-1) + float(comm) / XAUUSD.contract_size
+        cost = safe_div(per_side_next / bars["close"].astype(float), sigma)
+        frame = pd.DataFrame({"key": keys, "y": y.to_numpy(), "cost": np.asarray(cost, dtype=float)},
+                             index=bars.index)
         return frame[np.isfinite(frame["y"].to_numpy())]
 
     def fit(self, md: MarketData, features: pd.DataFrame | None = None) -> IntradaySeasonality:
         p = self.params
         data = self.training_targets(md)
         self.table_ = {}
+        self._cycle_keys = np.zeros(0, dtype=np.int64)
+        self._cycle_pos = np.zeros(0)
         if len(data) < 2:
             logger.warning("intraday_seasonality: not enough training rows (%d); flat table", len(data))
             self.fit_summary_ = {"n_obs": int(len(data)), "tau2": 0.0, "scalar": 0.0}
@@ -186,6 +335,11 @@ class IntradaySeasonality(Strategy):
             return self
         g = data.groupby("key")["y"]
         stats = pd.DataFrame({"n": g.size(), "mean": g.mean(), "var": g.var(ddof=1)})
+        if "cost" in data.columns:
+            c = data["cost"].where(np.isfinite(data["cost"]))
+            stats["cost"] = c.groupby(data["key"]).mean()
+        else:  # a custom label table without costs: frictionless
+            stats["cost"] = 0.0
         stats = stats[stats["n"] >= max(2, int(p["min_obs"]))]
         if stats.empty:
             logger.warning("intraday_seasonality: no bucket has >= %s observations", p["min_obs"])
@@ -241,9 +395,28 @@ class IntradaySeasonality(Strategy):
         effect = shrink * (m - mu)
         avg_abs = float((n * np.abs(effect)).sum() / n.sum())
         scalar = TARGET_ABS_FORECAST / avg_abs if avg_abs > 0 else 0.0
-        fc = np.clip(effect * scalar, -1.0, 1.0)
-        fc = np.where(np.abs(fc) < float(p["dead_zone"]), 0.0, fc)
-        self.table_ = {int(key): float(v) for key, v in zip(stats.index, fc, strict=True)}
+        frictionless = np.clip(effect * scalar, -1.0, 1.0)
+        kappa = np.nan_to_num(stats["cost"].to_numpy(dtype=float), nan=0.0, posinf=0.0)
+        kappa = np.maximum(kappa, 0.0)
+        lam_c = float(p["cost_multiplier"])
+        cost_aware = bool(p["cost_aware"]) and lam_c > 0.0 and scalar > 0.0 and bool(np.any(kappa > 0))
+        dp_info: dict[str, Any] = {}
+        if cost_aware:
+            gamma = 1.0 / scalar
+            fc, dp_info = periodic_cost_aware_positions(effect, lam_c * kappa, gamma)
+        else:
+            fc = frictionless
+        dz = p["dead_zone"]
+        if dz != "auto" and float(dz) > 0.0:
+            fc = np.where(np.abs(fc) < float(dz), 0.0, fc)
+        keys = stats.index.to_numpy(dtype=np.int64)
+        self.table_ = {int(key): float(v) for key, v in zip(keys, fc, strict=True)}
+        self._cycle_keys = keys
+        self._cycle_pos = np.asarray(fc, dtype=float)
+        # diagnostics along the fitted weekly orbit (in-sample expectations, vol units)
+        dpos = np.abs(np.diff(np.r_[fc[-1], fc]))
+        per_cycle = n.sum() / max(k, 1)                   # training observations per slot
+        rt_next = kappa + np.roll(kappa, -1)
         self.fit_summary_ = {
             "n_obs": int(len(data)),
             "n_buckets": int(k),
@@ -256,13 +429,28 @@ class IntradaySeasonality(Strategy):
             "q_pvalue": p_value,
             "heterogeneous": bool(heterogeneous),
             "mean_shrinkage": float(np.mean(shrink)),
-            "shrinkage_by_key": {int(key): float(b) for key, b in zip(stats.index, shrink, strict=True)},
+            "shrinkage_by_key": {int(key): float(b) for key, b in zip(keys, shrink, strict=True)},
             "scalar": float(scalar),
+            "cost_aware": bool(cost_aware),
+            "cost_multiplier": lam_c,
+            "cost_per_side_median": float(np.median(kappa)) if k else 0.0,
+            "n_active": int(np.count_nonzero(fc)),
+            "n_buckets_single_bar_feasible": int(np.count_nonzero(np.abs(effect) > lam_c * rt_next)),
+            "dead_zone_single_bar": float(np.median(lam_c * rt_next) * scalar) if k else 0.0,
+            "orbit_turnover_per_week": float(dpos.sum()),
+            "orbit_expected_gross_per_week": float((fc * effect).sum()),
+            "orbit_expected_cost_per_week": float((kappa * dpos).sum()),
+            "frictionless_turnover_per_week": float(np.abs(np.diff(np.r_[frictionless[-1], frictionless])).sum()),
+            "obs_per_slot": float(per_cycle),
+            "dp": dp_info,
             "train_start": str(md.bars.index[0]) if len(md.bars) else None,
             "train_end": str(md.bars.index[-1]) if len(md.bars) else None,
         }
-        logger.info("intraday_seasonality fitted: %d buckets, tau2=%.3g, Q p-value=%.3g, mean B=%.3f",
-                    k, tau2, p_value, float(np.mean(shrink)))
+        logger.info("intraday_seasonality fitted: %d buckets, tau2=%.3g, Q p-value=%.3g, mean B=%.3f, "
+                    "cost-aware=%s, %d active buckets, turnover/week %.2f (frictionless %.2f)",
+                    k, tau2, p_value, float(np.mean(shrink)), cost_aware, int(np.count_nonzero(fc)),
+                    self.fit_summary_["orbit_turnover_per_week"],
+                    self.fit_summary_["frictionless_turnover_per_week"])
         self.is_fitted = True
         return self
 
@@ -272,5 +460,11 @@ class IntradaySeasonality(Strategy):
         p = self.params
         bars = md.bars
         keys = bucket_keys(bars["available_at"], p["tz"], p["bucket_minutes"])
-        fc = pd.Series(keys).map(self.table_).to_numpy(dtype=float)
+        cyc_keys = getattr(self, "_cycle_keys", np.zeros(0, dtype=np.int64))
+        if self.fit_summary_.get("cost_aware") and len(cyc_keys):
+            # buckets unseen in training hold the preceding cycle bucket's position (no trade)
+            j = np.searchsorted(cyc_keys, keys, side="right") - 1      # -1 wraps to the last
+            fc = self._cycle_pos[j]
+        else:
+            fc = pd.Series(keys).map(self.table_).to_numpy(dtype=float)
         return self._finalize(pd.Series(fc, index=bars.index), bars.index)

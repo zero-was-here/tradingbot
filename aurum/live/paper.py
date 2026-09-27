@@ -2,8 +2,8 @@
 
 :class:`PaperBroker` is a venue that never touches money. It fills market orders with the
 SAME :class:`~aurum.execution.costs.CostModel` arithmetic as the research simulator
-(``mid ± effective_spread/2 ± slippage``, commission per lot per side, swap per financing
-night with the triple-swap weekday) and keeps positions the way a broker does — at their
+(``mid ± effective_spread/2 ± slippage``, commission per lot per side, overnight financing
+per rollover with the triple-swap weekday) and keeps positions the way a broker does — at their
 *executed* price, with commission booked to the balance and swap accrued on the position.
 That bookkeeping is algebraically identical to the simulator's "mark at mid, book spread and
 slippage as costs" identity, so equity paths agree to floating-point precision
@@ -29,17 +29,22 @@ A feed tells the paper broker what the market looks like at clock time ``now``:
 Protective orders
 -----------------
 Stops and take-profits are MID levels (as in the simulator) evaluated on every bar that
-closes after the position was opened: gap through the level at the open → exit at the open;
-otherwise stop at the level (market, slips) before take-profit at the level (limit, no
-slippage) — the conservative convention when a bar touches both.
+closes after the position was opened with the simulator's own
+:func:`aurum.execution.simulator.intrabar_exit`: gap through the level at the open → exit at
+the open; otherwise stop at the level (market, slips) before take-profit at the level (limit,
+no slippage) — the conservative convention when a bar touches both.
 
 Swap
 ----
-A position pays/receives ``instrument.swap_{long,short}_per_lot`` for every rollover instant
-``R`` (``rollover_hour_utc`` on weekdays, triple on ``triple_swap_weekday``) with
-``open_time < R <= close_time`` (:func:`aurum.execution.costs.rollover_nights_ns`). Swap is
-accrued on the position (included in equity) and realised into the balance on close, the
-MT5 convention.
+A position is financed for every rollover instant ``R`` (``rollover_hour_utc`` on weekdays,
+triple on ``triple_swap_weekday``) with ``open_time < R <= close_time``
+(:func:`aurum.execution.costs.rollover_nights_ns`) by ``costs.financing``
+(:class:`~aurum.execution.costs.FinancingModel`): ``"fixed"`` per-lot swaps from the
+instrument, or ``"rate"`` = benchmark (``rates=``, as of ``R``) +/- markup on the notional
+valued at the mid close of the bar ending at/after ``R`` (the previous close for a rollover
+in a gap between bars) — exactly the simulator's valuation, so the two stay in parity. Swap
+is accrued on the position (included in equity) and realised into the balance on close,
+the MT5 convention.
 
 The replay's clock is a :class:`~aurum.live.broker.SimulatedClock`, so hundreds of bars of
 paper trading run in well under a second.
@@ -61,7 +66,8 @@ from aurum.core.instrument import XAUUSD, Instrument
 from aurum.core.timeframes import get_timeframe, index_bar_minutes
 from aurum.core.types import Fill, Side
 from aurum.data.schema import validate_bars
-from aurum.execution.costs import CostModel, rollover_nights_ns
+from aurum.execution.costs import CostModel, RateSource, _warn_once, rollover_nights_ns
+from aurum.execution.simulator import intrabar_exit
 from aurum.live.broker import (
     AccountInfo,
     Broker,
@@ -272,29 +278,9 @@ class _Pos:
                 "swap_from_ns": self.swap_from_ns}
 
 
-def _protective_exit(pos: float, o: float, h: float, lo: float, sl: float | None,
-                     tp: float | None) -> tuple[float, str, bool] | None:
-    """(exit mid, reason, is_limit) for one bar — mirrors ``ExecutionSimulator._intrabar_exit``:
-    gap through a level exits at the open; stop is assumed before take-profit."""
-    if pos > 0:
-        if sl is not None and o <= sl:
-            return o, "stop", False
-        if tp is not None and o >= tp:
-            return o, "take_profit", True
-        if sl is not None and lo <= sl:
-            return sl, "stop", False
-        if tp is not None and h >= tp:
-            return tp, "take_profit", True
-    else:
-        if sl is not None and o >= sl:
-            return o, "stop", False
-        if tp is not None and o <= tp:
-            return o, "take_profit", True
-        if sl is not None and h >= sl:
-            return sl, "stop", False
-        if tp is not None and lo <= tp:
-            return tp, "take_profit", True
-    return None
+#: backward-compatible alias (``aurum.live.runner`` imports it); the implementation is the
+#: simulator's :func:`aurum.execution.simulator.intrabar_exit`, so there is no mirror copy.
+_protective_exit = intrabar_exit
 
 
 class PaperBroker:
@@ -311,6 +297,10 @@ class PaperBroker:
                      of netting (one position per symbol, deals net against it).
     state_path     : optional JSON file; the book is persisted after every change and restored
                      on construction, so paper trading survives restarts like a real venue.
+    rates          : benchmark-rate source for ``"rate"`` financing (``md.macro``, a macro frame
+                     with ``available_at``, a Series indexed by availability time or a
+                     :class:`~aurum.execution.costs.RateCurve`); read as of each rollover.
+                     ``None`` -> ``financing.fallback_rate``. Refresh with :meth:`set_rates`.
     """
 
     def __init__(
@@ -326,6 +316,7 @@ class PaperBroker:
         currency: str = "USD",
         state_path: str | Path | None = None,
         max_deals: int = 5000,
+        rates: RateSource = None,
     ) -> None:
         if not (math.isfinite(initial_equity) and initial_equity > 0):
             raise ValueError("initial_equity must be finite and > 0")
@@ -345,8 +336,20 @@ class PaperBroker:
         self._next_ticket = 1
         self._settled_ns = _ns(clock.now())
         self.n_orders = 0
+        self.rate_curve = None
+        self.set_rates(rates)
         if self.state_path is not None and self.state_path.exists():
             self._load_state()
+
+    def set_rates(self, rates: RateSource) -> None:
+        """(Re)load the benchmark-rate source used by ``"rate"`` financing (e.g. after a macro
+        refresh). Only observations with ``available_at <= R`` are used for a rollover ``R``."""
+        fin = self.costs.financing
+        self.rate_curve = fin.curve(rates) if fin.uses_rates else None
+        if fin.uses_rates and (self.rate_curve is None or not len(self.rate_curve)):
+            _warn_once(("paper_no_rates", fin.rate_series),
+                       "PaperBroker: rate financing without a %r series; using fallback_rate=%.4f "
+                       "(pass rates=md.macro or call set_rates)", fin.rate_series, fin.fallback_rate)
 
     # ------------------------------------------------------------------------------------------
     # persistence
@@ -404,13 +407,29 @@ class PaperBroker:
     # ------------------------------------------------------------------------------------------
     # time evolution: swap accrual and broker-side protective orders
     # ------------------------------------------------------------------------------------------
-    def _accrue_swap(self, t_ns: int) -> None:
+    def _accrue_swap(self, t_ns: int, price: float | None = None) -> None:
+        """Accrue financing on every position up to ``t_ns``; ``price`` (mid) values the notional
+        for ``"rate"`` financing (the simulator's valuation of the rollovers in that stretch)."""
+        fin = self.costs.financing
         for p in self._positions.values():
             if t_ns > p.swap_from_ns:
                 nights = float(rollover_nights_ns(p.swap_from_ns, t_ns, self.instrument))
                 if nights:
-                    p.swap += self.costs.swap(p.lots, nights, instrument=self.instrument)
+                    rn = None
+                    if fin.uses_rates:
+                        rn = float(fin.rate_nights_ns(p.swap_from_ns, t_ns, self.instrument, self.rate_curve))
+                    p.swap += self.costs.swap(p.lots, nights, instrument=self.instrument, price=price,
+                                              rate_nights=rn)
                 p.swap_from_ns = t_ns
+
+    def _price_at(self, t: pd.Timestamp) -> float | None:
+        """Mid used to value a notional for rate financing at ``t`` (last closed bar's close)."""
+        if not self.costs.financing.uses_rates:
+            return None
+        m = self.feed.mark(t)
+        if m is not None and math.isfinite(m):
+            return float(m)
+        return self._mark(t)
 
     def _settle(self, now: pd.Timestamp) -> None:
         """Advance the book to ``now``: per closed bar, accrue swap to its open, run the
@@ -420,6 +439,8 @@ class PaperBroker:
             return
         changed = False
         if self._positions:
+            rate_fin = self.costs.financing.uses_rates
+            prev = self._price_at(_ts(self._settled_ns)) if rate_fin else None
             new = self.feed.bars_between(_ts(self._settled_ns), _ts(now_ns))
             if len(new):
                 open_ns = pd.DatetimeIndex(new.index).tz_convert("UTC").as_unit("ns").asi8
@@ -427,15 +448,19 @@ class PaperBroker:
                 o = new["open"].to_numpy(dtype=float)
                 h = new["high"].to_numpy(dtype=float)
                 lo = new["low"].to_numpy(dtype=float)
+                c = new["close"].to_numpy(dtype=float)
                 spr = new["spread"].to_numpy(dtype=float)
                 for k in range(len(new)):
                     if not self._positions:
                         break
-                    self._accrue_swap(int(open_ns[k]))
+                    # rollovers in the gap before the bar: valued at the previous close
+                    self._accrue_swap(int(open_ns[k]), prev)
                     changed |= self._protective(int(open_ns[k]), int(avail_ns[k]), float(o[k]),
                                                 float(h[k]), float(lo[k]), float(spr[k]))
-                    self._accrue_swap(int(avail_ns[k]))
-            self._accrue_swap(now_ns)
+                    # rollovers inside the bar: valued at its close (as the simulator does)
+                    self._accrue_swap(int(avail_ns[k]), float(c[k]))
+                    prev = float(c[k])
+            self._accrue_swap(now_ns, self._price_at(_ts(now_ns)) if rate_fin else None)
             changed = True
         self._settled_ns = now_ns
         if self._positions:
@@ -449,7 +474,7 @@ class PaperBroker:
         for p in list(self._positions.values()):
             if (p.sl is None and p.tp is None) or p.open_ns >= bar_avail_ns:
                 continue
-            ex = _protective_exit(p.lots, o, h, lo, p.sl, p.tp)
+            ex = intrabar_exit(p.lots, o, h, lo, p.sl, p.tp)
             if ex is None:
                 continue
             exit_mid, reason, is_limit = ex

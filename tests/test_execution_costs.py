@@ -10,7 +10,7 @@ import pytest
 
 from aurum.core.instrument import XAUUSD
 from aurum.core.types import Side
-from aurum.execution.costs import CostModel, rollover_nights, rollover_nights_ns
+from aurum.execution.costs import CostModel, FinancingModel, rollover_nights, rollover_nights_ns
 
 
 def test_fill_price_half_spread_no_slippage() -> None:
@@ -51,7 +51,7 @@ def test_commission_defaults_to_instrument() -> None:
 
 
 def test_swap_sign_and_rates() -> None:
-    cm = CostModel()
+    cm = CostModel(financing=FinancingModel.fixed())  # broker-quoted per-lot swaps
     assert cm.swap(1.0, 1) == pytest.approx(-45.0)
     assert cm.swap(2.0, 3) == pytest.approx(-270.0)
     assert cm.swap(-1.0, 3) == pytest.approx(45.0)

@@ -17,11 +17,20 @@ Protocol
    ``<= t``, enforced by the strategy leakage tests), so by default they are generated once
    on the research span and sliced, which is identical to per-fold generation and far
    cheaper (``regenerate_per_fold: true`` forces the strict per-fold path).
+   ``Strategy.fit`` receives macro frames truncated to rows PUBLISHED by the decision time
+   of the last training bar (``available_at <= train end``): defensive point-in-time, so a
+   strategy that fits on whole macro frames instead of ``asof_join``-ing them still cannot
+   see a later print.
    The :class:`~aurum.portfolio.combiner.ForecastCombiner` for fold ``k`` is fitted
    (default ``walkforward.combiner_fit="oos"``) on the stitched out-of-sample forecasts of
    folds ``< k`` (strictly before fold ``k``'s test block; equal weights until
    ``combiner_min_obs`` such bars exist), then combines the test rows.
    ``combiner_fit="train"`` is the literal "fit on the training-period forecasts" variant.
+   Strategies are scored NET of estimated trading costs: the combiner gets the bars'
+   spreads/ranges and the SAME cost model and instrument as the backtests, and charges
+   ``c_t * |Δforecast|`` per bar (derivation in :mod:`aurum.portfolio.combiner`); under
+   ``sharpe_shrink`` a strategy with a non-positive net Sharpe gets zero weight and the
+   weights may sum to < 1 (unallocated risk, see the combiner docs).
 3. **Stitching**: test blocks are contiguous and non-overlapping (``step >= test``), so the
    OOS forecasts of all folds form one strictly increasing series per strategy and for the
    combined book.
@@ -29,14 +38,22 @@ Protocol
    research risk limits and cost model the live system uses (SPEC §0.2), plus a buy-and-hold
    benchmark over the same span.
 5. **Statistics** on DAILY returns: Sharpe, PSR and DSR (Bailey & López de Prado 2012,
-   2014) with ``n_trials`` = number of strategy configurations evaluated, stationary
+   2014) with ``n_trials`` = strategy configurations evaluated in this run (one config x N
+   strategies, or ``walkforward.n_trials``) + the number of DISTINCT other configs that
+   evaluated an overlapping holdout window before (holdout ledger, step 6), stationary
    bootstrap Sharpe CI (Politis & Romano 1994), PBO by CSCV over the per-strategy OOS daily
    return matrix (Bailey, Borwein, López de Prado & Zhu 2017), per-fold results, combiner
    weights per fold and cost attribution.
 6. **Holdout** (optional ``walkforward.holdout_start``): every bar from that timestamp on is
    physically removed from the research span (features, strategies, backtests of the folds
    never see it). After the folds, one final fit on the last training window is evaluated
-   on the holdout ONCE and reported separately.
+   on the holdout ONCE and reported separately. Every holdout evaluation is appended to the
+   **holdout ledger** (``holdout_ledger.jsonl`` in the output-directory root, next to the run
+   directories: timestamp, config hash, data hash, strategies, window, holdout metrics). The
+   ledger is read first: when the same (overlapping) window was already evaluated by a
+   DIFFERENT config the run logs a WARNING, notes it in the report (and the holdout
+   tearsheet) and adds those configs to the DSR ``n_trials``. The holdout OOS forecasts are
+   kept (``holdout/oos_forecasts.parquet``) so the production fit can weight on them.
 
 Known bias of ``combiner_fit="train"`` (documented, not hidden): the combiner is then
 fitted on *in-sample* forecasts of trainable strategies over the training window (their
@@ -87,18 +104,23 @@ from aurum.strategies.base import Strategy
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "HOLDOUT_LEDGER",
     "FoldPlan",
     "HoldoutReport",
     "QuantBook",
+    "append_holdout_ledger",
     "fit_quant_book",
     "load_summary",
     "WalkForwardReport",
     "book_statistics",
     "label_horizon",
     "plan_folds",
+    "prior_holdout_looks",
     "provenance",
+    "read_holdout_ledger",
     "run_single_backtest",
     "run_walk_forward",
+    "train_feature_reference",
 ]
 
 #: strategy parameters that denote a label / holding horizon in bars (purge candidates)
@@ -313,6 +335,42 @@ def _slice(md: MarketData, a: int, b: int) -> MarketData:
     return MarketData(bars=md.bars.iloc[a:b], macro=md.macro, events=md.events)
 
 
+def _pit_macro(macro: Mapping[str, pd.DataFrame] | None, cutoff: pd.Timestamp) -> dict[str, pd.DataFrame]:
+    """Macro frames restricted to rows published by ``cutoff`` (``available_at <= cutoff``).
+
+    Frames without ``available_at`` (off-spec) fall back to ``index <= cutoff``.
+    """
+    out: dict[str, pd.DataFrame] = {}
+    for k, v in (macro or {}).items():
+        if v is None or len(v) == 0:
+            out[k] = v
+            continue
+        if "available_at" in v.columns:
+            av = pd.to_datetime(v["available_at"], utc=True)
+            out[k] = v.loc[(av <= cutoff).to_numpy()]
+        else:
+            logger.warning("macro frame %r has no available_at column: truncated by its index", k)
+            ix = pd.DatetimeIndex(v.index)
+            ix = ix.tz_localize("UTC") if ix.tz is None else ix.tz_convert("UTC")
+            out[k] = v.loc[(ix <= cutoff)]
+    return out
+
+
+def _train_md(md: MarketData, a: int, b: int) -> MarketData:
+    """Training slice for ``Strategy.fit``: bars ``[a, b)`` and macro rows PUBLISHED by the
+    decision time of the last training bar (defensive point-in-time: a strategy that fits on
+    whole macro frames instead of ``asof_join``-ing them can still never see a later print)."""
+    bars = md.bars.iloc[a:b]
+    if not md.macro or len(bars) == 0:
+        return MarketData(bars=bars, macro=md.macro, events=md.events)
+    if "available_at" in bars.columns:
+        cutoff = pd.Timestamp(bars["available_at"].iloc[-1])
+    else:  # pragma: no cover - canonical bars always carry available_at
+        cutoff = pd.Timestamp(bars.index[-1])
+    cutoff = cutoff.tz_localize("UTC") if cutoff.tz is None else cutoff.tz_convert("UTC")
+    return MarketData(bars=bars, macro=_pit_macro(md.macro, cutoff), events=md.events)
+
+
 def _phase_md(ctx: _Ctx, phase: str) -> MarketData:
     if phase == "holdout" or ctx.n_research >= len(ctx.md.bars):
         return ctx.md
@@ -364,7 +422,9 @@ def _strategy_task(key: str, strategy: Strategy, plans: Sequence[FoldPlan], need
             x_train = x_hist.iloc[plan.train_start - plan.hist_start:plan.train_end - plan.hist_start]
         t0 = time.perf_counter()
         if s.trainable:
-            s.fit(_slice(ctx.md, plan.train_start, plan.train_end), x_train)
+            # Feature warm-up may reach into older PAST bars (never into any test block).
+            fit_a = plan.train_start if needs_features else max(0, plan.train_start - s.fit_history_bars)
+            s.fit(_train_md(ctx.md, fit_a, plan.train_end), x_train)
         t1 = time.perf_counter()
         f = _generate(s, _slice(ctx.md, plan.hist_start, plan.test_end), x_hist)
         t2 = time.perf_counter()
@@ -473,8 +533,8 @@ class _FixedWeightCombiner(ForecastCombiner):
         super().__init__(method="equal", **kwargs)
         self.fixed = {str(k): float(v) for k, v in weights.items()}
 
-    def fit(self, forecasts: pd.DataFrame, close: pd.Series) -> _FixedWeightCombiner:
-        super().fit(forecasts, close)
+    def fit(self, forecasts: pd.DataFrame, close: pd.Series, **cost_kwargs: Any) -> _FixedWeightCombiner:
+        super().fit(forecasts, close, **cost_kwargs)
         w = np.array([max(0.0, self.fixed.get(str(c), 0.0)) for c in self.columns_], dtype=float)
         if w.sum() <= 0:
             raise ValueError("fixed combiner weights sum to zero")
@@ -491,6 +551,13 @@ class _FixedWeightCombiner(ForecastCombiner):
         return self
 
 
+def _combiner_options(cfg: AurumConfig) -> dict[str, Any]:
+    """Cost-aware combiner knobs (``combiner.allow_unallocated`` / ``combiner.cost_multiplier``)
+    for the combiners not built by ``CombinerConfig.build`` (fixed weights, equal fallback)."""
+    c = cfg.combiner
+    return {"allow_unallocated": bool(c.allow_unallocated), "cost_multiplier": float(c.cost_multiplier)}
+
+
 def _make_combiner(cfg: AurumConfig, keys: Sequence[str]) -> ForecastCombiner:
     c = cfg.combiner
     if c.method == "fixed":
@@ -498,8 +565,17 @@ def _make_combiner(cfg: AurumConfig, keys: Sequence[str]) -> ForecastCombiner:
         weights = {k: weights.get(k, 1.0) for k in keys}
         return _FixedWeightCombiner(weights, shrinkage=c.shrinkage, max_weight=1.0, fdm_cap=c.fdm_cap,
                                     vol_halflife=c.vol_halflife, min_periods=c.min_periods,
-                                    corr_floor=c.corr_floor)
+                                    corr_floor=c.corr_floor, **_combiner_options(cfg))
     return c.build()
+
+
+def _cost_kwargs(cfg: AurumConfig, bars: pd.DataFrame | None) -> dict[str, Any]:
+    """What :meth:`ForecastCombiner.fit` needs to score strategies NET of trading costs: the
+    bars (spread, high/low; the combiner restricts them to the forecasts' own rows), the SAME
+    cost model and instrument the backtests use."""
+    if bars is None:
+        return {}
+    return {"bars": bars, "costs": cfg.costs.build(), "instrument": cfg.instrument.build()}
 
 
 # ============================================================================================
@@ -663,6 +739,93 @@ def provenance(cfg: AurumConfig | None, md: MarketData | None) -> dict[str, Any]
 
 
 # ============================================================================================
+# holdout ledger
+# ============================================================================================
+#: file name of the holdout ledger, kept in the ROOT of the output directory (the parent of the
+#: run directories, e.g. ``runs/holdout_ledger.jsonl``)
+HOLDOUT_LEDGER = "holdout_ledger.jsonl"
+
+
+def read_holdout_ledger(path: str | Path) -> list[dict[str, Any]]:
+    """Entries of a holdout ledger (JSONL). Missing file -> []; unreadable lines are skipped
+    with a warning (a corrupt line must not hide the others)."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            logger.warning("holdout ledger %s: line %d is not JSON; skipped", p, i)
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def prior_holdout_looks(entries: Sequence[Mapping[str, Any]], *, start: Any, end: Any, config_hash: str,
+                        symbol: str | None = None) -> dict[str, Any]:
+    """Earlier evaluations of a holdout window overlapping ``[start, end]`` (same symbol).
+
+    ``n_prior_looks`` counts every overlapping entry; ``n_prior_configs`` the DISTINCT config
+    hashes other than ``config_hash`` among them — re-running the same (deterministic) config
+    is not a new trial, evaluating a different one is (it is a selection opportunity).
+    """
+    s, e = _utc(start), _utc(end)
+    looks = []
+    for rec in entries:
+        try:
+            rs, re_ = _utc(rec["holdout_start"]), _utc(rec["holdout_end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if symbol is not None and rec.get("symbol") not in (None, symbol):
+            continue
+        if rs <= e and s <= re_:
+            looks.append(rec)
+    others = sorted({str(r.get("config_hash")) for r in looks if r.get("config_hash") != config_hash})
+    return {"n_prior_looks": len(looks), "n_prior_configs": len(others), "prior_config_hashes": others,
+            "n_prior_same_config": sum(1 for r in looks if r.get("config_hash") == config_hash),
+            "first_look": min((str(r.get("timestamp")) for r in looks), default=None)}
+
+
+def append_holdout_ledger(path: str | Path, entry: Mapping[str, Any]) -> Path:
+    """Append one JSON line (flushed and fsynced: the ledger is an audit trail)."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(_jsonable(dict(entry)), sort_keys=True, default=str)
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    return p
+
+
+def _ledger_entry(report: WalkForwardReport, cfg: AurumConfig, run_dir: Path | None) -> dict[str, Any]:
+    h = report.holdout
+    assert h is not None
+    stats = h.stats
+    keep = ("sharpe", "psr", "dsr", "total_return", "cagr", "ann_vol", "max_drawdown", "n_trades", "total_costs",
+            "n_days")
+    comb = {k: stats.loc[_COMBINED, k] for k in keep if _COMBINED in stats.index and k in stats.columns}
+    per = {str(k): stats.loc[k, "sharpe"] for k in stats.index if k != _COMBINED and "sharpe" in stats.columns}
+    prov = report.provenance or {}
+    return {
+        "timestamp": pd.Timestamp.now(tz="UTC").isoformat(), "kind": report.kind,
+        "name": cfg.name, "config_hash": report.config_hash, "data_hash": report.data_hash,
+        "symbol": cfg.data.symbol, "timeframe": cfg.data.timeframe,
+        "holdout_start": h.start, "holdout_end": h.end, "n_holdout_bars": len(h.combined.equity),
+        "strategies": sorted(report.strategy_results) or [c for c in report.oos_forecasts.columns
+                                                          if c not in (_COMBINED, "fold")],
+        "n_trials": report.n_trials, "prior_looks": h.prior_looks,
+        "metrics": {"combined": comb, "strategy_sharpe": per},
+        "run_dir": run_dir, "git_sha": prov.get("git_sha"),
+    }
+
+
+# ============================================================================================
 # reports
 # ============================================================================================
 def _jsonable(obj: Any) -> Any:
@@ -706,11 +869,15 @@ class HoldoutReport:
     fdm: float
     costs: pd.DataFrame
     combiner_basis: str = ""
+    forecasts: pd.DataFrame | None = None       # holdout OOS forecasts (strategies + combined)
+    prior_looks: dict[str, Any] = field(default_factory=dict)   # holdout ledger (earlier evaluations)
+    ledger_path: Path | None = None
 
     def summary(self) -> dict[str, Any]:
         return _jsonable({"start": self.start, "end": self.end, "stats": self.stats.to_dict(orient="index"),
                           "weights": self.weights, "fdm": self.fdm, "combiner_basis": self.combiner_basis,
-                          "costs": self.costs.to_dict(orient="index")})
+                          "costs": self.costs.to_dict(orient="index"), "prior_looks": self.prior_looks,
+                          "ledger": self.ledger_path})
 
 
 @dataclass
@@ -801,6 +968,8 @@ class WalkForwardReport:
             h.mkdir(exist_ok=True)
             self.holdout.stats.to_csv(h / "stats.csv")
             self.holdout.costs.to_csv(h / "costs.csv")
+            if self.holdout.forecasts is not None:
+                self.holdout.forecasts.to_parquet(h / "oos_forecasts.parquet")
             (h / "holdout.json").write_text(json.dumps(self.holdout.summary(), indent=2), encoding="utf-8")
             if save_books:
                 self.holdout.combined.save(h / "books" / _COMBINED)
@@ -820,10 +989,16 @@ class WalkForwardReport:
         from aurum.research.report import write_tearsheet
 
         if holdout and self.holdout is not None:
+            hnotes = ["Final holdout: fitted on the last training window before holdout_start and evaluated "
+                      "exactly once."]
+            pl = self.holdout.prior_looks or {}
+            if pl.get("n_prior_configs"):
+                hnotes.append(f"WARNING: this holdout window was evaluated before by {pl['n_prior_configs']} other "
+                              f"config(s) ({pl.get('n_prior_looks')} prior look(s) in the holdout ledger): it is "
+                              f"no longer untouched; DSR uses n_trials={self.n_trials}.")
             extra: dict[str, Any] = {"weights": self.holdout.weights, "n_trials": self.n_trials,
                                      "holdout_stats": self.holdout.stats, "costs_by_book": self.holdout.costs,
-                                     "notes": ["Final holdout: fitted on the last training window before "
-                                               "holdout_start and evaluated exactly once."]}
+                                     "notes": hnotes}
         else:
             extra = {"folds": self.folds, "weights": self.weights, "n_trials": self.n_trials,
                      "strategy_stats": self.stats,
@@ -935,7 +1110,8 @@ def _evaluate(ctx: _Ctx, cfg: AurumConfig, strategies: dict[str, Strategy], plan
 
 
 def _fit_fold_combiner(cfg: AurumConfig, keys: list[str], f_train: pd.DataFrame, close: pd.Series,
-                       history: pd.DataFrame | None, window: int | None) -> tuple[ForecastCombiner, str]:
+                       history: pd.DataFrame | None, window: int | None, *, bars: pd.DataFrame | None = None,
+                       combiner_fit: str | None = None) -> tuple[ForecastCombiner, str]:
     """Combiner for one fold and a description of what it was fitted on.
 
     ``combiner_fit="oos"``: fit on ``history`` (stitched OOS forecasts of EARLIER folds,
@@ -945,11 +1121,18 @@ def _fit_fold_combiner(cfg: AurumConfig, keys: list[str], f_train: pd.DataFrame,
     Garlappi & Uppal 2009) with activity/FDM from the training-window forecast correlations
     (no returns involved). ``"train"``: fit on the training-window forecasts (in-sample for
     trainable strategies). ``method="fixed"`` ignores returns either way.
+
+    With ``bars`` the strategies are scored NET of estimated trading costs (spread/2 +
+    slippage + commission per unit of forecast turnover, see :mod:`aurum.portfolio.combiner`);
+    the combiner restricts ``bars`` to the rows it is fitted on. ``combiner_fit`` overrides
+    ``walkforward.combiner_fit``.
     """
     wf = cfg.walkforward
+    mode = combiner_fit or wf.combiner_fit
+    kw = _cost_kwargs(cfg, bars)
     comb = _make_combiner(cfg, keys)
-    if cfg.combiner.method == "fixed" or wf.combiner_fit == "train":
-        comb.fit(f_train, close.reindex(f_train.index))
+    if cfg.combiner.method == "fixed" or mode == "train":
+        comb.fit(f_train, close.reindex(f_train.index), **kw)
         return comb, "train_window"
     h = history
     if h is not None and window is not None and len(h) > window:
@@ -957,15 +1140,16 @@ def _fit_fold_combiner(cfg: AurumConfig, keys: list[str], f_train: pd.DataFrame,
     why = f"OOS history {0 if h is None else len(h)} < {wf.combiner_min_obs} bars"
     if h is not None and len(h) >= wf.combiner_min_obs:
         try:
-            comb.fit(h[keys], close.reindex(h.index))
+            comb.fit(h[keys], close.reindex(h.index), **kw)
             return comb, f"oos_history({len(h)} bars)"
         except ValueError as exc:  # e.g. too few valid rows after warm-up
             logger.warning("combiner OOS fit failed (%s); equal weights", exc)
             why = f"OOS fit failed: {exc}"
     c = cfg.combiner
     eq = ForecastCombiner(method="equal", shrinkage=c.shrinkage, max_weight=c.max_weight, fdm_cap=c.fdm_cap,
-                          vol_halflife=c.vol_halflife, min_periods=c.min_periods, corr_floor=c.corr_floor)
-    eq.fit(f_train, close.reindex(f_train.index))
+                          vol_halflife=c.vol_halflife, min_periods=c.min_periods, corr_floor=c.corr_floor,
+                          **_combiner_options(cfg))
+    eq.fit(f_train, close.reindex(f_train.index), **kw)
     return eq, f"equal ({why})"
 
 
@@ -992,7 +1176,7 @@ def _combine_folds(ctx: _Ctx, cfg: AurumConfig, ev: _Evaluated, plans: Sequence[
         h = pd.concat(hist_parts) if hist_parts else None
         if h is not None:
             h = h.loc[h.index < te_idx[0]]  # defensive: strictly before this fold's test block
-        comb, basis = _fit_fold_combiner(cfg, keys, f_train, close, h, window)
+        comb, basis = _fit_fold_combiner(cfg, keys, f_train, close, h, window, bars=ctx.md.bars)
         f_test[_COMBINED] = comb.combine(f_test[keys]).to_numpy()
         hist_parts.append(f_test[keys])
         f_test["fold"] = p.key
@@ -1059,7 +1243,8 @@ def _resolve_strategies(cfg: AurumConfig, strategies: Sequence[Strategy] | Mappi
 
 
 def _run(md: MarketData, cfg: AurumConfig, strategies: dict[str, Strategy], plans: list[FoldPlan],
-         holdout: FoldPlan | None, settings: dict[str, Any], *, kind: str, notes: list[str]) -> WalkForwardReport:
+         holdout: FoldPlan | None, settings: dict[str, Any], *, kind: str, notes: list[str],
+         extra_trials: int = 0) -> WalkForwardReport:
     t_all = time.perf_counter()
     timing: dict[str, float] = {}
     wf = cfg.walkforward
@@ -1067,10 +1252,15 @@ def _run(md: MarketData, cfg: AurumConfig, strategies: dict[str, Strategy], plan
     ctx = _Ctx(md=md, n_research=n_research)
     n_tasks = sum(len(plans) + (holdout is not None) if s.trainable else 1 for s in strategies.values())
     exec_kind, n_jobs = _resolve_executor(cfg, n_research, max(n_tasks, len(strategies) + 2))
-    settings = {**settings, "executor": exec_kind, "n_jobs": n_jobs}
     logger.info("%s: %d strategies, %d folds, executor=%s(%d)", kind, len(strategies), len(plans), exec_kind, n_jobs)
     spec = _book_spec(cfg)
-    n_trials = int(wf.n_trials or len(strategies))
+    # DSR trials: strategy configurations evaluated in THIS run (one config x N strategies, or
+    # walkforward.n_trials) + configurations evaluated before on the same holdout window
+    # (holdout ledger): every earlier look is a selection opportunity the DSR must deflate.
+    n_trials_base = int(wf.n_trials or len(strategies))
+    n_trials = n_trials_base + max(0, int(extra_trials))
+    settings = {**settings, "executor": exec_kind, "n_jobs": n_jobs, "n_trials_base": n_trials_base,
+                "n_trials_prior_looks": max(0, int(extra_trials))}
     with _Runner(ctx, exec_kind, n_jobs) as runner:
         ev = _evaluate(ctx, cfg, strategies, plans, holdout, runner, timing)
         keys = [k for k in strategies if k in ev.fc]
@@ -1097,7 +1287,8 @@ def _run(md: MarketData, cfg: AurumConfig, strategies: dict[str, Strategy], plan
             hold_report = HoldoutReport(start=hs, end=he, combined=h_comb, strategy_results=h_books,
                                         benchmark=h_bench, stats=h_stats, weights=h_info[0]["weights"],
                                         fdm=h_info[0]["fdm"], costs=_costs_table(h_comb, h_books, h_bench),
-                                        combiner_basis=h_info[0]["basis"])
+                                        combiner_basis=h_info[0]["basis"],
+                                        forecasts=h_fc.drop(columns="fold", errors="ignore"))
             timing["holdout_s"] = round(time.perf_counter() - t0, 3)
 
     t0 = time.perf_counter()
@@ -1163,7 +1354,8 @@ def _default_out_dir(cfg: AurumConfig, kind: str) -> Path:
 
 def run_walk_forward(md: MarketData, config: AurumConfig, *,
                      strategies: Sequence[Strategy] | Mapping[str, Strategy] | None = None,
-                     out_dir: str | Path | None = None, write: bool | None = None) -> WalkForwardReport:
+                     out_dir: str | Path | None = None, write: bool | None = None,
+                     holdout_ledger: str | Path | bool | None = None) -> WalkForwardReport:
     """Run the full walk-forward protocol (module docstring) and return the report.
 
     Parameters
@@ -1175,12 +1367,49 @@ def run_walk_forward(md: MarketData, config: AurumConfig, *,
                them from ``config.strategies`` via the registry.
     out_dir  : run directory (default ``output.dir/walkforward_<utc>_<hash8>``).
     write    : write artefacts (default ``output.save_results``).
+    holdout_ledger : where holdout evaluations are recorded (JSONL, :data:`HOLDOUT_LEDGER`).
+               ``None`` (default): ``<run dir>/../holdout_ledger.jsonl`` when the run is written
+               (i.e. ``output.dir/holdout_ledger.jsonl`` for default run directories), not
+               recorded otherwise (noted in the report); a path: that file; ``False``: off.
+               Before the holdout is evaluated the ledger is read: earlier evaluations of an
+               overlapping window by OTHER configs trigger a WARNING + report note and are
+               added to the DSR ``n_trials`` (``settings["n_trials_prior_looks"]``).
     """
     t0 = time.perf_counter()
     strats = _resolve_strategies(config, strategies, None)
     idx = pd.DatetimeIndex(md.bars.index)
     plans, holdout, settings = plan_folds(idx, config, strats)
-    report = _run(md, config, strats, plans, holdout, settings, kind="walkforward", notes=[])
+    write = config.output.save_results if write is None else write
+    run_dir = (Path(out_dir) if out_dir is not None else _default_out_dir(config, "walkforward")) if write else None
+    notes: list[str] = []
+    ledger: Path | None = None
+    prior: dict[str, Any] = {}
+    if holdout is not None:
+        if isinstance(holdout_ledger, (str, Path)):
+            ledger = Path(holdout_ledger)
+        elif holdout_ledger is not False:
+            # default location: the ROOT of the output directory, next to the run directories
+            root = run_dir.parent if run_dir is not None else (Path(config.output.dir) if holdout_ledger else None)
+            ledger = root / HOLDOUT_LEDGER if root is not None else None
+        if ledger is not None:
+            prior = prior_holdout_looks(read_holdout_ledger(ledger), start=idx[holdout.test_start],
+                                        end=idx[holdout.test_end - 1], config_hash=config.config_hash(),
+                                        symbol=config.data.symbol)
+            if prior["n_prior_configs"]:
+                msg = (f"the holdout window {idx[holdout.test_start]} -> {idx[holdout.test_end - 1]} was "
+                       f"evaluated before by {prior['n_prior_configs']} other config(s) "
+                       f"({prior['n_prior_looks']} prior look(s) since {prior['first_look']}, ledger {ledger}): it is "
+                       f"no longer an untouched holdout; DSR n_trials is raised by {prior['n_prior_configs']}")
+                logger.warning(msg)
+                notes.append("WARNING: " + msg)
+        else:
+            notes.append("holdout evaluation NOT recorded in a holdout ledger (results not written; pass "
+                         "holdout_ledger=PATH to record it)")
+    report = _run(md, config, strats, plans, holdout, settings, kind="walkforward", notes=notes,
+                  extra_trials=int(prior.get("n_prior_configs", 0)))
+    if report.holdout is not None:
+        report.holdout.prior_looks = prior
+        report.holdout.ledger_path = ledger
     if (config.combiner.method != "fixed" and config.walkforward.combiner_fit == "train"
             and any(getattr(s, "trainable", False) for s in strats.values())):
         report.notes.append("combiner_fit=train: combiner weights were fitted on IN-SAMPLE forecasts of "
@@ -1188,10 +1417,12 @@ def run_walk_forward(md: MarketData, config: AurumConfig, *,
     n_eq = sum(1 for f in report.folds["combiner_basis"] if str(f).startswith("equal"))
     if n_eq:
         report.notes.append(f"{n_eq} fold(s) used equal combiner weights (not enough earlier OOS history)")
-    write = config.output.save_results if write is None else write
-    if write:
-        d = Path(out_dir) if out_dir is not None else _default_out_dir(config, "walkforward")
-        report.save(d, tearsheet=config.output.tearsheet, dark_charts=config.output.dark_charts)
+    if run_dir is not None:
+        report.save(run_dir, tearsheet=config.output.tearsheet, dark_charts=config.output.dark_charts)
+    if report.holdout is not None and ledger is not None:
+        # recorded AFTER the evaluation (and the write): the ledger lists looks that happened
+        append_holdout_ledger(ledger, _ledger_entry(report, config, report.out_dir))
+        logger.info("holdout evaluation recorded in %s", ledger)
     report.timing["wall_s"] = round(time.perf_counter() - t0, 3)
     if report.out_dir is not None:
         (report.out_dir / "summary.json").write_text(json.dumps(report.summary(), indent=2), encoding="utf-8")
@@ -1292,6 +1523,9 @@ class QuantBook:
 
     ``signals``/``combined`` cover every bar of the data they were generated on; rows inside
     the training window are in-sample, rows after ``fit_end`` are out-of-sample.
+    ``feature_reference`` (when a strategy consumes pipeline features) is the PSI reference
+    of the TRAIN-window features after the train-fitted scaling (what the live drift monitor
+    compares live features against).
     """
 
     strategies: dict[str, Strategy]
@@ -1302,12 +1536,15 @@ class QuantBook:
     train_end: pd.Timestamp
     fit_end: int                      # first bar NOT available to the fit (exclusive)
     pipeline: Any = None              # fitted FeaturePipeline when a strategy consumes features
+    combiner_basis: str = ""
+    feature_reference: Any = None     # aurum.live.monitor.FeatureReference of the TRAIN features
 
 
 def fit_quant_book(md: MarketData, cfg: AurumConfig, *,
                    strategies: Sequence[Strategy] | Mapping[str, Strategy] | None = None,
                    only: Sequence[str] | None = None, fit_end: Any = None, gap: bool = True,
-                   oos_forecasts: pd.DataFrame | None = None) -> QuantBook:
+                   oos_forecasts: pd.DataFrame | None = None, combiner_fit: str | None = None,
+                   feature_reference: bool = True) -> QuantBook:
     """Fit every strategy and the combiner on the training window that ends before ``fit_end``.
 
     ``fit_end``: bar position or timestamp; bars at/after it are never used for fitting
@@ -1315,12 +1552,13 @@ def fit_quant_book(md: MarketData, cfg: AurumConfig, *,
     earlier (use it when the bars after ``fit_end`` will be evaluated, e.g. a desk replay);
     the window length / anchoring follow ``walkforward.train`` / ``anchored``. Strategies
     are then generated on the whole ``md`` (causal) and combined with the fitted weights.
+    Trainable strategies are fitted on macro rows published by the end of the window only.
 
-    Combiner: with ``walkforward.combiner_fit="oos"`` the weights come from
-    ``oos_forecasts`` (e.g. a walk-forward run's ``oos_forecasts.parquet``; only rows before
-    ``fit_end`` are used) and fall back to EQUAL weights without such history; with
+    Combiner: with ``walkforward.combiner_fit="oos"`` (or ``combiner_fit="oos"``) the weights
+    come from ``oos_forecasts`` (e.g. a walk-forward run's ``oos_forecasts.parquet``; only rows
+    before ``fit_end`` are used) and fall back to EQUAL weights without such history; with
     ``"train"`` they are fitted on the training-window forecasts (in-sample for trainable
-    strategies).
+    strategies). Either way strategies are scored net of estimated trading costs.
     """
     strats = _resolve_strategies(cfg, strategies, only)
     bars = md.bars
@@ -1347,19 +1585,25 @@ def fit_quant_book(md: MarketData, cfg: AurumConfig, *,
     need = {k: _needs_features(s, cfg.features.enabled) for k, s in strats.items()}
     x_all = None
     pipe = None
+    ref = None
     if any(need.values()):
         pipe = cfg.features.build()
         raw = pipe.compute(md)
         pipe.fit(raw.iloc[tr0:tr1])
         x_all = pipe.transform(raw)
+        if feature_reference:
+            ref = train_feature_reference(x_all.iloc[tr0:tr1])
     fitted: dict[str, Strategy] = {}
     cols: dict[str, np.ndarray] = {}
-    md_train = _slice(md, tr0, tr1)
+    md_train = _train_md(md, tr0, tr1)
     for k, proto in strats.items():
         s = proto.clone()
         feats = x_all if need[k] else None
         if s.trainable:
-            s.fit(md_train, None if feats is None else feats.iloc[tr0:tr1])
+            if feats is None and s.fit_history_bars > 0:
+                s.fit(_train_md(md, max(0, tr0 - s.fit_history_bars), tr1), None)
+            else:
+                s.fit(md_train, None if feats is None else feats.iloc[tr0:tr1])
         cols[k] = _generate(s, md, feats)
         fitted[k] = s
     signals = pd.DataFrame(cols, index=idx)
@@ -1372,8 +1616,21 @@ def fit_quant_book(md: MarketData, cfg: AurumConfig, *,
         cut = idx[end] if end < n else idx[-1] + pd.Timedelta(seconds=1)
         hist = oos_forecasts.loc[oos_forecasts.index < cut, keys]
     window = None if wf.anchored else duration_to_bars(wf.train, bpd)
-    comb, basis = _fit_fold_combiner(cfg, keys, signals.iloc[tr0:tr1], bars["close"], hist, window)
+    comb, basis = _fit_fold_combiner(cfg, keys, signals.iloc[tr0:tr1], bars["close"], hist, window,
+                                     bars=bars.iloc[:end], combiner_fit=combiner_fit)
     logger.info("quant book combiner: %s", basis)
     combined = comb.combine(signals)
     return QuantBook(strategies=fitted, combiner=comb, signals=signals, combined=combined,
-                     train_start=idx[tr0], train_end=idx[tr1 - 1], fit_end=end, pipeline=pipe)
+                     train_start=idx[tr0], train_end=idx[tr1 - 1], fit_end=end, pipeline=pipe,
+                     combiner_basis=basis, feature_reference=ref)
+
+
+def train_feature_reference(train_features: pd.DataFrame | None, *, n_bins: int = 10) -> Any:
+    """:class:`aurum.live.monitor.FeatureReference` of TRAIN-window features AFTER the
+    train-fitted scaling (``pipeline.transform``) - the distribution the live drift monitor
+    (PSI) compares live features with. Warm-up rows (NaN) are ignored; None without features."""
+    if train_features is None or train_features.shape[1] == 0:
+        return None
+    from aurum.live.monitor import FeatureReference
+
+    return FeatureReference.from_frame(train_features, n_bins=n_bins)

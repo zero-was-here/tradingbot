@@ -73,6 +73,7 @@ __all__ = [
     "CostsConfig",
     "DataConfig",
     "FeaturesConfig",
+    "FinancingConfig",
     "InstrumentConfig",
     "LiveConfig",
     "OutputConfig",
@@ -335,7 +336,7 @@ class InstrumentConfig:
     max_lot: float = XAUUSD.max_lot
     margin_rate: float = XAUUSD.margin_rate
     commission_per_lot: float = XAUUSD.commission_per_lot
-    swap_long_per_lot: float = XAUUSD.swap_long_per_lot
+    swap_long_per_lot: float = XAUUSD.swap_long_per_lot     # used by costs.financing.mode: fixed
     swap_short_per_lot: float = XAUUSD.swap_short_per_lot
     triple_swap_weekday: int = XAUUSD.triple_swap_weekday
     rollover_hour_utc: int = XAUUSD.rollover_hour_utc
@@ -344,6 +345,30 @@ class InstrumentConfig:
         from aurum.core.instrument import Instrument
 
         return Instrument(**dataclasses.asdict(self))
+
+
+@dataclass
+class FinancingConfig:
+    """Overnight financing (see :class:`aurum.execution.costs.FinancingModel`).
+
+    ``mode: rate`` (default) charges the benchmark ``rate_series`` from the macro data
+    (``fedfunds`` = FRED DFF, percent), read point-in-time at each rollover, plus
+    ``markup_long`` / minus ``markup_short`` (annual fractions; ~2-3% at retail CFD brokers)
+    on the position's notional, ``/day_count`` per night (triple on the instrument's
+    ``triple_swap_weekday``); ``lease_rate`` is the gold lease rate earned by longs.
+    ``fallback_rate`` applies before the series starts or without macro data.
+    ``mode: fixed`` uses the broker-quoted ``instrument.swap_{long,short}_per_lot``;
+    ``mode: none`` disables financing.
+    """
+
+    mode: str = "rate"
+    markup_long: float = 0.025
+    markup_short: float = 0.025
+    lease_rate: float = 0.0
+    rate_series: str = "fedfunds"
+    rate_unit: str = "percent"
+    fallback_rate: float = 0.03
+    day_count: float = 360.0
 
 
 @dataclass
@@ -356,6 +381,7 @@ class CostsConfig:
     slippage_range_frac: float = 0.02
     impact_coef: float = 0.0
     commission_per_lot: float | None = None
+    financing: FinancingConfig = field(default_factory=FinancingConfig)
 
     def build(self) -> Any:
         from aurum.execution.costs import CostModel
@@ -404,7 +430,13 @@ class StrategyConfig:
 @dataclass
 class CombinerConfig:
     """:class:`aurum.portfolio.combiner.ForecastCombiner` settings. ``method="fixed"`` uses
-    the strategies' ``weight`` values (normalised) with the same FDM logic."""
+    the strategies' ``weight`` values (normalised) with the same FDM logic.
+
+    ``allow_unallocated`` (default true): strategies with a non-positive NET Sharpe get no
+    weight and the ``max_weight`` cap never forces weight onto them, so the weights may sum
+    to < 1 (less risk); false restores the sum-to-1 behaviour. ``cost_multiplier`` scales the
+    combiner's estimated turnover cost (1 = the configured cost model, 0 = score gross).
+    """
 
     method: str = "sharpe_shrink"
     shrinkage: float = 0.5
@@ -413,6 +445,8 @@ class CombinerConfig:
     vol_halflife: float = 48.0
     min_periods: int = 20
     corr_floor: float = 0.0
+    allow_unallocated: bool = True
+    cost_multiplier: float = 1.0
 
     def build(self) -> Any:
         from aurum.portfolio.combiner import ForecastCombiner
@@ -420,7 +454,9 @@ class CombinerConfig:
         method = "equal" if self.method == "fixed" else self.method
         return ForecastCombiner(method=method, shrinkage=self.shrinkage, max_weight=self.max_weight,
                                 fdm_cap=self.fdm_cap, vol_halflife=self.vol_halflife,
-                                min_periods=self.min_periods, corr_floor=self.corr_floor)
+                                min_periods=self.min_periods, corr_floor=self.corr_floor,
+                                allow_unallocated=self.allow_unallocated,
+                                cost_multiplier=self.cost_multiplier)
 
 
 @dataclass
@@ -746,9 +782,6 @@ class AurumConfig:
         problems = _live_option_problems(base, self.live.options)
         if problems:
             raise ConfigError(problems)
-        if self.backtest.stop_cooldown_bars:
-            logger.warning("backtest.stop_cooldown_bars=%d is not implemented by the live runner: live "
-                           "re-entries after a stop will differ from the backtest", self.backtest.stop_cooldown_bars)
         dropped = sorted(k for k, v in self.agents.desk.items() if isinstance(v, Mapping))
         if dropped and self.live.use_desk:
             logger.warning("live desk: nested desk settings %s are not passed to the live runner "
@@ -766,6 +799,7 @@ class AurumConfig:
             "retry_poll_seconds": lv.poll_seconds,
             "stop_atr_mult": self.backtest.stop_atr_mult, "take_profit_atr_mult": self.backtest.take_profit_atr_mult,
             "atr_period": self.backtest.atr_period,
+            "stop_cooldown_bars": self.backtest.stop_cooldown_bars,
             "macro_dir": str(self.data.resolved_macro_dir()) if self.data.macro else None,
             "calendar": "rule_based" if self.data.events == "rule_based" else None,
             "calendar_csv": self.data.events if str(self.data.events).lower().endswith(".csv") else None,

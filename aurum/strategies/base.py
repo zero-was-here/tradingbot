@@ -51,6 +51,18 @@ class Strategy(ABC):
         """Bars of history required before the forecast is meaningful."""
         return 0
 
+    @property
+    def fit_history_bars(self) -> int:
+        """Bars of history BEFORE the training window that ``fit`` may receive purely for
+        feature warm-up (the walk-forward engine prepends them to the training slice).
+
+        Those bars are strictly in the past relative to every test row, so using them is not
+        leakage; strategies whose own feature pipeline needs a long warm-up (e.g. the ML
+        models' one-year regime rank) override this so a rolling 3-year training window is
+        not partly consumed by warm-up. Default 0.
+        """
+        return 0
+
     def fit(self, md: MarketData, features: pd.DataFrame | None = None) -> Strategy:
         """Learn parameters from TRAINING data only. Default: nothing to learn."""
         self.is_fitted = True

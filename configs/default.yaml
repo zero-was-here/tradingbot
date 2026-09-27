@@ -25,6 +25,15 @@ costs:
   slippage_range_frac: 0.02       # + 2% of the execution bar's high-low range
   impact_coef: 0.0
   commission_per_lot: null        # -> instrument.commission_per_lot
+  financing:                      # overnight financing at each rollover (triple on Wednesday)
+    mode: rate                    # rate | fixed (instrument swap_*_per_lot, USD/lot/night) | none
+    rate_series: fedfunds         # data_store/macro/fedfunds (FRED DFF, %), read as of each rollover
+    rate_unit: percent
+    markup_long: 0.025            # long pays  fedfunds - lease + 2.5%/yr on notional (retail CFD ~2-3%)
+    markup_short: 0.025           # short gets fedfunds - lease - 2.5%/yr (negative -> it pays)
+    lease_rate: 0.0               # gold lease rate (small; set to model the gold carry)
+    fallback_rate: 0.03           # benchmark used before the series starts / without macro data
+    day_count: 360
 
 features:
   enabled: auto                   # auto: only strategies declaring uses_features get the config pipeline;
@@ -62,6 +71,8 @@ combiner:
   shrinkage: 0.5
   max_weight: 0.4
   fdm_cap: 2.5
+  allow_unallocated: true         # net-losing strategies get 0 weight; weights may sum to < 1 (less risk)
+  cost_multiplier: 1.0            # x the estimated turnover cost the combiner scores strategies net of
 
 sizing:
   method: vol_target
@@ -103,7 +114,7 @@ walkforward:
   embargo: 24                     # bars (1 trading day on H1)
   holdout_start: "2025-01-01"     # final holdout: excluded from every fold, evaluated ONCE
   min_train_bars: 500
-  n_trials: null                  # DSR trials; null = number of strategy configs
+  n_trials: 23                    # pre-registered: 21 strategy configs + 2 combined books (docs/RESEARCH_PROTOCOL.md)
   pbo_splits: 16
   n_boot: 1000
   on_strategy_error: raise

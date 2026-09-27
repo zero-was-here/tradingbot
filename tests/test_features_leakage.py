@@ -37,6 +37,12 @@ SPEC_GROUPS = {
     "session", "mtf", "macro", "calendar", "regime",
 }
 TIME_ONLY_GROUPS = {"session", "calendar"}  # depend on timestamps/schedule only
+#: Test-only parameter overrides for groups whose DEFAULT warm-up exceeds this 2,400-bar
+#: history: ``regime``'s bounded vol rank is NaN until its 1-year window (5,796 H1 bars) is
+#: full, so with defaults the prefix checks would compare NaN with NaN. A 500-bar window runs
+#: the same code; the default window is checked on a long history in
+#: tests/test_stability_regime.py (point-in-time and sliding-window parity).
+GROUP_TEST_PARAMS: dict[str, dict] = {"regime": {"rank_window": 500}}
 #: Every group registered at collection time (SPEC groups + anything added later).
 ALL_GROUPS = sorted({s.name for s in list_features()} | SPEC_GROUPS)
 
@@ -108,11 +114,12 @@ def compare_prefix(a: pd.DataFrame, b: pd.DataFrame, t: int, label: str) -> list
 def leak_report(name: str, md: MarketData, alternatives: dict[int, list[MarketData]]) -> list[str]:
     """Run the perturbation + truncation checks for one registered group."""
     spec = get_feature(name)
-    full = spec.compute(md)
+    params = GROUP_TEST_PARAMS.get(name, {})
+    full = spec.compute(md, **params)
     problems: list[str] = []
     for t, markets in alternatives.items():
         for i, alt in enumerate(markets):
-            other = spec.compute(alt)
+            other = spec.compute(alt, **params)
             label = f"{name}@t={t}/{'perturbed' if i == 0 else 'truncated'}"
             problems += compare_prefix(full, other, t, label)
     return problems
@@ -167,7 +174,8 @@ def test_leakage_check_is_not_vacuous(name: str, market: MarketData,
     """Every column must be populated before the last cutoff (otherwise the prefix check
     compares NaN with NaN), and price-driven groups must react to the perturbation."""
     spec = get_feature(name)
-    full = spec.compute(market)
+    params = GROUP_TEST_PARAMS.get(name, {})
+    full = spec.compute(market, **params)
     assert full.shape[1] > 0, f"{name} produced no columns"
     prefixes = (f"{name}_", f"{spec.family}_")
     assert all(c.startswith(prefixes) for c in full.columns), "columns must carry the group prefix"
@@ -176,7 +184,7 @@ def test_leakage_check_is_not_vacuous(name: str, market: MarketData,
     assert populated.all(), f"never populated before t={t_last}: {list(populated[~populated].index)}"
     if name not in TIME_ONLY_GROUPS:
         t = min(CUTOFFS)
-        other = spec.compute(alternatives[t][0])
+        other = spec.compute(alternatives[t][0], **params)
         x = full.iloc[t + 1:].to_numpy(dtype=float)
         y = other.iloc[t + 1:].to_numpy(dtype=float)
         changed = ~((x == y) | (np.isnan(x) & np.isnan(y)))
@@ -313,7 +321,8 @@ def test_schema_and_values_on_tiny_histories(name: str, market: MarketData) -> N
     columns as the full history and the full history's first rows (NaN == NaN) — a group
     that drops columns until data arrives breaks ``FeaturePipeline.transform`` in live."""
     spec = get_feature(name)
-    full = spec.compute(market)
+    params = GROUP_TEST_PARAMS.get(name, {})
+    full = spec.compute(market, **params)
     for k in (0, 1, 2, 3):
         if k:
             short = truncated_market(market, k - 1)
@@ -323,7 +332,7 @@ def test_schema_and_values_on_tiny_histories(name: str, market: MarketData) -> N
                                macro={n: v.loc[pd.DatetimeIndex(v["available_at"]) <= first_open]
                                       for n, v in market.macro.items()},
                                events=market.events)
-        out = spec.compute(short)
+        out = spec.compute(short, **params)
         assert list(out.columns) == list(full.columns), (name, k)
         assert out.index.equals(market.bars.index[:k])
         if k:

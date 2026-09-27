@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +12,7 @@ import pytest
 from aurum.core.instrument import XAUUSD
 from aurum.core.types import Side
 from aurum.data.synthetic import make_synthetic_bars
-from aurum.execution.costs import CostModel
+from aurum.execution.costs import CostModel, FinancingModel
 from aurum.execution.simulator import ExecutionSimulator
 from aurum.live.broker import Broker, OrderRequest, OrderStatusCode, SimulatedClock, net_lots
 from aurum.live.paper import PaperBroker, ReplayFeed
@@ -94,8 +95,10 @@ def test_paper_equals_simulator(stop: float | None) -> None:
 def test_paper_swap_matches_simulator_over_rollovers() -> None:
     """Hold a position over many rollovers (incl. the triple-swap Wednesday)."""
     bars = _bars(24 * 9)
-    sim = ExecutionSimulator(bars, costs=CostModel.zero())
-    pb, clock, _ = _broker(bars, costs=CostModel.zero())
+    # no trading frictions, per-lot swaps (CostModel.zero() also switches financing off)
+    costs = dataclasses.replace(CostModel.zero(), financing=FinancingModel.fixed())
+    sim = ExecutionSimulator(bars, costs=costs)
+    pb, clock, _ = _broker(bars, costs=costs)
     for t in range(len(bars) - 1):
         clock.advance_to(bars["available_at"].iloc[t] + DELAY)
         if t == 0:

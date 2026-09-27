@@ -5,6 +5,10 @@
 extends: default.yaml
 name: desk_overlay
 
+costs:
+  financing:                      # rate-based overnight financing (see default.yaml)
+    mode: rate
+
 agents:
   enabled: true
   policy:

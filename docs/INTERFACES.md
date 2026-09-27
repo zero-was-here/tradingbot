@@ -148,7 +148,9 @@ aurum.features.microstructure: microstructure_features(md, *, z_window=120, atr_
 aurum.features.multi_timeframe: resample_anchored(bars, to, anchor_hour_utc=0) (pandas-3-safe anchored resample_bars); htf_compact_features(htf, ...); mtf_features(md, *, htfs=("H4","D1"), daily_anchor_hour_utc=22, prev_day=True, ...)
 aurum.features.macro: macro_features(md, *, series=None, change_days=(1,5,20), z_window=250, z_min_periods=60, corr_window=60, corr_min_periods=40, beta_series=("dxy","real10y"), yield_series=DEFAULT_YIELD_SERIES, stale_days=10, daily_anchor_hour_utc=22); session_date(index, anchor_hour_utc)
 aurum.features.calendar: calendar_features(md, *, min_importance=3, cap_hours=72, currencies=None, near_minutes=30, wide_hours=2, count_horizon_hours=24); classify_event(names); EVENT_PATTERNS
-aurum.features.regime: regime_features(md, ...); efficiency_ratio(close, n); variance_ratio(logp, q, window)
+aurum.features.regime: regime_features(md, *, vol_window=24, rank_years=1.0, rank_window=None, expanding=False, ..., vol_halflife=None, ...); efficiency_ratio(close, n); variance_ratio(logp, q, window); rank_window_bars(rank_years, minutes); regime_lookback(params, bar_minutes); DEFAULT_RANK_YEARS
+  # wave 3: default columns regime_vol_pctrank (bounded rolling rank, NaN until the rank_years window is full; 5,796 H1 / 23,184 M15 / 1,449 H4 / 252 D1 bars), regime_high_vol/low_vol from it;
+  # regime_vol_pctrank_exp only with expanding=True; regime_vol_pctrank_2000 is gone (pipelines/RL policies fitted before must be retrained: FeatureSchemaError)
 aurum.features.pipeline:
   class FeaturePipeline(groups=None, overrides=None, scaler="robust"|"standard"|"none", clip=5.0, *, warmup=None)
     compute(md) -> DataFrame; fit(raw_train) -> self; transform(raw, *, strict=True) -> DataFrame; fit_transform(raw)
@@ -177,20 +179,28 @@ Strategies and sizing: import atr, true_range, yang_zhang_vol, parkinson_vol, ga
 ```
 aurum.execution.costs:
   FillPrice(NamedTuple): price, spread_cost, slippage_cost
-  @dataclass(frozen) CostModel(spread_multiplier=1.0, min_spread=0.10, slippage_fixed=0.02, slippage_range_frac=0.02, impact_coef=0.0, commission_per_lot=None)
-    .zero() -> CostModel (classmethod); .to_dict()
+  @dataclass(frozen) CostModel(spread_multiplier=1.0, min_spread=0.10, slippage_fixed=0.02, slippage_range_frac=0.02, impact_coef=0.0, commission_per_lot=None, financing=FinancingModel())   # financing also accepts kwargs / a mode name
+    .zero() -> CostModel (classmethod; financing "none" too); .to_dict()
     .effective_spread(spread) -> float            # max(spread*mult, min_spread)
     .slippage(bar_range, lots) -> float           # USD/oz: fixed + frac*range + impact*sqrt(|lots|)
     .fill_price(side, mid, spread, bar_range, lots, *, instrument=XAUUSD, limit=False) -> FillPrice
     .commission(lots, *, instrument=XAUUSD) -> float   # per lot per side; None -> instrument
-    .swap(lots, nights, *, instrument=XAUUSD) -> float  # signed, nights already triple-weighted
-    .swap_between(lots, start, end, *, instrument=XAUUSD) -> float
+    .swap(lots, nights, *, instrument=XAUUSD, price=None, rate_nights=None) -> float  # signed, nights already triple-weighted; rate mode needs price
+    .swap_between(lots, start, end, *, instrument=XAUUSD, price=None, rates=None) -> float
+  @dataclass(frozen) FinancingModel(mode="rate"|"fixed"|"none", markup_long=0.025, markup_short=0.025, lease_rate=0.0, rate_series="fedfunds", rate_unit="percent"|"fraction"|"bps", fallback_rate=0.03, day_count=360.0)
+    .fixed() / .none() / .coerce(model|mapping|mode|None); .to_dict(); .uses_rates; .curve(rates) -> RateCurve|None
+    .benchmark_ns(t_ns, curve); .rate_nights_ns(t0_ns, t1_ns, instrument, curve)   # sum_R w(R)*r(R) over rollovers in (t0, t1], r as of R
+    .amount(lots, nights, *, price=None, rate_nights=None, instrument) ; .nightly(lots, price, benchmark) ; .annual_rate(lots, benchmark)
+    # rate: -lots*contract_size*P*(r - lease + markup_long [long] / - markup_short [short])/day_count per night
+  RateCurve(available_ns, values, name).asof_ns(t_ns); RateCurve.from_source(md.macro | frame with available_at | Series indexed by availability | RateCurve, name="fedfunds", unit="percent")
+  FINANCING_MODES
     .round_trip_cost(lots, spread, bar_range=0.0, *, instrument=XAUUSD) -> float
   rollover_nights(start, end, instrument=XAUUSD) -> float          # nights charged over (start, end]
   rollover_nights_ns(t0_ns, t1_ns, instrument=XAUUSD) -> np.ndarray # vectorised O(1)/interval
 
 aurum.execution.simulator:
-  ExecutionSimulator(bars, instrument=XAUUSD, costs=None, initial_equity=100_000.0, *, validate=True)
+  ExecutionSimulator(bars, instrument=XAUUSD, costs=None, initial_equity=100_000.0, *, validate=True, rates=None)   # result().meta["financing"] = rate provenance
+  intrabar_exit(pos, o, h, lo, sl, tp) -> (exit_mid, reason, is_limit) | None   # shared with PaperBroker and the live runner (ExecutionSimulator._intrabar_exit / aurum.live.paper._protective_exit are aliases)
     .reset(start=0, equity=None)
     .step(target_lots, *, stop_price=None, take_profit=None, reason="signal") -> StepResult
     .result(*, compute_metrics=True) -> BacktestResult
@@ -200,9 +210,10 @@ aurum.execution.simulator:
   TRADE_COLUMNS, FILL_COLUMNS
 
 aurum.backtest.engine:
-  run_backtest(md, forecast, *, sizer, risk=None, instrument=XAUUSD, costs=None, initial_equity=100_000.0, vol=None, stop_atr_mult=None, start=None, end=None, take_profit_atr_mult=None, atr_period=14, stop_cooldown_bars=0, bars_per_year=None, event_horizon_hours=24.0, compute_metrics=True) -> BacktestResult
-  run_target_lots(md, target_lots, *, risk=None, instrument=XAUUSD, costs=None, initial_equity=100_000.0, vol=None, stop_atr_mult=None, start=None, end=None, take_profit_atr_mult=None, atr_period=14, stop_cooldown_bars=0, bars_per_year=None, event_horizon_hours=24.0, compute_metrics=True) -> BacktestResult   # NaN target = hold
-  buy_and_hold_benchmark(md, lots=None, notional=None, *, instrument=XAUUSD, costs=None, initial_equity=100_000.0, start=None, end=None, frictionless=False, compute_metrics=True) -> BacktestResult
+  run_backtest(md, forecast, *, sizer, risk=None, instrument=XAUUSD, costs=None, initial_equity=100_000.0, vol=None, stop_atr_mult=None, start=None, end=None, take_profit_atr_mult=None, atr_period=14, stop_cooldown_bars=0, bars_per_year=None, event_horizon_hours=24.0, compute_metrics=True, forecast_hook=None, hook_every=1, financing=None, rates=None) -> BacktestResult
+  run_target_lots(md, target_lots, *, risk=None, instrument=XAUUSD, costs=None, initial_equity=100_000.0, vol=None, stop_atr_mult=None, start=None, end=None, take_profit_atr_mult=None, atr_period=14, stop_cooldown_bars=0, bars_per_year=None, event_horizon_hours=24.0, compute_metrics=True, financing=None, rates=None) -> BacktestResult   # NaN target = hold
+  buy_and_hold_benchmark(md, lots=None, notional=None, *, instrument=XAUUSD, costs=None, initial_equity=100_000.0, start=None, end=None, frictionless=False, compute_metrics=True, financing=None, rates=None) -> BacktestResult
+  # financing= overrides costs.financing; rates= defaults to md.macro (rates read as of each rollover, point-in-time)
   average_true_range(bars, n=14) -> pd.Series   # Wilder, causal, never NaN
   RISK_EVENT_COLUMNS = [time, bar_time, bar, current, requested, approved, halted, reasons]; OUTCOME_COLUMNS
 
@@ -325,11 +336,13 @@ aurum.portfolio.sizing:
     .target_lots(..., *, current_lots=0.0, drawdown=0.0, atr=None) ; .stop_distance(vol_ann, price, *, atr=None)
   drawdown_multiplier(drawdown, steps) ; DEFAULT_DRAWDOWN_DERISK
 aurum.portfolio.combiner:
-  class ForecastCombiner(method="sharpe_shrink"|"equal"|"inverse_vol"|"hrp", shrinkage=0.5, max_weight=0.4, fdm_cap=2.5, *, vol_halflife=48, min_periods=20, corr_floor=0.0, bars_per_year=None)
-    .fit(forecasts, close) -> self ; .combine(forecasts) -> Series 'combined' in [-1,1] ; .fit_combine(...) ; .unit_vol_streams(forecasts, close)
-    .explain() -> dict(weights, train_sharpe, sharpe_basis, train_stream_std, avg_abs_forecast, fdm, fdm_raw, avg_forecast_correlation, n_obs, train_start/end, notes)
-    attrs weights_, fdm_, fdm_raw_, train_sharpe_, corr_, stream_corr_, notes_
-  cap_weights(weights, max_weight) -> ndarray ; METHODS
+  class ForecastCombiner(method="sharpe_shrink"|"equal"|"inverse_vol"|"hrp", shrinkage=0.5, max_weight=0.4, fdm_cap=2.5, *, vol_halflife=48, min_periods=20, corr_floor=0.0, bars_per_year=None, allow_unallocated=True, cost_multiplier=1.0)
+    .fit(forecasts, close, *, bars=None, spread=None, costs=None, instrument=None, cost_per_turnover=None) -> self   # NET of c_t*|df| when cost info is given, else gross (noted)
+    .combine(forecasts) -> Series 'combined' in [-1,1] ; .fit_combine(..., **cost_kwargs) ; .unit_vol_streams(forecasts, close, *, cost_per_turnover=None) ; .turnover_cost(forecasts, close, *, bars|spread, costs, instrument) -> c_t
+    .explain() -> dict(weights, weights_sum, unallocated, allow_unallocated, train_sharpe (net), train_sharpe_gross, sharpe_basis, cost_basis, avg_cost_per_turnover, train_turnover, train_cost_per_bar, train_stream_std, avg_abs_forecast, fdm, fdm_raw, avg_forecast_correlation, n_obs, train_start/end, notes)
+    attrs weights_ (may sum to < 1 with allow_unallocated), fdm_, fdm_raw_, train_sharpe_, train_sharpe_gross_, corr_, stream_corr_, notes_, cost_basis_
+  cap_weights(weights, max_weight, *, allow_unallocated=False) -> ndarray ; METHODS
+  # config: combiner.allow_unallocated (true) / combiner.cost_multiplier (1.0)
 aurum.risk.manager:
   @dataclass RiskLimits(max_lots=None, max_leverage=3.0, max_daily_loss=0.03, max_drawdown=0.20, max_spread=None, event_blackout_before_min=30, event_blackout_after_min=30, event_min_importance=3, blackout_mode="no_new_risk"|"flatten", max_trades_per_day=None, stale_data_seconds=None, max_margin_utilisation=0.5, daily_reset="utc"|"rollover", daily_loss_persistent=True, event_lookahead_min=0.0)
   class StandardRiskManager(limits=None, instrument=XAUUSD, state_path=None, *, events=None)  [RiskManager]
@@ -421,3 +434,28 @@ Run the tests with: .venv/bin/python -m pytest tests/test_agents_desk.py tests/t
 - HistoricalDeskDataProvider cannot supply live risk or position state by itself; that needs the hooks above (see the backtest engine change request). Backtest stats handed to it must already be point-in-time; that is the caller's responsibility.
 - The Fake client routes scripts by the 'Agent: <id>' header in each agent's first user message. When the same role is consulted twice in parallel it gets id 'role#2' and falls back to the base role's queue, so the interleaving is nondeterministic in that case.
 - No prompt or quality evaluation (evals) of the agents was done. That requires live model runs.
+
+## wave 3 integration (financing, cost-aware combiner/research, stability)
+
+### Public API additions
+```
+aurum.execution: FinancingModel, RateCurve (costs), intrabar_exit (simulator) added to the lazy exports
+aurum.core.config: FinancingConfig (costs.financing, default mode "rate"); CombinerConfig.allow_unallocated=True, .cost_multiplier=1.0 (passed by build());
+  live_runner_mapping() passes backtest.stop_cooldown_bars (live.options.stop_cooldown_bars is rejected)
+aurum.rl.env.GoldTradingEnv(..., rates=None)   # aurum.rl.train passes md.macro in training, evaluation and rollout_artifact (parity with run_backtest)
+aurum.rl.train: POLICY_FILES, read_artifact_bytes(path) -> dict[str, bytes], load_artifact_bytes(files, *, device="cpu", path=None) -> RLArtifact (also via aurum.rl)
+aurum.strategies.rl.RLPolicyStrategy: embeds the artifact bytes + fingerprint (.has_embedded_policy); pickles are self-contained
+aurum.strategies.seasonal: IntradaySeasonality params cost_aware=True, costs=None (CostModel or kwargs), cost_multiplier=2.0, dead_zone="auto"; periodic_cost_aware_positions(alpha, kappa, gamma)
+aurum.live.paper.PaperBroker(..., rates=None).set_rates(rates)   # the runner passes macro_dir frames at construction and on every macro reload
+aurum.live.runner: runner_state.json prev_final_forecast -> TradingDesk.run_cycle(previous_forecast=...); decisions.jsonl previous_forecast
+aurum.research.walkforward: HOLDOUT_LEDGER, read_holdout_ledger(path), prior_holdout_looks(entries, *, start, end, config_hash, symbol=None), append_holdout_ledger(path, entry), train_feature_reference(train_features)
+  run_walk_forward(md, config, *, strategies=None, out_dir=None, write=None, holdout_ledger=None|path|False)
+  fit_quant_book(md, cfg, *, ..., oos_forecasts=None, combiner_fit=None, feature_reference=True) -> QuantBook(+combiner_basis, feature_reference)
+  HoldoutReport(+forecasts, prior_looks, ledger_path); settings n_trials_base / n_trials_prior_looks
+aurum.cli: aurum train-final --config C --out DIR [--cutoff TS] [--from-run WF_DIR] [--allow-config-mismatch] [--overwrite] [--jobs N] [--executor ...] [--no-write] [--no-tearsheet]
+```
+
+### Integration notes
+- Config hashes changed (costs.financing and the combiner knobs are hashed): `--from-run` refuses runs made before this change unless `--allow-config-mismatch`.
+- Anything built with the default `CostModel()` now pays rate financing (Fed funds from `md.macro` + 2.5%); tests that pin per-lot swap arithmetic use `FinancingModel.fixed()`.
+- The regime group's default warm-up is about one year of bars (5,820 H1), which ML strategies with default feature groups lose from each fold's training slice; set the strategy param `feature_overrides: {regime: {rank_years: ...}}` (or `features.overrides` for the shared pipeline) if that matters. The live runner's history (3 x max_lookback) grows accordingly (about 17.5k H1 / 70k M15 bars).

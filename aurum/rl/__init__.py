@@ -23,9 +23,10 @@ import pandas as pd
 
 _ENV_NAMES = ("DEFAULT_ACTION_LEVELS", "STATE_NAMES", "EnvConfig", "GoldTradingEnv",
               "RolloutResult", "rollout")
-_TRAIN_NAMES = ("DEFAULT_FEATURE_GROUPS", "RLArtifact", "RLTrainConfig", "RLTrainResult",
+_TRAIN_NAMES = ("DEFAULT_FEATURE_GROUPS", "POLICY_FILES", "RLArtifact", "RLTrainConfig", "RLTrainResult",
                 "backtest_forecast", "check_bar_size", "evaluate_policy", "load_artifact",
-                "prepare_data", "rollout_artifact", "train_ppo")
+                "load_artifact_bytes", "prepare_data", "read_artifact_bytes", "rollout_artifact",
+                "train_ppo")
 
 #: Supported calendar anchors for simulated episodes (``rl_ppo``) and a CONSERVATIVE bound,
 #: in calendar days, on the gap between two consecutive anchor bars (weekends/holidays

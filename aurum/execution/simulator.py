@@ -10,14 +10,16 @@ Timing model (SPEC §1)
 
 1. **Gap segment** ``(close[t] -> open[t+1]]``: the *old* position is marked from
    ``close[t]`` to ``open[t+1]`` and pays swap for any rollover falling strictly after
-   ``available_at[t]`` and at/before ``open[t+1]`` (e.g. a weekend).
+   ``available_at[t]`` and at/before ``open[t+1]`` (e.g. a daily maintenance break); with
+   rate-based financing the notional is valued at ``close[t]``, the last mid before it.
 2. **Fill at the open** of ``t+1``: the position is traded to ``round_lots(target)``;
    buys fill at ``open + spread_eff/2 + slippage``, sells at ``open - spread_eff/2 -
    slippage`` (:class:`~aurum.execution.costs.CostModel`). Spread and slippage are booked
    as costs; the position itself is marked from the MID, so
    ``equity change = price PnL (at mid) - costs + swap`` holds *exactly* every bar.
 3. **Intrabar protective exits** on bar ``t+1`` for the post-fill position. OHLC are mid
-   prices and stop/take-profit levels are mid levels. For a long (mirror for shorts):
+   prices and stop/take-profit levels are mid levels (:func:`intrabar_exit`, shared with
+   the paper broker and the live runner). For a long (mirror for shorts):
 
    * ``open <= stop``  → gap through the stop: market exit at the OPEN;
    * ``open >= tp``    → gap through the take-profit: exit at the OPEN (limit, no slip);
@@ -29,10 +31,22 @@ Timing model (SPEC §1)
    either as absolute mid prices or, for a position entered at this open, as distances
    from the entry (``stop_distance`` / ``take_profit_distance``, anchored at ``open[t+1]``).
 4. **Mark-to-market** at ``close[t+1]`` and swap for rollovers inside
-   ``(open[t+1], available_at[t+1]]`` charged on the position held at the bar's close.
+   ``(open[t+1], available_at[t+1]]`` charged on the position held at the bar's close
+   (rate-based financing values the notional at ``close[t+1]``).
    (If a protective exit fired in the same bar the exact intrabar time is unknown; the
    position at the close — i.e. flat — is used. With bars ending exactly at the rollover
-   hour, the usual case for M1..H1, this is exact.)
+   hour, the usual case for M1..H1, this is exact; for H4/D1 bars that contain the
+   rollover, the bar close stands in for the price at the rollover.)
+
+Financing (:class:`~aurum.execution.costs.FinancingModel`, ``costs.financing``)
+---------------------------------------------------------------------------------
+``"fixed"`` charges ``instrument.swap_{long,short}_per_lot`` per night (bit-identical to the
+original model); ``"rate"`` charges ``-lots * contract_size * P * (r - lease +/- markup) /
+360`` per night, where ``r`` is the benchmark (``rates``; the engine passes ``md.macro``, so
+``md.macro["fedfunds"]`` by default) as of each rollover instant ``R``: only observations
+with ``available_at <= R`` are used. The rate per bar interval is precomputed at
+construction, and a rollover is only settled by the step that simulates it, so a rate is
+never used before it was published. ``"none"`` charges nothing.
 
 No information from bar ``t+1`` is available to the caller before it calls ``step``: the
 simulator only *consumes* the future to settle orders that were decided at ``t``.
@@ -61,11 +75,12 @@ from aurum.backtest.result import BacktestResult
 from aurum.core.instrument import XAUUSD, Instrument
 from aurum.core.types import Fill, Side, Trade
 from aurum.data.schema import validate_bars
-from aurum.execution.costs import CostModel, rollover_nights_ns
+from aurum.execution.costs import CostModel, FinancingModel, RateSource, _warn_once, rollover_nights_ns
 
 logger = logging.getLogger(__name__)
 
 _EPS = 1e-9
+_STALE_RATE_NS = 14 * 86_400 * 10**9
 
 #: columns of ``BacktestResult.trades``: the fields of ``aurum.core.types.Trade`` (``side`` is
 #: stored as int +1/-1) plus bar bookkeeping.
@@ -77,6 +92,37 @@ FILL_COLUMNS: list[str] = [
     "time", "bar", "side", "lots", "price", "mid", "spread_cost", "slippage_cost",
     "commission", "kind", "reason", "position_after",
 ]
+
+
+def intrabar_exit(pos: float, o: float, h: float, lo: float, sl: float | None,
+                  tp: float | None) -> tuple[float, str, bool] | None:
+    """Protective exit of a position of sign ``pos`` within one bar (``o``/``h``/``lo`` MID).
+
+    Returns ``(exit mid level, reason, is_limit)`` or ``None``. A gap through a level exits
+    at the OPEN; otherwise the stop (market order, slips) is checked before the take-profit
+    (limit order, no slippage), the conservative convention when a bar touches both. Shared
+    by :class:`ExecutionSimulator`, :class:`aurum.live.paper.PaperBroker` and the live runner
+    so that all of them resolve the same bar identically.
+    """
+    if pos > 0:
+        if sl is not None and o <= sl:
+            return o, "stop", False
+        if tp is not None and o >= tp:
+            return o, "take_profit", True
+        if sl is not None and lo <= sl:
+            return sl, "stop", False
+        if tp is not None and h >= tp:
+            return tp, "take_profit", True
+    else:
+        if sl is not None and o >= sl:
+            return o, "stop", False
+        if tp is not None and o <= tp:
+            return o, "take_profit", True
+        if sl is not None and h >= sl:
+            return sl, "stop", False
+        if tp is not None and lo <= tp:
+            return tp, "take_profit", True
+    return None
 
 
 @dataclass
@@ -142,9 +188,14 @@ class ExecutionSimulator:
     ----------
     bars : canonical bars frame (``aurum.data.schema``), mid OHLC + ``spread`` + ``available_at``.
     instrument : contract specification (lot size, rounding, swaps, rollover hour).
-    costs : :class:`CostModel`; ``None`` -> ``CostModel()`` defaults.
+    costs : :class:`CostModel`; ``None`` -> ``CostModel()`` defaults (incl. its financing).
     initial_equity : starting account equity in USD.
     validate : run ``validate_bars`` on construction (cheap, vectorised).
+    rates : benchmark-rate source for ``"rate"`` financing: ``md.macro`` (the model's
+        ``rate_series`` is picked), a macro frame with ``available_at``, a Series indexed by
+        availability time, or a :class:`~aurum.execution.costs.RateCurve`. ``None`` means
+        ``financing.fallback_rate`` for every rollover (warned once). Ignored by the
+        ``"fixed"`` and ``"none"`` modes.
 
     Attributes
     ----------
@@ -163,6 +214,7 @@ class ExecutionSimulator:
         initial_equity: float = 100_000.0,
         *,
         validate: bool = True,
+        rates: RateSource = None,
     ) -> None:
         if validate:
             validate_bars(bars)
@@ -193,7 +245,49 @@ class ExecutionSimulator:
             nights_gap[1:] = rollover_nights_ns(avail_ns[:-1], open_ns[1:], instrument)
         self._nights_bar: list[float] = nights_bar.tolist()
         self._nights_gap: list[float] = nights_gap.tolist()
+        # Rate-based financing: sum_R w(R) * r(R) per interval, r as of each rollover instant R.
+        fin = self.costs.financing
+        self.financing: FinancingModel = fin
+        self.rate_curve = fin.curve(rates) if fin.uses_rates else None
+        rn_bar = np.zeros(n)
+        rn_gap = np.zeros(n)
+        self._financing_info: dict = {"mode": fin.mode}
+        if fin.uses_rates:
+            jb = np.flatnonzero(nights_bar != 0)
+            if len(jb):
+                rn_bar[jb] = fin.rate_nights_ns(open_ns[jb], avail_ns[jb], instrument, self.rate_curve)
+            jg = np.flatnonzero(nights_gap != 0)
+            if len(jg):
+                rn_gap[jg] = fin.rate_nights_ns(avail_ns[jg - 1], open_ns[jg], instrument, self.rate_curve)
+            self._financing_info = self._rate_coverage(int(open_ns[0]), int(avail_ns[-1]))
+        self._rn_bar: list[float] = rn_bar.tolist()
+        self._rn_gap: list[float] = rn_gap.tolist()
         self.reset()
+
+    def _rate_coverage(self, t_first: int, t_last: int) -> dict:
+        """Provenance of the benchmark used by rate financing (and one-time warnings)."""
+        fin, curve = self.financing, self.rate_curve
+        info: dict = {"mode": fin.mode, "rate_series": fin.rate_series,
+                      "fallback_rate": fin.fallback_rate, "rate_first_available": None,
+                      "rate_last_available": None}
+        if curve is None or not len(curve):
+            _warn_once(("no_rates", fin.rate_series),
+                       "rate financing: no %r series supplied (md.macro / rates=); every rollover "
+                       "uses fallback_rate=%.4f", fin.rate_series, fin.fallback_rate)
+            return info
+        info["rate_first_available"] = str(curve.first_available)
+        info["rate_last_available"] = str(curve.last_available)
+        if int(curve.available_ns[0]) > t_first:
+            _warn_once(("rates_start", fin.rate_series, int(curve.available_ns[0])),
+                       "rate financing: %r is first available at %s, after the first bar (%s); "
+                       "earlier rollovers use fallback_rate=%.4f", fin.rate_series,
+                       curve.first_available, pd.Timestamp(t_first, tz="UTC"), fin.fallback_rate)
+        if t_last - int(curve.available_ns[-1]) > _STALE_RATE_NS:
+            _warn_once(("rates_stale", fin.rate_series, int(curve.available_ns[-1])),
+                       "rate financing: %r ends at %s, more than 14 days before the last bar (%s); "
+                       "its last value is carried forward", fin.rate_series, curve.last_available,
+                       pd.Timestamp(t_last, tz="UTC"))
+        return info
 
     # ---- lifecycle ---------------------------------------------------------------------------
     def reset(self, start: int = 0, equity: float | None = None) -> None:
@@ -353,8 +447,8 @@ class ExecutionSimulator:
             price_pnl += seg
             tr.price_pnl += seg
             ng = self._nights_gap[i]
-            if ng:
-                x = cm.swap(pos, ng, instrument=inst)
+            if ng:  # rate financing values the notional at the last mid before the rollover
+                x = cm.swap(pos, ng, instrument=inst, price=self._close[t], rate_nights=self._rn_gap[i])
                 swap += x
                 tr.swap += x
 
@@ -384,7 +478,7 @@ class ExecutionSimulator:
                 tp_lvl = x if x > 0.0 else None
         exit_reason: str | None = None
         if pos != 0.0 and (sl_lvl is not None or tp_lvl is not None):
-            ex = self._intrabar_exit(pos, o, h, lo, sl_lvl, tp_lvl)
+            ex = intrabar_exit(pos, o, h, lo, sl_lvl, tp_lvl)
             if ex is not None:
                 exit_mid, exit_reason, is_limit = ex
                 seg = pos * cs * (exit_mid - o)
@@ -406,7 +500,7 @@ class ExecutionSimulator:
             tr.price_pnl += seg
             nb = self._nights_bar[i]
             if nb:
-                x = cm.swap(pos, nb, instrument=inst)
+                x = cm.swap(pos, nb, instrument=inst, price=c, rate_nights=self._rn_bar[i])
                 swap += x
                 tr.swap += x
 
@@ -446,29 +540,8 @@ class ExecutionSimulator:
             take_profit=tp_lvl,
         )
 
-    @staticmethod
-    def _intrabar_exit(pos: float, o: float, h: float, lo: float, sl: float | None,
-                       tp: float | None) -> tuple[float, str, bool] | None:
-        """(exit mid level, reason, is_limit) or None. Stop is checked before take-profit."""
-        if pos > 0:
-            if sl is not None and o <= sl:
-                return o, "stop", False
-            if tp is not None and o >= tp:
-                return o, "take_profit", True
-            if sl is not None and lo <= sl:
-                return sl, "stop", False
-            if tp is not None and h >= tp:
-                return tp, "take_profit", True
-        else:
-            if sl is not None and o >= sl:
-                return o, "stop", False
-            if tp is not None and o <= tp:
-                return o, "take_profit", True
-            if sl is not None and h >= sl:
-                return sl, "stop", False
-            if tp is not None and lo <= tp:
-                return tp, "take_profit", True
-        return None
+    #: backward-compatible alias of the module-level :func:`intrabar_exit`.
+    _intrabar_exit = staticmethod(intrabar_exit)
 
     def _execute(self, i: int, qty: float, mid: float, spr: float, rng: float, kind: str,
                  reason: str, *, limit: bool) -> tuple[float, float, float, Fill]:
@@ -589,6 +662,7 @@ class ExecutionSimulator:
                 "end": str(idx[-1]) if len(idx) else None,
                 "n_bars": int(e - s),
                 "bankrupt": self.bankrupt,
+                "financing": dict(self._financing_info),
             },
         )
         if compute_metrics:

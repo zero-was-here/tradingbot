@@ -69,7 +69,16 @@ def test_shrinkage_one_equals_inverse_vol_on_positive_sharpes(setup):
     a = ForecastCombiner(method="sharpe_shrink", shrinkage=1.0, max_weight=1.0).fit(fc, close)
     b = ForecastCombiner(method="inverse_vol", max_weight=1.0).fit(fc, close)
     if a.train_sharpe_.mean() > 0:
-        pd.testing.assert_series_equal(a.weights_, b.weights_, check_exact=False, atol=1e-12)
+        # Cost-aware default: strategies with a non-positive (net) Sharpe get zero weight, so
+        # shrinkage=1 is inverse-vol over the POSITIVE-Sharpe strategies only (renormalised).
+        pos = a.train_sharpe_ > 0
+        expected = b.weights_.where(pos, 0.0)
+        expected = expected / expected.sum()
+        pd.testing.assert_series_equal(a.weights_, expected, check_exact=False, atol=1e-12)
+        # the legacy mode (allow_unallocated=False) keeps the old identity with plain inverse-vol
+        legacy = ForecastCombiner(method="sharpe_shrink", shrinkage=1.0, max_weight=1.0,
+                                  allow_unallocated=False).fit(fc, close)
+        pd.testing.assert_series_equal(legacy.weights_, b.weights_, check_exact=False, atol=1e-12)
 
 
 def test_fit_uses_only_given_data(setup):
@@ -126,12 +135,21 @@ def test_cap_forcing_weight_onto_losers_is_flagged(setup):
         },
         index=fc.index,
     )
-    comb = ForecastCombiner(method="sharpe_shrink", max_weight=0.4).fit(f.iloc[:3000], close.iloc[:3000])
+    # legacy behaviour (allow_unallocated=False): the cap forces weight onto the losers, flagged
+    comb = ForecastCombiner(method="sharpe_shrink", max_weight=0.4, allow_unallocated=False).fit(
+        f.iloc[:3000], close.iloc[:3000])
     assert comb.weights_.sum() == pytest.approx(1.0)
     assert comb.weights_.max() <= 0.4 + 1e-12
     assert comb.weights_["good"] == pytest.approx(0.4)
     assert any("forced" in n for n in comb.explain()["notes"])
-    # without the cap the losers get nothing
+    # default: the losers get nothing and the rest of the budget stays UNALLOCATED (less risk)
+    dflt = ForecastCombiner(method="sharpe_shrink", max_weight=0.4).fit(f.iloc[:3000], close.iloc[:3000])
+    assert dflt.weights_["good"] == pytest.approx(0.4)
+    assert dflt.weights_[["bad1", "bad2"]].sum() == 0.0
+    assert dflt.weights_.sum() == pytest.approx(0.4)
+    assert dflt.explain()["unallocated"] == pytest.approx(0.6)
+    assert any("UNALLOCATED" in n for n in dflt.explain()["notes"])
+    # without the cap the losers get nothing either way
     free = ForecastCombiner(method="sharpe_shrink", max_weight=1.0).fit(f.iloc[:3000], close.iloc[:3000])
     assert free.weights_["good"] == pytest.approx(1.0)
 

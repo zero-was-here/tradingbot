@@ -5,6 +5,8 @@ synthetic-data module) and the sizer / risk manager are local classes, so the pi
 digests below depend only on the backtest engine, the execution simulator and the cost
 model. They were produced by the engine BEFORE the hook was added (wave 1); if the
 simulator or cost model is changed on purpose, regenerate them with the previous engine.
+The scenarios pin ``financing="fixed"`` (the per-lot swaps of wave 1, reproduced
+bit-identically) since rate-based financing became the ``CostModel`` default.
 """
 
 from __future__ import annotations
@@ -86,12 +88,13 @@ def digest(res) -> str:
 def scenarios():
     """(name, kwargs) of engine runs whose digests are pinned in the golden test."""
     return [
-        ("cap_risk_stops", dict(risk_factory=lambda md: CapHaltRisk(2.0), costs=CostModel(),
+        ("cap_risk_stops", dict(risk_factory=lambda md: CapHaltRisk(2.0), costs=CostModel(financing="fixed"),
                                 stop_atr_mult=2.0, take_profit_atr_mult=3.0, stop_cooldown_bars=4)),
-        ("window_no_risk", dict(risk_factory=lambda md: None, costs=CostModel(slippage_fixed=0.05),
+        ("window_no_risk", dict(risk_factory=lambda md: None,
+                                costs=CostModel(slippage_fixed=0.05, financing="fixed"),
                                 start=300, end=2000)),
         ("halt_midway", dict(risk_factory=lambda md: CapHaltRisk(5.0, md.bars["available_at"].iloc[1200]),
-                             costs=CostModel())),
+                             costs=CostModel(financing="fixed"))),
     ]
 
 

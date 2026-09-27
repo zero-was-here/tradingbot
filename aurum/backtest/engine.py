@@ -22,6 +22,12 @@ The order then fills at the OPEN of bar ``t+1`` inside the simulator. ``bars_per
 (used only to annualise the default vol) is inferred from the timestamps of the whole
 sample — calendar density, not price information.
 
+Overnight financing (``costs.financing``, see :class:`aurum.execution.costs.FinancingModel`)
+is settled by the simulator at each rollover. In the default ``"rate"`` mode the benchmark
+comes from ``md.macro[financing.rate_series]`` (FRED ``fedfunds`` by default; override with
+``rates=``) and is read AS OF the rollover instant (``available_at <= R``), so a rate is only
+ever charged once it was published; ``financing=`` overrides the cost model's financing.
+
 Loop per bar ``t = start .. end-1``::
 
     risk.on_bar(available_at[t], equity)            # update peak / day-start equity
@@ -74,7 +80,7 @@ from aurum.core.instrument import XAUUSD, Instrument
 from aurum.core.interfaces import PositionSizer, RiskContext, RiskManager
 from aurum.core.timeframes import infer_bars_per_year
 from aurum.core.types import MarketData
-from aurum.execution.costs import CostModel
+from aurum.execution.costs import CostModel, FinancingModel, RateSource
 from aurum.execution.simulator import ExecutionSimulator
 from aurum.models.volatility import ewma_volatility
 
@@ -124,6 +130,27 @@ def _unpack(md: MarketData | pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame |
     if isinstance(md, pd.DataFrame):
         return md, None
     raise TypeError(f"md must be MarketData or a bars DataFrame, got {type(md).__name__}")
+
+
+FinancingSpec = FinancingModel | dict | str | None
+
+
+def _with_financing(costs: CostModel | None, financing: FinancingSpec) -> CostModel | None:
+    """``costs`` with its financing replaced by ``financing`` (``None`` keeps it)."""
+    if financing is None:
+        return costs
+    import dataclasses
+
+    return dataclasses.replace(costs if costs is not None else CostModel(),
+                               financing=FinancingModel.coerce(financing))
+
+
+def _rate_source(md: MarketData | pd.DataFrame, rates: RateSource) -> RateSource:
+    """Explicit ``rates`` win; otherwise the macro frames of ``md`` (point-in-time frames with
+    ``available_at``; the simulator reads each rate as of the rollover instant)."""
+    if rates is not None:
+        return rates
+    return md.macro if isinstance(md, MarketData) else None
 
 
 def _bound(index: pd.DatetimeIndex, value: StartEnd, *, is_end: bool) -> int:
@@ -277,6 +304,8 @@ def _simulate(
     event_horizon_hours: float,
     compute_metrics: bool,
     meta: dict[str, Any],
+    financing: FinancingSpec = None,
+    rates: RateSource = None,
 ) -> BacktestResult:
     """Shared bar loop for :func:`run_backtest` and :func:`run_target_lots`.
 
@@ -319,7 +348,8 @@ def _simulate(
     decide = make_decide(_Window(lo=lo, hi=hi, bars=bars, vol=vol_arr, close=close, forecast=fc_arr,
                                  state=loop_state))
 
-    sim = ExecutionSimulator(bars, instrument, costs, initial_equity)
+    sim = ExecutionSimulator(bars, instrument, _with_financing(costs, financing), initial_equity,
+                             rates=_rate_source(md, rates))
     n = sim.n_bars
     spread = bars["spread"].to_numpy(dtype=float).tolist()
     times = list(bars.index)
@@ -487,6 +517,8 @@ def run_backtest(
     compute_metrics: bool = True,
     forecast_hook: ForecastHook | None = None,
     hook_every: int = 1,
+    financing: FinancingSpec = None,
+    rates: RateSource = None,
 ) -> BacktestResult:
     """Backtest a forecast series through sizer, risk manager and the execution simulator.
 
@@ -517,6 +549,11 @@ def run_backtest(
         ``spread``, ``vol``, ``bar_time`` and ``window_bar``. Used to replay the LLM desk
         through the SAME sizer and risk manager (it cannot bypass risk). ``result.forecast``
         then holds the forecasts actually used; ``result.meta["hook"]`` summarises the calls.
+    financing : overrides ``costs.financing`` (a :class:`~aurum.execution.costs.FinancingModel`,
+        its kwargs, or a mode name ``"rate"``/``"fixed"``/``"none"``).
+    rates : benchmark-rate source for ``"rate"`` financing (default ``md.macro``, from which
+        ``financing.rate_series`` is taken point-in-time; see
+        :class:`~aurum.execution.simulator.ExecutionSimulator`).
     """
     if isinstance(hook_every, bool) or int(hook_every) != hook_every or hook_every < 1:
         raise ValueError(f"hook_every must be a positive integer, got {hook_every!r}")
@@ -583,7 +620,7 @@ def run_backtest(
         take_profit_atr_mult=take_profit_atr_mult, atr_period=atr_period,
         stop_cooldown_bars=stop_cooldown_bars, start=start, end=end, bars_per_year=bars_per_year,
         event_horizon_hours=event_horizon_hours, compute_metrics=compute_metrics,
-        meta=meta,
+        meta=meta, financing=financing, rates=rates,
     )
     if forecast_hook is not None:
         result.meta["hook"] = {"hook": repr(forecast_hook), "every": int(hook_every), **hook_stats}
@@ -608,12 +645,15 @@ def run_target_lots(
     bars_per_year: float | None = None,
     event_horizon_hours: float = 24.0,
     compute_metrics: bool = True,
+    financing: FinancingSpec = None,
+    rates: RateSource = None,
 ) -> BacktestResult:
     """Backtest a pre-sized lot path: ``target_lots[t]`` = signed lots wanted after the fill at
     the open of ``t+1`` (decided at the close of ``t``). NaN means "no decision, hold".
 
     Used by the RL evaluation, the LLM-desk replay and benchmarks; the optional ``risk``
-    manager and protective stops behave exactly as in :func:`run_backtest`.
+    manager and protective stops behave exactly as in :func:`run_backtest`, and so do
+    ``financing`` / ``rates``.
     """
     bars_full, _ = _unpack(md)
     tl = _align(target_lots, pd.DatetimeIndex(bars_full.index), "target_lots", fill=None, ffill=False)
@@ -634,7 +674,7 @@ def run_target_lots(
         take_profit_atr_mult=take_profit_atr_mult, atr_period=atr_period,
         stop_cooldown_bars=stop_cooldown_bars, start=start, end=end, bars_per_year=bars_per_year,
         event_horizon_hours=event_horizon_hours, compute_metrics=compute_metrics,
-        meta={"engine": "run_target_lots"},
+        meta={"engine": "run_target_lots"}, financing=financing, rates=rates,
     )
 
 
@@ -650,14 +690,17 @@ def buy_and_hold_benchmark(
     end: StartEnd = None,
     frictionless: bool = False,
     compute_metrics: bool = True,
+    financing: FinancingSpec = None,
+    rates: RateSource = None,
 ) -> BacktestResult:
     """Long-only benchmark: buy at the open after the first bar and hold to the end.
 
     Size is ``lots`` or, if given, ``notional`` USD converted at the first bar's close
     (default ``notional = initial_equity``, i.e. 1x leverage). The benchmark is run through
-    the same simulator, so by default it pays spread, slippage, commission and the CFD swap
+    the same simulator, so by default it pays spread, slippage, commission and the CFD
+    financing (``costs.financing``, or ``financing=``; rates from ``md.macro`` / ``rates=``)
     — the like-for-like comparison for a CFD strategy. ``frictionless=True`` removes all
-    costs and swaps (a pure price-return benchmark).
+    costs and financing (a pure price-return benchmark).
     """
     if lots is not None and notional is not None:
         raise ValueError("pass either lots or notional, not both")
@@ -667,7 +710,8 @@ def buy_and_hold_benchmark(
     if frictionless:
         import dataclasses
 
-        costs = CostModel.zero()
+        costs = CostModel.zero()          # no spread/slippage/commission and no financing
+        financing = None
         instrument = dataclasses.replace(instrument, swap_long_per_lot=0.0, swap_short_per_lot=0.0,
                                          commission_per_lot=0.0)
     if lots is None:
@@ -679,6 +723,6 @@ def buy_and_hold_benchmark(
         logger.warning("buy_and_hold_benchmark: size rounds to 0 lots")
     res = run_target_lots(md, pd.Series(size, index=full_idx), instrument=instrument, costs=costs,
                           initial_equity=initial_equity, start=start, end=end,
-                          compute_metrics=compute_metrics)
+                          compute_metrics=compute_metrics, financing=financing, rates=rates)
     res.meta.update({"engine": "buy_and_hold_benchmark", "lots": size, "frictionless": frictionless})
     return res

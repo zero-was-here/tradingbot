@@ -6,6 +6,10 @@ name: fast
 data:
   start: "2019-01-01"
 
+costs:
+  financing:                      # rate-based overnight financing (see default.yaml)
+    mode: rate
+
 strategies:
   - {name: tsmom}
   - {name: ema_cross}

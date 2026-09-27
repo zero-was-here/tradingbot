@@ -257,7 +257,13 @@ def test_trend_strategies_positive_oos_on_trending_data(trend_report):
     # the combiner learned to avoid the contrarian (non-positive shrunk Sharpe) in every fold
     w = trend_report.weights
     assert (w["wf_contrarian"] <= w["wf_ema_mom"] + 1e-12).all()
-    assert (w.drop(columns="fdm").sum(axis=1).round(9) == 1.0).all()
+    # Cost-aware combiner: weights sum to <= 1; a fold whose positive-net-Sharpe strategies
+    # cannot absorb the budget under max_weight leaves the rest UNALLOCATED (less risk)
+    # instead of forcing weight onto losers - and says so in the report notes.
+    sums = w.drop(columns="fdm").sum(axis=1).round(9)
+    assert ((sums > 0.0) & (sums <= 1.0)).all()
+    for fold in sums.index[sums < 1.0]:
+        assert any(n.startswith(f"fold {fold} combiner:") and "UNALLOCATED" in n for n in trend_report.notes)
     assert (w["fdm"] >= 1.0).all()
 
 
@@ -450,7 +456,9 @@ def test_oos_combiner_uses_only_earlier_folds(trend_md):
         if not row["combiner_basis"].startswith("oos_history"):
             continue
         hist = oos.loc[oos.index < row["test_start"], keys].iloc[-window:]
-        ref = ForecastCombiner().fit(hist, md.bars["close"])
+        # the walk-forward scores strategies NET of the configured costs (same bars/cost model)
+        ref = ForecastCombiner().fit(hist, md.bars["close"], bars=md.bars, costs=cfg.costs.build(),
+                                     instrument=cfg.instrument.build())
         np.testing.assert_allclose(rep.weights.loc[row["fold"], keys].to_numpy(dtype=float),
                                    ref.weights_.to_numpy(), atol=1e-12)
         assert rep.weights.loc[row["fold"], "fdm"] == pytest.approx(ref.fdm_)
@@ -468,7 +476,8 @@ def test_fit_quant_book_combiner_from_oos_history(trend_md):
     book = fit_quant_book(md, cfg, strategies=strats, fit_end=fit_end, oos_forecasts=oos)
     keys = ["wf_ema_mom", "wf_slow_trend"]
     hist = oos.loc[oos.index < md.bars.index[fit_end], keys].iloc[-rep.settings["train"]:]
-    ref = ForecastCombiner().fit(hist, md.bars["close"])
+    ref = ForecastCombiner().fit(hist, md.bars["close"], bars=md.bars, costs=cfg.costs.build(),
+                                 instrument=cfg.instrument.build())   # net of costs, as the book
     np.testing.assert_allclose(book.combiner.weights_.to_numpy(), ref.weights_.to_numpy(), atol=1e-12)
     eq = fit_quant_book(md, cfg, strategies=strats, fit_end=fit_end)   # no history -> equal weights
     np.testing.assert_allclose(eq.combiner.weights_.to_numpy(), [0.5, 0.5])

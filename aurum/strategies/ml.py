@@ -661,6 +661,14 @@ class _MLStrategyBase(Strategy):
         return int(self._pipe.max_lookback)
 
     @property
+    def fit_history_bars(self) -> int:
+        """Own-pipeline models need ``warmup_bars`` of pre-training history so their first
+        training rows have fully warmed-up features (external features arrive warmed up)."""
+        if self._external_features:
+            return 0
+        return self.warmup_bars
+
+    @property
     def warmup_bars(self) -> int:
         if self._pipe is not None:
             return self._pipe_warmup()

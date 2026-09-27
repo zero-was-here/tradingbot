@@ -119,6 +119,9 @@ def test_registry_and_metadata(name: str) -> None:
     ("risk_off", {"entry_z": 0.5, "exit_z": 1.0}),
     ("intraday_seasonality", {"shrinkage": "lots"}),
     ("intraday_seasonality", {"significance": 2.0}),
+    ("intraday_seasonality", {"dead_zone": "large"}),
+    ("intraday_seasonality", {"cost_multiplier": -1.0}),
+    ("intraday_seasonality", {"costs": {"min_spread": -0.1}}),
 ])
 def test_invalid_parameters_raise(name: str, params: dict) -> None:
     with pytest.raises(ValueError):
@@ -569,11 +572,16 @@ def test_seasonality_shrinks_noise_to_zero() -> None:
     s = IntradaySeasonality().fit(md_of(bars))
     assert not s.fit_summary_["heterogeneous"]
     assert (s.generate(md_of(bars)) == 0).all()
-    s2 = IntradaySeasonality(significance=None, shrinkage=1e9).fit(md_of(bars))
+    # even with the pre-test and shrinkage disabled, noise effects never pay for the costs
+    forced = IntradaySeasonality(significance=None, shrinkage=1e9).fit(md_of(bars))
+    assert forced.fit_summary_["cost_aware"] and (forced.generate(md_of(bars)) == 0).all()
+    # the frictionless estimator (cost_aware=False) keeps the legacy table semantics
+    s2 = IntradaySeasonality(significance=None, shrinkage=1e9, cost_aware=False).fit(md_of(bars))
     assert s2.fit_summary_["scalar"] > 0                 # scaled back to avg |f| = 0.5
     f2 = s2.generate(md_of(bars))
     assert f2.abs().mean() == pytest.approx(0.5, abs=0.1)
-    s3 = IntradaySeasonality(significance=None, shrinkage=1e9, dead_zone=0.5).fit(md_of(bars))
+    s3 = IntradaySeasonality(significance=None, shrinkage=1e9, dead_zone=0.5,
+                             cost_aware=False).fit(md_of(bars))
     f3 = s3.generate(md_of(bars))
     assert ((f3 == 0) | (f3.abs() >= 0.5)).all() and (f3 == 0).mean() > (f2 == 0).mean()
 

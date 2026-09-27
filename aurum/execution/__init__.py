@@ -14,9 +14,12 @@ from typing import Any
 _EXPORTS: dict[str, str] = {
     "CostModel": "aurum.execution.costs",
     "FillPrice": "aurum.execution.costs",
+    "FinancingModel": "aurum.execution.costs",
+    "RateCurve": "aurum.execution.costs",
     "rollover_nights": "aurum.execution.costs",
     "ExecutionSimulator": "aurum.execution.simulator",
     "StepResult": "aurum.execution.simulator",
+    "intrabar_exit": "aurum.execution.simulator",
 }
 
 __all__ = sorted(_EXPORTS)

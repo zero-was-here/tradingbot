@@ -43,6 +43,10 @@ Safety
 * Graceful shutdown on SIGINT/SIGTERM; a heartbeat file is rewritten every loop.
 * Every decision is appended to ``decisions.jsonl`` (forecasts per strategy, combined, desk
   decision, sizing, risk, orders, fills, equity).
+* The final forecast of the last decision is persisted (``runner_state.json``) and passed to
+  the LLM desk as ``previous_forecast``, so ``DecisionPolicy(on_failure="hold")`` / a ``hold``
+  decision keep the standing forecast — also after a restart or a cycle in which the desk
+  was not consulted (a fresh desk would otherwise treat "hold" as flat).
 
 Trading artifact
 ----------------
@@ -94,6 +98,7 @@ from aurum.core.interfaces import RiskContext
 from aurum.core.timeframes import get_timeframe
 from aurum.core.types import MarketData
 from aurum.execution.costs import CostModel
+from aurum.execution.simulator import intrabar_exit
 from aurum.live.broker import Broker, BrokerError, Clock, SimulatedClock, SystemClock, net_lots
 from aurum.live.monitor import (
     AlertManager,
@@ -107,7 +112,6 @@ from aurum.live.monitor import (
     WebhookAlertSink,
 )
 from aurum.live.oms import ExecutionReport, OrderManager
-from aurum.live.paper import _protective_exit
 from aurum.live.state import (
     StateCorruptError,
     append_jsonl,
@@ -786,6 +790,7 @@ class LiveRunner:
         self._last_exec: dict[str, Any] | None = None
         self._last_bar: pd.Timestamp | None = None
         self._last_avail: pd.Timestamp | None = None
+        self._prev_final: float | None = None   # final forecast of the last decision (desk "hold")
         self._macro_cache: tuple[pd.Timestamp, dict[str, pd.DataFrame]] | None = None
         self._events_cache: tuple[pd.Timestamp, pd.DataFrame | None] | None = None
         self._macro_stale_alerted: str | None = None
@@ -949,6 +954,8 @@ class LiveRunner:
             self._last_bar = utc(st["last_bar"])
             self._last_avail = utc(st["last_avail"]) if st.get("last_avail") else self._last_bar + self.tf.delta
         self.n_decisions = int(st.get("n_decisions", 0))
+        pf = _finite(st.get("prev_final_forecast"))
+        self._prev_final = float(np.clip(pf, -1.0, 1.0)) if math.isfinite(pf) else None
         self._cooldown_left = int(st.get("cooldown_left", 0) or 0)
         self._cooldown_side = int(st.get("cooldown_side", 0) or 0)
         le = st.get("last_exec")
@@ -977,6 +984,7 @@ class LiveRunner:
         p = self._pending
         atomic_write_json(self.runner_state_path, {
             "last_bar": self._last_bar, "last_avail": self._last_avail, "n_decisions": self.n_decisions,
+            "prev_final_forecast": self._prev_final,
             "cooldown_left": self._cooldown_left, "cooldown_side": self._cooldown_side,
             "last_exec": self._last_exec,
             "pnl_band": self.monitor.pnl.to_state() if self.monitor.pnl is not None else None,
@@ -1001,6 +1009,7 @@ class LiveRunner:
                 try:
                     self._macro_cache = (now, load_macro_dir(cfg.macro_dir))
                     logger.info("macro data reloaded from %s (%d series)", cfg.macro_dir, len(self._macro_cache[1]))
+                    self._refresh_broker_rates(self._macro_cache[1])
                 except Exception as exc:
                     logger.error("macro reload failed (%s); keeping previous data", exc)
                     if self._macro_cache is None:
@@ -1027,6 +1036,18 @@ class LiveRunner:
                                           f"newest macro observation is from {newest} (> {cfg.macro_max_age_days} days)",
                                           time=decision_time)
         return out
+
+    def _refresh_broker_rates(self, frames: Mapping[str, pd.DataFrame]) -> None:
+        """Hand freshly loaded macro frames to a paper broker's rate-based financing
+        (:meth:`aurum.live.paper.PaperBroker.set_rates`; it reads each benchmark rate as of
+        the rollover, so passing whole frames is point-in-time). Other brokers: no-op."""
+        setter = getattr(self.broker, "set_rates", None)
+        if not callable(setter) or not frames:
+            return
+        try:
+            setter(frames)
+        except (TypeError, ValueError) as exc:  # e.g. a rate frame without available_at
+            logger.error("paper broker financing rates not refreshed (%s); keeping the previous ones", exc)
 
     def _events(self, now: pd.Timestamp, decision_time: pd.Timestamp) -> pd.DataFrame | None:
         cfg = self.config
@@ -1347,6 +1368,13 @@ class LiveRunner:
             rec["desk"] = desk_info
         res.final_forecast = final
         rec["final_forecast"] = final
+        rec["previous_forecast"] = self._prev_final
+        # the standing forecast for the next cycle's desk ("hold"): what was actually sized;
+        # a signal error with on_error="hold" keeps the old one, "flatten" makes it flat
+        if signal_error is None:
+            self._prev_final = float(final)
+        elif cfg.on_error == "flatten":
+            self._prev_final = 0.0
 
         # ---- sizing ----------------------------------------------------------------------
         if signal_error is not None:
@@ -1498,7 +1526,7 @@ class LiveRunner:
         """Was our position closed by its broker-side stop since the last decision?
 
         The venue does not tell us why a position vanished, so the backtest engine's rule is
-        replayed on the bars closed since then (:func:`aurum.live.paper._protective_exit`: gap
+        replayed on the bars closed since then (:func:`aurum.execution.simulator.intrabar_exit`: gap
         through the level at the open, else stop before take-profit). A stop starts the
         ``stop_cooldown_bars`` cooldown on that side, exactly like ``run_backtest``.
         """
@@ -1512,7 +1540,7 @@ class LiveRunner:
         win = bars.loc[(avail > le["time"]) & (avail <= t_dec)]
         for o, h, lo in zip(win["open"].to_numpy(float), win["high"].to_numpy(float),
                             win["low"].to_numpy(float), strict=True):
-            ex = _protective_exit(float(le["side"]), o, h, lo, le.get("sl"), le.get("tp"))
+            ex = intrabar_exit(float(le["side"]), o, h, lo, le.get("sl"), le.get("tp"))
             if ex is None:
                 continue
             if ex[1] == "stop":
@@ -1617,7 +1645,7 @@ class LiveRunner:
         """LLM desk cycle; any failure falls back per ``desk.on_error`` (default follow_quant)."""
         dc = self.config.desk
         on_error = dc.get("on_error", "follow_quant")
-        info: dict[str, Any] = {"quant_forecast": combined}
+        info: dict[str, Any] = {"quant_forecast": combined, "previous_forecast": self._prev_final}
         try:
             if self.desk_provider is not None and md is not None:
                 cs = combined_series if combined_series is not None else pd.Series(combined, index=md.bars.index)
@@ -1631,7 +1659,8 @@ class LiveRunner:
                                               "exposure_pct_equity": 100.0 * net_lots(positions) * cs_contract
                                               * float(md.bars["close"].iloc[-1]) / eq if eq > 0 else None,
                                               "n_tickets": len(positions)})
-            out = self.desk.run_cycle(t_dec, combined, context={"mode": self.mode, "dry_run": self.config.dry_run})
+            out = self.desk.run_cycle(t_dec, combined, previous_forecast=self._prev_final,
+                                      context={"mode": self.mode, "dry_run": self.config.dry_run})
             final = float(np.clip(_finite(out.final_forecast, combined), -1.0, 1.0))
             info.update(status=out.status, final_forecast=final, failure_reason=out.failure_reason,
                         action=out.policy.action if out.policy is not None else None,
@@ -1647,7 +1676,8 @@ class LiveRunner:
             if on_error == "flat":
                 final = 0.0
             elif on_error == "hold":
-                prev = getattr(self.desk, "last_final_forecast", None)
+                prev = self._prev_final if self._prev_final is not None else getattr(
+                    self.desk, "last_final_forecast", None)
                 final = float(prev) if prev is not None else 0.0
                 # overlay semantics: holding may not add risk relative to the quant forecast
                 if _sign(final) != _sign(combined) or abs(final) > abs(combined):
@@ -1671,6 +1701,21 @@ def _as_utc(value: Any) -> pd.Timestamp:
     return t.tz_localize("UTC") if t.tz is None else t.tz_convert("UTC")
 
 
+def _paper_rates(cfg: LiveConfig, costs: CostModel) -> dict[str, pd.DataFrame] | None:
+    """Macro frames for the paper broker's rate-based financing (``cfg.macro_dir``; the broker
+    reads each rate as of the rollover, and the runner refreshes them on every macro reload).
+    ``None`` (fallback rate, warned by the broker) without macro data or outside rate mode."""
+    if not costs.financing.uses_rates or not cfg.macro_dir:
+        return None
+    from aurum.data.macro import load_macro_dir
+
+    try:
+        return load_macro_dir(cfg.macro_dir)
+    except Exception as exc:  # noqa: BLE001 - a missing macro dir must not stop paper trading
+        logger.error("paper broker: macro data for financing rates not loaded from %s (%s)", cfg.macro_dir, exc)
+        return None
+
+
 def _build_broker(cfg: LiveConfig, instrument: Instrument) -> tuple[Broker, Clock, pd.Timestamp | None]:
     if cfg.broker == "mt5":
         from aurum.live.mt5 import MT5Broker
@@ -1682,6 +1727,7 @@ def _build_broker(cfg: LiveConfig, instrument: Instrument) -> tuple[Broker, Cloc
 
     p = cfg.paper
     costs = CostModel(**cfg.costs)
+    rates = _paper_rates(cfg, costs)
     if p.get("data") == "mt5":  # paper execution on live MT5 quotes/bars (real time)
         from aurum.live.mt5 import MT5Broker
 
@@ -1690,7 +1736,7 @@ def _build_broker(cfg: LiveConfig, instrument: Instrument) -> tuple[Broker, Cloc
         broker = PaperBroker(BrokerDataFeed(data, cfg.symbol, cfg.timeframe), instrument, costs,
                              float(p.get("initial_equity", 100_000.0)), clock=wall, symbol=cfg.symbol,
                              hedging=bool(p.get("hedging", False)),
-                             state_path=Path(cfg.state_dir) / "paper_broker.json")
+                             state_path=Path(cfg.state_dir) / "paper_broker.json", rates=rates)
         return broker, wall, None
     if not p.get("bars_path"):
         raise ValueError("paper broker needs paper.bars_path (a stored bars parquet to replay)")
@@ -1705,7 +1751,7 @@ def _build_broker(cfg: LiveConfig, instrument: Instrument) -> tuple[Broker, Cloc
     clock = SimulatedClock(start + pd.Timedelta(seconds=cfg.bar_close_delay_seconds - 1))
     broker = PaperBroker(feed, instrument, costs, float(p.get("initial_equity", 100_000.0)),
                          clock=clock, symbol=cfg.symbol, hedging=bool(p.get("hedging", False)),
-                         state_path=Path(cfg.state_dir) / "paper_broker.json")
+                         state_path=Path(cfg.state_dir) / "paper_broker.json", rates=rates)
     return broker, clock, feed.end + pd.Timedelta(seconds=cfg.bar_close_delay_seconds + 1)
 
 

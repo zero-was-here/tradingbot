@@ -49,12 +49,19 @@ feature columns and scaling it was trained with, so the artifact's own
 :class:`~aurum.features.pipeline.FeaturePipeline` recomputes them from ``md`` (causal).
 ``md`` must have the bar size the policy was trained on (``ValueError`` otherwise).
 
-Artifact integrity: every ``fit`` writes a NEW directory (a unique subdirectory of
-``out_dir``), so clones fitted on different walk-forward folds can never overwrite each
-other's policy. The policy network is reloaded lazily (clones and pickles stay light), and
-the reload refuses to run if the artifact's files changed since it was attached (SHA-256
-fingerprint) — a strategy never silently trades a different policy, e.g. one trained on a
-later fold that includes its own test period.
+Artifact integrity and portability: every ``fit`` writes a NEW directory (a unique
+subdirectory of ``out_dir``), so clones fitted on different walk-forward folds can never
+overwrite each other's policy. When a strategy attaches an artifact (``fit`` or
+:meth:`RLPolicyStrategy.load`) it reads the files that define the policy (``policy.zip``,
+``pipeline.json``, ``config.json``, plus ``metrics.json``) ONCE and embeds their bytes and
+SHA-256 fingerprint in its own state. Clones and pickles (the live trading artifact's
+``strategies.pkl``, walk-forward worker processes) are therefore self-contained: the
+artifact directory is provenance only and may be moved, copied elsewhere or deleted, and
+the policy is rebuilt from the embedded bytes. A strategy never silently trades a different
+policy: overwriting the directory later has no effect (the attached bytes are used), and
+embedded bytes that no longer match the fingerprint are refused. The torch network itself
+is still rebuilt lazily and never pickled. Strategies pickled before embedding existed fall
+back to the directory (which must then exist, unchanged).
 
 Importing this module does NOT import torch, stable-baselines3 or gymnasium; they are
 loaded inside ``fit``/``generate`` (optional ``rl`` extra).
@@ -66,6 +73,7 @@ import hashlib
 import json
 import logging
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +102,15 @@ def _artifact_fingerprint(path: Path) -> str:
     return h.hexdigest()
 
 
+def _bytes_fingerprint(files: Mapping[str, bytes]) -> str:
+    """:func:`_artifact_fingerprint` of in-memory file contents (same digest)."""
+    h = hashlib.sha256()
+    for name in _FINGERPRINT_FILES:
+        h.update(name.encode("utf-8") + b"\0")
+        h.update(files[name])
+    return h.hexdigest()
+
+
 @register_strategy
 class RLPolicyStrategy(Strategy):
     """Adapter from a trained :mod:`aurum.rl` PPO artifact to the Strategy interface.
@@ -101,7 +118,8 @@ class RLPolicyStrategy(Strategy):
     Parameters (``params``)
     -----------------------
     artifact_dir : load a trained artifact (``policy.zip``, ``pipeline.json``, ``config.json``)
-                   instead of training.
+                   instead of training. Its files are embedded in the strategy (pickles are
+                   self-contained); the path is kept for provenance only.
     config       : :class:`aurum.rl.train.RLTrainConfig` or its dict form, used by ``fit``.
     val_fraction : trailing fraction of the ``fit`` data held out (time-ordered) for
                    validation-based checkpoint selection / early stopping.
@@ -137,6 +155,7 @@ class RLPolicyStrategy(Strategy):
         self._artifact: Any = None          # aurum.rl.train.RLArtifact (lazy, holds torch)
         self._pipeline: Any = None          # FeaturePipeline (JSON, cheap)
         self._config: Any = None            # RLTrainConfig
+        self._bundle: dict[str, bytes] | None = None   # embedded artifact files (pickled)
         self.artifact_dir_: Path | None = None
         self.artifact_fingerprint_: str | None = None
         self.train_summary_: dict[str, Any] = {}
@@ -145,25 +164,28 @@ class RLPolicyStrategy(Strategy):
 
     # ---- persistence ---------------------------------------------------------------------
     def load(self, artifact_dir: str | Path) -> RLPolicyStrategy:
-        """Attach a trained artifact. Reads the JSON parts now; the policy network is loaded
-        lazily on the first :meth:`generate` (keeps construction torch-free)."""
+        """Attach a trained artifact: its files are read ONCE and embedded (bytes + SHA-256
+        fingerprint), so this strategy and its pickles no longer need the directory. The
+        policy network is rebuilt lazily on the first :meth:`generate` (keeps construction
+        torch-free)."""
         from aurum.features.pipeline import FeaturePipeline
-        from aurum.rl.train import RLTrainConfig
+        from aurum.rl.train import RLTrainConfig, read_artifact_bytes
 
         p = Path(artifact_dir)
         missing = [f for f in _FINGERPRINT_FILES if not (p / f).exists()]
         if missing:
             raise FileNotFoundError(f"RL artifact {p} is missing {missing}")
-        fingerprint = _artifact_fingerprint(p)
-        self._config = RLTrainConfig.from_dict(json.loads((p / "config.json").read_text("utf-8")))
-        self._pipeline = FeaturePipeline.load(p / "pipeline.json")
+        files = read_artifact_bytes(p)
+        self._config = RLTrainConfig.from_dict(json.loads(files["config.json"].decode("utf-8")))
+        self._pipeline = FeaturePipeline.from_dict(json.loads(files["pipeline.json"].decode("utf-8")))
         self._artifact = None
+        self._bundle = dict(files)
         self.artifact_dir_ = p
-        self.artifact_fingerprint_ = fingerprint
+        self.artifact_fingerprint_ = _bytes_fingerprint(files)
         self.params["artifact_dir"] = str(p)
-        mpath = p / "metrics.json"
-        if mpath.exists():
-            m = json.loads(mpath.read_text("utf-8"))
+        self.train_summary_ = {}
+        if "metrics.json" in files:
+            m = json.loads(files["metrics.json"].decode("utf-8"))
             self.train_summary_ = {k: m.get(k) for k in (
                 "val", "selected_timesteps", "n_evals", "timesteps_trained", "early_stopped")}
         self.is_fitted = True
@@ -173,11 +195,29 @@ class RLPolicyStrategy(Strategy):
     def from_artifact(cls, artifact_dir: str | Path, **params: Any) -> RLPolicyStrategy:
         return cls(artifact_dir=str(artifact_dir), **params)
 
+    @property
+    def has_embedded_policy(self) -> bool:
+        """Whether the policy files travel inside this object (pickles are self-contained)."""
+        return bool(getattr(self, "_bundle", None))
+
     def _get_artifact(self) -> Any:
         if self._artifact is None:
+            expected = getattr(self, "artifact_fingerprint_", None)
+            bundle = getattr(self, "_bundle", None)
+            if bundle:
+                if expected is None or _bytes_fingerprint(bundle) != expected:
+                    raise RuntimeError(
+                        "the RL policy embedded in this strategy does not match its fingerprint "
+                        f"({(expected or '?')[:12]}...); refusing to run a different policy. "
+                        "Call load(artifact_dir) explicitly to attach new files.")
+                from aurum.rl.train import load_artifact_bytes
+
+                self._artifact = load_artifact_bytes(bundle, device=self.params["device"],
+                                                     path=self.artifact_dir_)
+                return self._artifact
+            # legacy state (pickled before policies were embedded): the directory must exist
             if self.artifact_dir_ is None:
                 raise RuntimeError("rl_ppo is not fitted: call fit() or load(artifact_dir)")
-            expected = getattr(self, "artifact_fingerprint_", None)
             if expected is not None and _artifact_fingerprint(self.artifact_dir_) != expected:
                 raise RuntimeError(
                     f"RL artifact {self.artifact_dir_} changed on disk since it was attached "
@@ -189,11 +229,16 @@ class RLPolicyStrategy(Strategy):
         return self._artifact
 
     def __getstate__(self) -> dict[str, Any]:
-        # The torch policy is reloaded from ``artifact_dir_`` on demand, so clones/pickles
-        # stay light and never share mutable network state.
+        # The torch network is rebuilt on demand from the EMBEDDED policy bytes, so clones and
+        # pickles are self-contained (no dependency on ``artifact_dir_``) and never share
+        # mutable network state.
         state = self.__dict__.copy()
         state["_artifact"] = None
         return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        state.setdefault("_bundle", None)   # strategies pickled before embedding
+        self.__dict__.update(state)
 
     # ---- Strategy interface ----------------------------------------------------------------
     @property
@@ -265,7 +310,7 @@ class RLPolicyStrategy(Strategy):
 
     def generate(self, md: MarketData, features: pd.DataFrame | None = None) -> pd.Series:
         """Deterministic policy forecasts in the policy's discrete levels (or [-1, 1])."""
-        if not self.is_fitted or self.artifact_dir_ is None:
+        if not self.is_fitted or (self.artifact_dir_ is None and not self.has_embedded_policy):
             raise RuntimeError("rl_ppo is not fitted: call fit() or load(artifact_dir)")
         from aurum.rl.train import check_bar_size, rollout_artifact
 

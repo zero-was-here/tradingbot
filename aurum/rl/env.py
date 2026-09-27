@@ -71,7 +71,7 @@ from gymnasium import spaces
 from aurum.backtest.result import BacktestResult
 from aurum.core.instrument import XAUUSD, Instrument
 from aurum.core.interfaces import PositionSizer, RiskContext, RiskManager
-from aurum.execution.costs import CostModel
+from aurum.execution.costs import CostModel, RateSource
 from aurum.execution.simulator import ExecutionSimulator, StepResult
 from aurum.models.volatility import ewma_volatility
 from aurum.portfolio.sizing import VolTargetSizer
@@ -162,7 +162,8 @@ class EnvConfig:
     sizer             : ``VolTargetSizer`` keyword arguments.
     risk              : ``RiskLimits`` keyword arguments (a fresh ``StandardRiskManager`` per
                         episode), or ``None`` for no risk manager.
-    costs             : ``CostModel`` keyword arguments (``{}`` = defaults).
+    costs             : ``CostModel`` keyword arguments (``{}`` = defaults, incl. rate-based
+                        financing; ``{"financing": {"mode": "fixed"}}`` etc. to change it).
     vol_halflife      : half-life (bars) of the causal EWMA vol used by the sizer (48 = engine
                         default, which keeps env and ``run_backtest`` identical).
     min_equity_frac   : terminate when equity falls below this fraction of the episode's
@@ -296,6 +297,10 @@ class GoldTradingEnv(gym.Env):
                 ``episode_length``. ``False`` (evaluation): start at the first eligible bar
                 and run to ``end`` (``reset(options={"start": i})`` overrides the start).
     sizer, costs, instrument : optional objects overriding ``config.sizer`` / ``config.costs``.
+    rates     : benchmark-rate source for ``"rate"`` financing (``md.macro`` — pass the same
+                one the engine gets so env and :func:`~aurum.backtest.engine.run_backtest`
+                equity paths stay identical; ``None`` -> ``financing.fallback_rate``). Rates are
+                read as of each rollover by the simulator (point-in-time).
     """
 
     metadata = {"render_modes": []}
@@ -314,6 +319,7 @@ class GoldTradingEnv(gym.Env):
         sizer: PositionSizer | None = None,
         costs: CostModel | None = None,
         instrument: Instrument = XAUUSD,
+        rates: RateSource = None,
     ) -> None:
         super().__init__()
         self.config = cfg = config if config is not None else EnvConfig()
@@ -377,7 +383,7 @@ class GoldTradingEnv(gym.Env):
 
         # One simulator per env, over the bars it may ever touch.
         sim_bars = bars.iloc[: hi + 1]
-        self.sim = ExecutionSimulator(sim_bars, instrument, self.costs, cfg.initial_equity)
+        self.sim = ExecutionSimulator(sim_bars, instrument, self.costs, cfg.initial_equity, rates=rates)
         self._close: list[float] = sim_bars["close"].to_numpy(dtype=float).tolist()
         self._open: list[float] = sim_bars["open"].to_numpy(dtype=float).tolist()
         self._spread: list[float] = sim_bars["spread"].to_numpy(dtype=float).tolist()
