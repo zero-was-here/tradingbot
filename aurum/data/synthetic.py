@@ -11,14 +11,20 @@ import numpy as np
 import pandas as pd
 
 from aurum.core.timeframes import get_timeframe, infer_bars_per_year
+from aurum.data.pit import asof_join
 from aurum.data.schema import make_bars
+
+_MACRO_LAG = pd.Timedelta(hours=21, minutes=30)
 
 
 def _timeline(n: int, timeframe: str, start: str, weekend_gaps: bool) -> pd.DatetimeIndex:
     tf = get_timeframe(timeframe)
-    # Generate generously, then filter weekends and cut to n.
+    # Generate generously, then filter weekends and cut to n. The fixed margin covers one
+    # whole closed weekend (Fri 21:00 → Sun 22:00 = 49h) so a short series starting on a
+    # Saturday still fits; the first n open stamps do not depend on the margin.
     factor = 1.6 if weekend_gaps else 1.0
-    idx = pd.date_range(pd.Timestamp(start, tz="UTC"), periods=int(n * factor) + 10, freq=tf.freq)
+    margin = int(np.ceil(pd.Timedelta(hours=50) / tf.delta)) + 10 if weekend_gaps else 10
+    idx = pd.date_range(pd.Timestamp(start, tz="UTC"), periods=int(n * factor) + margin, freq=tf.freq)
     if weekend_gaps:
         # Gold CFD: closed from Fri 21:00 UTC to Sun 22:00 UTC (approx).
         wd, hr = idx.weekday, idx.hour
@@ -99,7 +105,11 @@ def make_synthetic_bars(
     # small open gap vs previous close (larger after weekends)
     gap_sigma = np.full(n, 0.05 * sigma)
     if weekend_gaps and n > 1:
-        big = np.r_[False, np.diff(idx.asi8) > get_timeframe(timeframe).delta.value * 2]
+        # Compare Timedeltas, not raw integers: ``asi8`` is in the index's own unit (us on
+        # pandas 3, ns on pandas 2) while ``Timedelta.value`` is always ns, so an integer
+        # comparison silently never flagged a weekend on pandas 3.
+        steps = idx[1:] - idx[:-1]
+        big = np.r_[False, np.asarray(steps > 2 * get_timeframe(timeframe).delta)]
         gap_sigma[big] = 1.5 * sigma
     open_[1:] = close[:-1] * np.exp(rng.normal(0, gap_sigma[1:]))
     # High/low: extend beyond open/close by a half-normal excursion scaled to bar vol.
@@ -121,8 +131,14 @@ def make_synthetic_macro(bars: pd.DataFrame, *, seed: int = 0) -> dict[str, pd.D
     """Daily macro frames (value + available_at) loosely correlated with gold returns."""
     rng = np.random.default_rng(seed + 1)
     days = pd.date_range(bars.index[0].normalize(), bars.index[-1].normalize(), freq="B", tz="UTC")
-    gold_daily = bars["close"].resample("1D").last().reindex(days).ffill()
-    g = np.log(gold_daily).diff().fillna(0.0).to_numpy()
+    avail = days + _MACRO_LAG
+    # Point-in-time: the day-d macro print (available at d + 21:30 UTC) may only co-move with
+    # gold returns known by then. Using the UTC-midnight close here would embed up to 2.5h
+    # of *future* gold moves in the macro series — a leak a macro strategy could exploit,
+    # breaking the "no edge on gbm" property that the leakage tests rely on.
+    gold_asof = asof_join(pd.DatetimeIndex(avail), bars[["close", "available_at"]], columns=["close"])["close"]
+    g = np.log(gold_asof.ffill().to_numpy(dtype=float))
+    g = np.nan_to_num(np.diff(g, prepend=g[0]), nan=0.0)
     n = len(days)
     specs = {
         "dxy": dict(start=100.0, vol=0.005, beta=-0.35, kind="price"),
@@ -140,25 +156,43 @@ def make_synthetic_macro(bars: pd.DataFrame, *, seed: int = 0) -> dict[str, pd.D
             val = s["start"] + np.cumsum(s["beta"] * g + eps)
         frame = pd.DataFrame({"value": val}, index=days)
         frame.index.name = "date"
-        frame["available_at"] = frame.index + pd.Timedelta(hours=21, minutes=30)
+        frame["available_at"] = frame.index + _MACRO_LAG
         out[name] = frame
     return out
 
 
+def _ny(day: pd.Timestamp, hhmm: str) -> pd.Timestamp:
+    """New York wall-clock time on ``day`` → UTC (DST-aware)."""
+    return pd.Timestamp(f"{day.date()} {hhmm}").tz_localize("America/New_York").tz_convert("UTC")
+
+
 def make_synthetic_events(start: pd.Timestamp | str, end: pd.Timestamp | str) -> pd.DataFrame:
-    """Monthly NFP-like (first Friday 13:30 UTC) and 8-per-year FOMC-like (19:00 UTC) events."""
+    """Rule-shaped USD event calendar in the SPEC §3.5 format.
+
+    * NFP-like: first Friday of each month, 08:30 New York (12:30/13:30 UTC by US DST);
+    * CPI-like: the 13th of the month (next weekday if it falls on a weekend), 08:30 NY;
+    * FOMC-like: 8 per year (Jan, Mar, May, Jun, Jul, Sep, Nov, Dec) on the Wednesday
+      falling in days 15-21, 14:00 New York (18:00/19:00 UTC) — real statements are
+      (almost always) Wednesdays in the second half of the month.
+    """
     start = pd.Timestamp(start)
     end = pd.Timestamp(end)
     start = start.tz_localize("UTC") if start.tz is None else start.tz_convert("UTC")
     end = end.tz_localize("UTC") if end.tz is None else end.tz_convert("UTC")
     rows = []
-    for m in pd.date_range(start.normalize().replace(day=1), end, freq="MS"):
+    for m in pd.date_range(start.tz_localize(None).normalize().replace(day=1), end.tz_localize(None), freq="MS"):
         first_friday = m + pd.Timedelta(days=(4 - m.weekday()) % 7)
-        rows.append((first_friday + pd.Timedelta(hours=13, minutes=30), "NFP"))
-        rows.append((m + pd.Timedelta(days=12, hours=13, minutes=30), "CPI"))
+        rows.append((_ny(first_friday, "08:30"), "NFP"))
+        cpi = m + pd.Timedelta(days=12)
+        if cpi.weekday() >= 5:
+            cpi += pd.Timedelta(days=7 - cpi.weekday())
+        rows.append((_ny(cpi, "08:30"), "CPI"))
         if m.month in (1, 3, 5, 6, 7, 9, 11, 12):
-            rows.append((m + pd.Timedelta(days=17, hours=19), "FOMC"))
+            d15 = m + pd.Timedelta(days=14)
+            wed = d15 + pd.Timedelta(days=(2 - d15.weekday()) % 7)
+            rows.append((_ny(wed, "14:00"), "FOMC"))
     ev = pd.DataFrame(rows, columns=["time", "name"])
+    ev["time"] = pd.DatetimeIndex(ev["time"]).tz_convert("UTC")
     ev = ev[(ev["time"] >= start) & (ev["time"] <= end)].sort_values("time").reset_index(drop=True)
     ev["currency"] = "USD"
     ev["importance"] = 3

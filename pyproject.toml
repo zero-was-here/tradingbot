@@ -23,7 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 data = ["yfinance>=0.2.40"]
 rl = ["torch>=2.2", "gymnasium>=0.29", "stable-baselines3>=2.3"]
-agents = ["anthropic>=1.0"]
+agents = ["anthropic>=1.8"]
 mt5 = ["MetaTrader5>=5.0.45; platform_system == 'Windows'"]
 dev = ["pytest>=8", "ruff>=0.5"]
 all = ["aurum[data,rl,agents,dev]"]

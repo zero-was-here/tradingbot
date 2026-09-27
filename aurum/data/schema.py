@@ -95,6 +95,8 @@ def validate_bars(df: pd.DataFrame, *, check_ohlc: bool = True) -> None:
     avail = pd.DatetimeIndex(df["available_at"])
     if avail.tz is None:
         raise SchemaError("available_at must be tz-aware")
+    if avail.isna().any():
+        raise SchemaError("available_at contains NaT")
     if (avail <= idx).any():
         raise SchemaError("available_at must be strictly after bar open time")
 

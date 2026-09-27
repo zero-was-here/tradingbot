@@ -24,6 +24,11 @@ class BacktestResult:
     fills     : DataFrame of individual fills (time, side, lots, price, costs...).
     metrics   : dict produced by ``aurum.backtest.metrics.compute_metrics``.
     risk_events : DataFrame of risk-manager interventions (time, reasons, requested, approved).
+    pnl       : optional DataFrame per bar with columns ``price`` (mark-to-market PnL at MID
+                prices), ``costs`` (spread + slippage + commission, positive), ``swap``
+                (signed) and ``net`` = price - costs + swap. ``equity.diff() == net``.
+    position_close : optional signed lots held at each bar's CLOSE (after intrabar stop /
+                take-profit exits). Equals ``positions`` unless a protective exit fired.
     """
 
     equity: pd.Series
@@ -37,6 +42,29 @@ class BacktestResult:
     forecast: pd.Series | None = None
     risk_events: pd.DataFrame | None = None
     meta: dict = field(default_factory=dict)
+    pnl: pd.DataFrame | None = None
+    position_close: pd.Series | None = None
+
+    def reconcile(self) -> dict[str, float]:
+        """PnL identity check: equity change vs. sum of price PnL, costs and swap.
+
+        Returns the components and ``residual`` (should be ~0, e.g. < 1e-6 USD). Uses
+        ``pnl`` when present, otherwise ``costs`` only (price PnL then = residual).
+        """
+        change = float(self.equity.iloc[-1] - self.equity.iloc[0]) if len(self.equity) else 0.0
+        cost_cols = [c for c in ("spread", "slippage", "commission") if c in self.costs.columns]
+        total_costs = float(self.costs[cost_cols].to_numpy().sum()) if cost_cols else 0.0
+        swap = float(self.costs["swap"].sum()) if "swap" in self.costs.columns else 0.0
+        price = float(self.pnl["price"].sum()) if self.pnl is not None else change + total_costs - swap
+        trade_pnl = float(self.trades["pnl"].sum()) if "pnl" in self.trades.columns else float("nan")
+        return {
+            "equity_change": change,
+            "price_pnl": price,
+            "costs": total_costs,
+            "swap": swap,
+            "residual": change - (price - total_costs + swap),
+            "trade_pnl": trade_pnl,
+        }
 
     def summary(self) -> str:
         keys = [
@@ -60,7 +88,11 @@ class BacktestResult:
             frame["target"] = self.target
         if self.forecast is not None:
             frame["forecast"] = self.forecast
+        if self.position_close is not None:
+            frame["position_close"] = self.position_close
         frame = frame.join(self.costs.add_prefix("cost_"), how="left")
+        if self.pnl is not None:
+            frame = frame.join(self.pnl.add_prefix("pnl_"), how="left")
         frame.to_parquet(d / "timeseries.parquet")
         self.trades.to_csv(d / "trades.csv", index=False)
         self.fills.to_csv(d / "fills.csv", index=False)

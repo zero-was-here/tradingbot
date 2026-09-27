@@ -63,3 +63,35 @@ def infer_bars_per_year(index: pd.DatetimeIndex) -> float:
     if span_years <= 0:
         raise ValueError("Index must be increasing")
     return (len(index) - 1) / span_years
+
+
+#: Trading-calendar constants used for NOMINAL annualisation (see ``nominal_bars_per_year``).
+TRADING_DAYS_PER_YEAR = 252
+TRADING_MINUTES_PER_DAY = 23 * 60   # spot gold trades ~23h per weekday
+
+
+def nominal_bars_per_year(minutes: float) -> float:
+    """Timeframe-based annualisation constant that never looks at the data.
+
+    Intraday: ``252 * 23h / bar``  (5,796 for H1); daily or slower: ``252 * 1440 / minutes``.
+    Prefer this over :func:`infer_bars_per_year` inside causal code (sizing, features), where
+    the realised bar density of the *whole* sample must not leak into earlier decisions.
+    """
+    if minutes <= 0:
+        raise ValueError(f"non-positive bar duration {minutes}")
+    if minutes >= 1440:
+        return TRADING_DAYS_PER_YEAR * 1440.0 / minutes
+    return TRADING_DAYS_PER_YEAR * TRADING_MINUTES_PER_DAY / minutes
+
+
+def index_bar_minutes(index: pd.DatetimeIndex, probe: int = 200) -> float:
+    """Bar length in minutes from the median spacing of the FIRST ``probe`` timestamps.
+
+    Only the prefix is inspected, so the answer for a series never changes as data is
+    appended (point-in-time safe).
+    """
+    if len(index) < 2:
+        raise ValueError("need at least two timestamps")
+    head = index[: probe + 1]
+    diffs = (head[1:] - head[:-1]).total_seconds() / 60.0
+    return float(pd.Series(diffs).median())

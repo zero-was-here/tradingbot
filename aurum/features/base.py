@@ -78,6 +78,11 @@ def register_feature(
     return deco
 
 
+def unregister_feature(name: str) -> None:
+    """Remove a feature from the registry (used by tests for temporary features)."""
+    _REGISTRY.pop(name, None)
+
+
 def get_feature(name: str) -> FeatureSpec:
     _ensure_loaded()
     if name not in _REGISTRY:
