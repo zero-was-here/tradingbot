@@ -15,6 +15,15 @@ new agents on demand**, and makes the call. It can never bypass the risk manager
 > paper-trading platform. The v1 README's claims of "80–120% annual returns" had no evidence
 > behind them and have been removed.
 
+**📚 Documentation:** start at [docs/index.md](docs/index.md). The docs cover:
+[Getting started](docs/getting-started.md), [Architecture](docs/architecture.md),
+[Data](docs/data.md), [Features](docs/features.md), [Strategies](docs/strategies.md),
+[ML & RL](docs/ml-and-rl.md), [Portfolio & risk](docs/portfolio-and-risk.md),
+[Execution & costs](docs/execution-and-costs.md), [Research](docs/research.md),
+[LLM trading desk](docs/llm-desk.md), [Live trading](docs/live-trading.md),
+[Configuration](docs/configuration.md), [CLI reference](docs/cli.md),
+[Development](docs/development.md) and [Results](docs/RESULTS.md).
+
 ---
 
 ## Contents
