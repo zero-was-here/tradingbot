@@ -981,7 +981,8 @@ def build_parser() -> argparse.ArgumentParser:
     dl.add_argument("--cache", default="cache/dukascopy")
     dl.add_argument("--workers", type=int, default=4)
     dl.add_argument("--time-budget", type=float, default=None, help="seconds for the prefetch pass")
-    dl.add_argument("--offline", action="store_true", help="build only from the local cache")
+    dl.add_argument("--offline", action="store_true",
+                    help="build the bars only from the local cache (macro is still fetched unless --no-macro)")
     dl.add_argument("--no-bars", action="store_true")
     dl.add_argument("--no-macro", action="store_true")
     dl.add_argument("--macro-start", default="2011-01-01")

@@ -1,7 +1,10 @@
 """Bar-level execution simulator — the single source of truth for PnL (SPEC §0.2, §8).
 
-Research backtests, the RL environment, the paper broker and the LLM-desk replay all drive
-this class, so a strategy's economics cannot differ between research and trading.
+Research backtests, the RL environment and the LLM-desk replay drive this class. The paper
+broker (:mod:`aurum.live.paper`) keeps broker-style books instead, but reuses the same
+:class:`~aurum.execution.costs.CostModel` arithmetic, financing model and
+:func:`intrabar_exit`, and ``tests/test_live_paper.py`` holds it to this simulator's equity
+path, so a strategy's economics cannot differ between research and trading.
 
 Timing model (SPEC §1)
 ----------------------

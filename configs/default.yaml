@@ -64,8 +64,10 @@ strategies:
   - {name: ml_gbm}
   - {name: meta_label}
   # rl_ppo is NOT in the default set: it trains a PPO policy inside every fold (hours).
-  # Train once with `aurum rl train` and add {name: rl_ppo, params: {artifact_dir: ...}} -
-  # a pre-trained artifact is only out-of-sample AFTER its validation end date.
+  # Walk-forward and train-final call fit() on every trainable strategy, and rl_ppo's fit()
+  # always trains a new policy, even with params.artifact_dir set, so a policy from
+  # `aurum rl train` cannot be evaluated this way (see docs/ml-and-rl.md). A pre-trained
+  # policy is only out-of-sample AFTER its validation end date.
 
 combiner:
   method: sharpe_shrink           # sharpe_shrink | equal | inverse_vol | hrp | fixed (uses strategies[].weight)

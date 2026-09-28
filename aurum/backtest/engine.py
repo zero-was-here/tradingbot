@@ -18,9 +18,10 @@ At the close of bar ``t`` (decision time ``available_at[t]``) the engine uses on
   advance; *outcome* columns such as ``actual``/``surprise`` are stripped from upcoming
   events).
 
-The order then fills at the OPEN of bar ``t+1`` inside the simulator. ``bars_per_year``
-(used only to annualise the default vol) is inferred from the timestamps of the whole
-sample — calendar density, not price information.
+The order then fills at the OPEN of bar ``t+1`` inside the simulator. The default vol is
+annualised with the nominal timeframe constant (or ``bars_per_year=`` when given). Only the
+per-bar metrics (``sharpe_bar``, ``meta["bars_per_year"]``) use a density inferred from the
+timestamps of the whole sample — calendar density, not price information.
 
 Overnight financing (``costs.financing``, see :class:`aurum.execution.costs.FinancingModel`)
 is settled by the simulator at each rollover. In the default ``"rate"`` mode the benchmark
@@ -651,9 +652,9 @@ def run_target_lots(
     """Backtest a pre-sized lot path: ``target_lots[t]`` = signed lots wanted after the fill at
     the open of ``t+1`` (decided at the close of ``t``). NaN means "no decision, hold".
 
-    Used by the RL evaluation, the LLM-desk replay and benchmarks; the optional ``risk``
-    manager and protective stops behave exactly as in :func:`run_backtest`, and so do
-    ``financing`` / ``rates``.
+    Used by :func:`buy_and_hold_benchmark` (the RL evaluation and the LLM-desk replay go
+    through :func:`run_backtest`); the optional ``risk`` manager and protective stops behave
+    exactly as in :func:`run_backtest`, and so do ``financing`` / ``rates``.
     """
     bars_full, _ = _unpack(md)
     tl = _align(target_lots, pd.DatetimeIndex(bars_full.index), "target_lots", fill=None, ffill=False)

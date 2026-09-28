@@ -27,6 +27,7 @@ agents = ["anthropic>=1.8"]
 mt5 = ["MetaTrader5>=5.0.45; platform_system == 'Windows'"]
 # ruff < 0.13 still enforces the removed UP038 rule and fails `ruff check` on this tree
 dev = ["pytest>=8", "ruff>=0.13"]
+docs = ["mkdocs>=1.6", "mkdocs-material>=9.5"]
 all = ["aurum[data,rl,agents,dev]"]
 
 [project.scripts]

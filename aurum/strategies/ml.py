@@ -875,7 +875,7 @@ class _MLStrategyBase(Strategy):
         return self.feature_importances_.groupby(fam).sum().sort_values(ascending=False)
 
     def explain(self, top: int = 15) -> dict[str, Any]:
-        """JSON-serialisable summary for tearsheets and the LLM desk."""
+        """JSON-serialisable summary of the fitted model (not wired into the tearsheet or the desk)."""
         out: dict[str, Any] = {
             "strategy": self.name,
             "description": self.description,

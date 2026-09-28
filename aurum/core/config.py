@@ -15,8 +15,9 @@ the dataclass tree with strict checking:
 * scalar types are checked (YAML dates are accepted where a string is expected);
 * semantic validation builds the REAL downstream objects (``Instrument``, ``CostModel``,
   ``VolTargetSizer``, ``RiskLimits``, ``ForecastCombiner``, ``DecisionPolicy``,
-  ``DeskConfig``) so that a config accepted here cannot fail later on a parameter range,
-  and every problem is reported at once.
+  ``DeskConfig``) and reports every problem at once. Strategy names/params, feature groups,
+  ``instrument.triple_swap_weekday``, ``rl.params`` and unknown ``live.options`` keys are only
+  checked when a command builds the object that uses them.
 
 Secrets
 -------
@@ -394,8 +395,11 @@ class CostsConfig:
 class FeaturesConfig:
     """:class:`aurum.features.pipeline.FeaturePipeline` settings.
 
-    ``enabled``: ``"auto"`` computes features only when a strategy needs them (a trainable
-    strategy, or one declaring ``uses_features = True``); ``true``/``false`` force it.
+    ``enabled`` decides which strategies the walk-forward hands the fold's pipeline features
+    (see ``aurum.research.walkforward._needs_features``): a strategy declaring
+    ``uses_features`` gets them as declared; otherwise ``"auto"`` feeds none (``ml_gbm`` and
+    ``meta_label`` build their own pipelines), ``true`` feeds every trainable strategy, and
+    ``false`` never computes features.
     """
 
     enabled: bool | str = "auto"

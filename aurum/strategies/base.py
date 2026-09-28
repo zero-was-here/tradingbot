@@ -32,7 +32,7 @@ from aurum.core.types import MarketData
 class Strategy(ABC):
     #: registry key, e.g. "tsmom"
     name: ClassVar[str] = "base"
-    #: short human description shown in reports and to the LLM agents
+    #: short human description (printed by ``aurum strategies list``)
     description: ClassVar[str] = ""
     #: whether ``fit`` learns anything from data (affects walk-forward refits)
     trainable: ClassVar[bool] = False

@@ -20,6 +20,9 @@ venv/
 /share/
 /pyvenv.cfg
 
+# Built documentation site (`mkdocs build`); the source is docs/
+/site/
+
 # Tooling caches
 .pytest_cache/
 .ruff_cache/

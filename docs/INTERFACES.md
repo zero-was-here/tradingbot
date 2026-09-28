@@ -1,5 +1,5 @@
 # Wave 1 module interfaces (as built)
-Authoritative source is the code; this is a map.
+Authoritative source is the code; this is a map. It was written module by module while Aurum v2 was built; entries that later changed were corrected for v2.0.0 (2026-09-28). The topic pages linked from [index.md](index.md) describe current behaviour in more depth.
 
 ## data
 
@@ -133,7 +133,7 @@ Daily spot and futures log returns correlate at about 0.89.
 
 ### Public API
 ```
-Registry groups (exact SPEC names; columns prefixed '<group>_'): returns, trend, momentum, meanrev, range (technical.py); volatility (volatility.py); microstructure, session (microstructure.py); mtf (multi_timeframe.py); macro (macro.py); calendar (calendar.py, requires_events=True); regime (regime.py). 12 groups, 175 columns with default params and full MarketData.
+Registry groups (exact SPEC names; columns prefixed '<group>_'): returns, trend, momentum, meanrev, range (technical.py); volatility (volatility.py); microstructure, session (microstructure.py); mtf (multi_timeframe.py); macro (macro.py); calendar (calendar.py, requires_events=True); regime (regime.py). 12 groups; with default params that is 174 columns on H1 bars with the five synthetic macro series and 194 with the ten series `aurum data download` fetches (see [features.md](features.md)).
 
 aurum.features.volatility (standalone, imports no other feature module; verified in a subprocess test):
   true_range(bars) -> Series; atr(bars, n=14) -> Series (Wilder); wilder_smooth(x, n)
@@ -150,7 +150,7 @@ aurum.features.regime: regime_features(md, *, vol_window=24, rank_years=1.0, ran
   # wave 3: default columns regime_vol_pctrank (bounded rolling rank, NaN until the rank_years window is full; 5,796 H1 / 23,184 M15 / 1,449 H4 / 252 D1 bars), regime_high_vol/low_vol from it;
   # regime_vol_pctrank_exp only with expanding=True; regime_vol_pctrank_2000 is gone (pipelines/RL policies fitted before must be retrained: FeatureSchemaError)
 aurum.features.pipeline:
-  class FeaturePipeline(groups=None, overrides=None, scaler="robust"|"standard"|"none", clip=5.0, *, warmup=None)
+  class FeaturePipeline(groups=None, overrides=None, scaler="robust"|"standard"|"none", clip=5.0, *, warmup=None, bar_minutes=None)
     compute(md) -> DataFrame; fit(raw_train) -> self; transform(raw, *, strict=True) -> DataFrame; fit_transform(raw)
     max_lookback (property); columns (property); dropped_columns; stats (DataFrame loc/scale/kind); is_fitted
     save(path) -> Path; load(path) (classmethod); to_dict()/from_dict()
@@ -160,11 +160,11 @@ aurum.features.pipeline:
 ```
 
 ### Integration notes
-Strategies and sizing: import atr, true_range, yang_zhang_vol, parkinson_vol, garman_klass_vol, rogers_satchell_vol from aurum.features.volatility; it does not import technical, pipeline or macro. Pass bars_per_year explicitly if it must match ewma_volatility/infer_bars_per_year. ML strategies and walk-forward: `pipe = FeaturePipeline(groups=..., overrides=...); raw = pipe.compute(md)` on FULL history (all groups are causal), then `pipe.fit(raw.iloc[train_idx])` and `X = pipe.transform(raw.iloc[test_idx])`. Warm-up rows keep NaN; call dropna() or skip pipe.max_lookback rows before training. Live runner: persist with pipe.save('artifacts/features.json') and restore with FeaturePipeline.load(...). transform raises FeatureSchemaError if live compute is missing a fitted column (e.g. macro or events not supplied), or has new columns when strict=True. Use pipe.parity_report(batch_raw, live_raw) to check batch vs incremental parity. Daily-based groups need md.macro (dict of frames with 'value' + 'available_at') and md.events (time, name, importance, currency). With no macro the macro group returns an empty frame; with events=None the pipeline skips calendar. Session features describe available_at[t] (the next bar's scheduled open). For H4/D1 bars with a broker-day anchor, use aurum.features.multi_timeframe.resample_anchored(bars, 'D1', 22) until resample_bars is fixed for pandas 3. Other test authors can reuse the leak checker pattern (perturbed_market / truncated_market / compare_prefix) in tests/test_features_leakage.py for strategy leakage tests.
+Strategies and sizing: import atr, true_range, yang_zhang_vol, parkinson_vol, garman_klass_vol, rogers_satchell_vol from aurum.features.volatility; it does not import technical, pipeline or macro. Pass bars_per_year explicitly if it must match ewma_volatility/infer_bars_per_year. ML strategies and walk-forward: `pipe = FeaturePipeline(groups=..., overrides=...); raw = pipe.compute(md)` on FULL history (all groups are causal), then `pipe.fit(raw.iloc[train_idx])` and `X = pipe.transform(raw.iloc[test_idx])`. Warm-up rows keep NaN; call dropna() or skip pipe.max_lookback rows before training. Live runner: persist with pipe.save('artifacts/features.json') and restore with FeaturePipeline.load(...). transform raises FeatureSchemaError if live compute is missing a fitted column (e.g. macro or events not supplied), or has new columns when strict=True. Use pipe.parity_report(batch_raw, live_raw) to check batch vs incremental parity. Daily-based groups need md.macro (dict of frames with 'value' + 'available_at') and md.events (time, name, importance, currency). With no macro the macro group returns an empty frame; with events=None the pipeline skips calendar. Session features describe available_at[t] (the next bar's scheduled open). For H4/D1 bars with a broker-day anchor, resample_bars(bars, 'D1', daily_anchor_hour_utc=22) now honours the anchor on pandas 3 (it uses fixed-length Timedelta buckets); resample_anchored remains as an equivalent wrapper. Other test authors can reuse the leak checker pattern (perturbed_market / truncated_market / compare_prefix) in tests/test_features_leakage.py for strategy leakage tests.
 
 ### Known limitations
 - LLM desk (SPEC §10, aurum/agents): the features module's only contribution is FeaturePipeline.snapshot(), a JSON-safe feature dict the desk's DeskDataProvider can expose to the CIO/specialist agents.
-- max_lookback is static and calibrated for H1 for the daily-based groups (macro 1560, mtf 528 bars). For overrides it takes the largest numeric override value + 1, which is conservative and heuristic. Pass warmup= to set it exactly on other timeframes. The per-column first-valid rule in transform limits the damage of a wrong estimate.
+- (Updated.) max_lookback is no longer static: each built-in group attaches a lookback_fn(params, bar_minutes) evaluated on its effective parameters and the bar size (on H1: macro 2136, mtf 576, regime 5820 bars; see [features.md](features.md#warm-up)). Groups without a lookback_fn fall back to the registered lookback, raised to the largest integer override + 1 (a heuristic). Pass warmup= to set it exactly. `aurum features list` still prints the H1 registry values.
 - The leakage test does not perturb the event calendar, because scheduled times are public in advance (SPEC §3.5). Unscheduled events that appear in historical calendars (e.g. emergency FOMC) cannot be told apart and would leak slightly; calendar sources should flag them.
 - The perturbation test keeps the same timestamp grid; a length-dependent full-sample statistic is covered by the truncation variant. Both use one synthetic seed/model per cutoff.
 - The random-walk test is a single-seed statistical test with a 1% family-wise false-positive rate by construction. It is deterministic and passes, but a future feature change could need a seed review if it trips at p just below threshold.
@@ -200,11 +200,11 @@ aurum.execution.simulator:
   ExecutionSimulator(bars, instrument=XAUUSD, costs=None, initial_equity=100_000.0, *, validate=True, rates=None)   # result().meta["financing"] = rate provenance
   intrabar_exit(pos, o, h, lo, sl, tp) -> (exit_mid, reason, is_limit) | None   # shared with PaperBroker and the live runner (ExecutionSimulator._intrabar_exit / aurum.live.paper._protective_exit are aliases)
     .reset(start=0, equity=None)
-    .step(target_lots, *, stop_price=None, take_profit=None, reason="signal") -> StepResult
+    .step(target_lots, *, stop_price=None, take_profit=None, reason="signal", stop_distance=None, take_profit_distance=None) -> StepResult   # *_distance: levels anchored at the entry fill open[t+1]
     .result(*, compute_metrics=True) -> BacktestResult
     .trades_frame(*, include_open=True) -> DataFrame; .fills_frame() -> DataFrame; .snapshot() -> dict
     attrs/properties: index, equity, position, done, peak_equity, bankrupt, n_bars, start, time, decision_time, price, spread, drawdown, margin_used, free_margin
-  @dataclass StepResult(index, time, equity, pnl, ret, price_pnl, costs: dict[spread,slippage,commission,swap], fills: list[aurum.core.types.Fill], position, position_open, done, exit_reason)
+  @dataclass StepResult(index, time, equity, pnl, ret, price_pnl, costs: dict[spread,slippage,commission,swap], fills: list[aurum.core.types.Fill], position, position_open, done, exit_reason, stop_price, take_profit)
   TRADE_COLUMNS, FILL_COLUMNS
 
 aurum.backtest.engine:
@@ -216,7 +216,7 @@ aurum.backtest.engine:
   RISK_EVENT_COLUMNS = [time, bar_time, bar, current, requested, approved, halted, reasons]; OUTCOME_COLUMNS
 
 aurum.backtest.metrics:
-  compute_metrics(result_or_returns, *, bars_per_year=None, trades=None, positions=None, costs=None, equity=None, fills=None) -> dict   # all SPEC keys + n_bars, n_days, years, bars_per_year, final_equity
+  compute_metrics(result_or_returns, *, bars_per_year=None, trades=None, positions=None, costs=None, equity=None, fills=None, bar_duration=None) -> dict   # all SPEC keys + n_bars, n_days, years, bars_per_year, final_equity
   daily_returns(equity, *, initial=None, fold_weekends=True) -> Series
   daily_equity(equity, *, fold_weekends=True); trading_dates(index, *, fold_weekends=True)
   drawdown_series(equity) -> Series (<=0); max_drawdown(equity); max_drawdown_duration_days(equity)
@@ -231,7 +231,7 @@ Checked against the real modules (not in my tests, since those are being written
 How to plug in:
 - **Research and walk-forward:** call run_backtest(md, combined_forecast, sizer=VolTargetSizer(...), risk=StandardRiskManager(...), stop_atr_mult=...). It uses ewma_volatility by default, computed over the full history so a start/end window begins warmed up.
 - **Report and research:** result.pnl has per-bar price/costs/swap/net; result.position_close gives positions after stops; result.reconcile() checks the PnL identity; buy_and_hold_benchmark(md) gives the comparison curve (it pays CFD swap unless frictionless=True).
-- **RL env and paper broker:** use ExecutionSimulator directly: reset(start) -> step(target, stop_price=, take_profit=) -> StepResult with pnl, ret, costs and fills -> result(). The constructor is O(n) and reset allocates O(n) lists, so reuse one simulator per dataset.
+- **RL env:** uses ExecutionSimulator directly: reset(start) -> step(target, stop_price=, take_profit=) -> StepResult with pnl, ret, costs and fills -> result(). The constructor is O(n) and reset allocates O(n) lists, so reuse one simulator per dataset. (Updated: the live PaperBroker does not instantiate ExecutionSimulator; it keeps broker-style books with the same CostModel arithmetic, FinancingModel and intrabar_exit, and tests/test_live_paper.py holds it to the simulator's equity path.)
 - **LLM desk replay (§10):** turn the DecisionPolicy output into a forecast or scale and pass it through run_backtest, so it goes through the same sizer and risk manager. Pre-sized lot paths go through run_target_lots(md, lots, risk=...). In both cases risk is applied and clamped to reduce-only, so the LLM cannot bypass it.
 
 What risk-manager authors can rely on:
@@ -247,12 +247,12 @@ Tests: pytest tests/test_execution_*.py tests/test_backtest_*.py
 
 ### Known limitations
 - The path inside a bar is unknown. If both SL and TP are touched in one bar, the SL is assumed to fill first. In a bar where a stop or TP fired, swap is charged on the position at the bar's close, which is flat. This is exact for M1..H1 bars that end on the rollover hour, and approximate for H4/D1 bars that contain it.
-- Engine stops are set from close[t] +/- k*ATR[t]. If the next open gaps past that level, the position is entered and immediately stopped at the open, paying the spread twice. A real broker might instead reject the invalid SL. Stops are fixed for the life of the position (no trailing).
+- (Updated.) Engine stops are passed as stop_distance = k*ATR[t] and anchored at the entry fill (open[t+1]), so a gap at the open no longer enters and immediately stops the position. Stops are fixed for the life of the position (no trailing).
 - Slippage uses the high-low range of the execution bar (t+1). This is a cost-model input only and never reaches a decision before the step. Fill prices are not rounded to the tick grid; the error is at most $0.005/oz and keeping it unrounded keeps the PnL identity exact.
 - No partial fills, liquidity limits or margin stop-out model. The only guard is bankruptcy: once equity <= 0, the position is forced flat with exit_reason 'risk'. Margin utilisation limits belong to the risk manager.
 - The rollover hour is a fixed UTC hour from the Instrument. It does not move with New York DST, so it can be off by an hour for about half the year.
-- By default bars_per_year is inferred from the whole sample's timestamps. That is calendar density, not price information, but runs on truncated data can scale the default vol slightly differently. Pass bars_per_year explicitly when you need runs to be exactly invariant to truncation.
-- The simulator works over a fixed bars frame. A live PaperBroker that receives bars incrementally would need to rebuild the simulator or add an append API; there is none yet.
+- (Updated.) The default vol is annualised with the nominal timeframe constant (or bars_per_year= when given), so truncated runs size identically. Only the per-bar metrics (sharpe_bar, meta['bars_per_year']) use the density inferred from the whole sample's timestamps.
+- The simulator works over a fixed bars frame; there is no append API. The live PaperBroker therefore keeps its own books (see the integration note above) instead of driving the simulator.
 - LLM desk (SPEC §10, aurum.agents): this module gives the desk a route through the same simulator, sizer and risk manager, so it cannot bypass risk.
 
 ## research (aurum/research: splits.py, stats.py, report.py)
@@ -365,10 +365,10 @@ Engine and live runner: call risk.on_bar(bars.available_at[t], equity), then ris
 - GARCH(1,1): Gaussian QMLE only (no Student-t innovations, no standard errors or Hessian); the mean is estimated two-step; fit() drops non-finite returns, which joins returns across gaps; the variance recursion starts from the training-sample variance (h0_), which is also used when forecasting later data (fitted on train, so causal).
 - HAR-RV: plain OLS with no HAC standard errors; forecasts are floored at a tiny positive variance in levels mode. daily_realised_variance drops a trailing day whose last bar ends before the day boundary, so a Friday 21:00 close that is the very last row is dropped too (conservative).
 - GaussianHMM: diagonal covariances only. The 2-state recursion is hand-unrolled and fast (about 50 ms fit for T=3000); the general K>2 path is a numpy loop and slower (about 2.4 s for K=3, T=2000, 3 restarts). There is deliberately no public smoother or Viterbi (look-ahead). Emissions are Gaussian, so non-Gaussian features such as |returns| degrade regime recovery (seen during testing; univariate returns reach about 96% accuracy).
-- ForecastCombiner FDM follows Carver in assuming forecasts share a common scale; strategies on [-1,1] with very different typical magnitudes are not rescaled (avg_abs_forecast is reported instead). A low max_weight with few positive-edge strategies forces weight onto losers (flagged in notes, not prevented).
+- ForecastCombiner FDM follows Carver in assuming forecasts share a common scale; strategies on [-1,1] with very different typical magnitudes are not rescaled (avg_abs_forecast is reported instead). (Updated.) With the default allow_unallocated=True a low max_weight with few positive-edge strategies leaves the excess risk unallocated instead of forcing weight onto losers; only allow_unallocated=False (the legacy contract) still pushes weight onto them (flagged in notes).
 - Risk manager: the context event-frame cache is keyed on object identity, so frames passed in RiskContext must not be mutated in place (the engine's cached slices are fine). Blackouts use scheduled times only. The stale-data check only fires when ctx.data_age_seconds is set (live). With state_path set, the JSON state is rewritten on every bar (atomic tmp + os.replace). Measured cost is about 16 µs/bar without event frames and about 35 µs/bar under cProfile with frames; a plain timing run including first-call parsing showed about 88 µs.
 - VaR: historical-method horizon scaling uses sqrt(h), an approximation. Cornish-Fisher is only reliable for moderate skew and kurtosis: on Student-t(5) it overshot the 99% quantile, as documented and tested. The named historical stress scenarios (2013-04-15 about -9%, 2011-09-23 about -6%, 2016 Brexit about +5%) are rounded, approximate magnitudes from memory, not verified data. risk_report takes the stress price from price=, then meta['last_price'], then the last fill price.
-- LLM desk (SPEC §10, aurum/agents): this module gives the agents JSON-friendly hooks: StandardRiskManager.snapshot(), evaluate(ctx, commit=False) previews, halt(reason) for a Risk Officer agent, ForecastCombiner.explain(), VolTargetSizer.breakdown(), Garch11.summary(), GaussianHMM.summary() and risk_report(). The LLM path still goes through the same sizer and risk manager and cannot bypass them.
+- LLM desk (SPEC §10, aurum/agents): this module offers JSON-friendly hooks: StandardRiskManager.snapshot(), evaluate(ctx, commit=False) previews, halt(reason), ForecastCombiner.explain(), VolTargetSizer.breakdown(), Garch11.summary(), GaussianHMM.summary() and risk_report(). (Updated: nothing in aurum/agents calls evaluate(commit=False) or halt(); the only halt() caller is the live runner. The desk sees risk through the runner's risk.snapshot().) The LLM path still goes through the same sizer and risk manager and cannot bypass them.
 
 ## agents
 

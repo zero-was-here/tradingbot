@@ -1,0 +1,126 @@
+# MkDocs site for the Aurum documentation in docs/.
+#   pip install -e ".[docs]"
+#   mkdocs serve                                     # http://127.0.0.1:8000
+#   mkdocs build --strict --site-dir /tmp/aurum-site # the built site is not committed
+# The Markdown is written for GitHub first; docs/_hooks/mkdocs_hooks.py adapts links that
+# leave docs/, GitHub alert blocks and <details> blocks for the site.
+
+site_name: Aurum v2
+site_description: >-
+  Point-in-time research and paper-trading stack for spot gold (XAUUSD), with an optional
+  LLM trading desk.
+site_author: zero-was-here
+repo_url: https://github.com/zero-was-here/tradingbot
+repo_name: zero-was-here/tradingbot
+edit_uri: edit/aurum-v2/docs/
+docs_dir: docs
+copyright: MIT License. Research software, not investment advice.
+
+theme:
+  name: material
+  language: en
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: amber
+      accent: deep orange
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: amber
+      accent: deep orange
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - navigation.indexes
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+exclude_docs: |
+  _hooks/
+
+hooks:
+  - docs/_hooks/mkdocs_hooks.py
+
+extra:
+  # Git ref used for links from the site to files outside docs/ (source code, SPEC.md, ...).
+  source_ref: aurum-v2
+
+extra_javascript:
+  - _assets/mathjax.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      # GitHub-compatible heading anchors, so the same #links work on GitHub and on the site.
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: false
+  - pymdownx.inlinehilite
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+        - name: math
+          class: arithmatex
+          format: !!python/object/apply:pymdownx.arithmatex.arithmatex_fenced_format
+            kwds:
+              mode: generic
+              tag: div
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+nav:
+  - Home: index.md
+  - Start here:
+      - Getting started: getting-started.md
+      - Architecture: architecture.md
+  - Concepts:
+      - Research: research.md
+      - Research protocol: RESEARCH_PROTOCOL.md
+      - Results: RESULTS.md
+  - Components:
+      - Data: data.md
+      - Features: features.md
+      - Strategies: strategies.md
+      - ML and RL: ml-and-rl.md
+      - Portfolio and risk: portfolio-and-risk.md
+      - Execution and costs: execution-and-costs.md
+      - LLM desk: llm-desk.md
+  - Operations:
+      - Live and paper trading: live-trading.md
+      - CLI reference: cli.md
+  - Reference:
+      - Configuration: configuration.md
+      - Module interfaces: INTERFACES.md
+      - SPEC.md: https://github.com/zero-was-here/tradingbot/blob/aurum-v2/SPEC.md
+  - Project:
+      - Development: development.md
+      - Changelog: https://github.com/zero-was-here/tradingbot/blob/aurum-v2/CHANGELOG.md
+      - Security: https://github.com/zero-was-here/tradingbot/blob/aurum-v2/SECURITY.md
