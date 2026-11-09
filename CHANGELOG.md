@@ -104,6 +104,36 @@ and the used-up 2025-26 holdout was not touched.
 
 ### Fixed / safety
 
+- **Daily dating of walk-forward statistics.** `book_statistics` (Sharpe, PSR, DSR, CI in
+  `stats.csv`), the DSR trial Sharpes, the per-fold Sharpes (`folds.csv`, `fold_sharpe.csv`)
+  and the PBO matrix now date each equity mark by its bar's close, with the run's bar
+  duration (the bars' timeframe, else `available_at - open`), like `metrics.json` already
+  did. They used the bar's open: on New York close D1 bars (open 22:00 UTC) the Sunday and
+  Monday bars merged, a week had four daily returns (1,862 instead of 2,322 over 2016-2024)
+  and the D1 Sharpes were 10-13% too large in magnitude. H1 bars never straddle midnight:
+  every published protocol number is unchanged. Both exploratory D1 runs were re-run; the
+  corrected numbers are below and in [docs/RESULTS.md](docs/RESULTS.md). The tearsheet's
+  daily statistics, `aurum stress`, the sweep's daily return matrix, the dashboard's daily
+  equity and rolling Sharpe and the `aurum rl train` validation Sharpe date by the close
+  the same way (new `aurum.backtest.metrics.resolve_bar_duration`).
+- `aurum backtest --include-holdout --no-write` records its holdout look in
+  `output.dir/holdout_ledger.jsonl`, as `walkforward --no-write` does (it recorded nothing).
+- `aurum sweep` resolves `--strategy` and checks the `--grid` parameter names before it loads
+  any data (exit 2 with a did-you-mean hint, instead of failing after the load).
+- Config validation checks the keys of `live.options.mt5` against `MT5Broker`'s signature
+  (without building the broker; `symbol`, `instrument`, `connect` and the code-level
+  arguments are refused) and refuses unknown keys in `live.options.desk`; the runner's
+  `LiveConfig` refuses desk keys outside the new `aurum.live.runner.DESK_KEYS`. Both kinds
+  of typo used to pass validation (a desk typo was silently ignored, an MT5 typo failed only
+  when `aurum live run` built the broker).
+- `aurum data info --help` no longer claims `--config` defaults to the built-in defaults.
+- The MkDocs hook also rewrites links that leave `docs/` inside figure captions (they broke
+  `mkdocs build --strict`).
+- CI runs on pushes to `main` (and pull requests), asserts all 17 strategies, and has a
+  `docs` job: figure checks, docs asset/link tests and a strict MkDocs build.
+- The test suite refuses writes into the repository's `data_store/` (the aurum.data
+  writers and the generic parquet writers are guarded from collection on; a swallowed
+  refusal still fails the test).
 - The LLM desk's prerequisites (`anthropic` importable, `ANTHROPIC_API_KEY` set) are checked
   before the runner touches the broker, and by `aurum live run` before it writes anything.
 - `desk.on_error` must be one of `follow_quant|flat|hold`, and `desk.enabled` must be a real
@@ -124,8 +154,8 @@ and the used-up 2025-26 holdout was not touched.
 ### Research (additional trials, not pre-registered)
 
 Exploratory runs on real data ending 2024-12-31, holdout disabled, DSR with `n_trials` = 30:
-daily trend (`d1_trend`) combined Sharpe -0.29 (DSR 0.002); `managed_gold` combined 0.12
-(DSR 0.040; `managed_gold` alone 0.19 vs buy-and-hold 0.51); an `ema_cross` sweep's best
+daily trend (`d1_trend`) combined Sharpe -0.26 (DSR 0.002); `managed_gold` combined 0.11
+(DSR 0.040; `managed_gold` alone 0.17 vs buy-and-hold 0.47); an `ema_cross` sweep's best
 point 16/64 Sharpe 0.24 with DSR 0.19 and a knife-edge plateau (ratio 0.49). No book comes
 close to the protocol's bar.
 

@@ -1053,9 +1053,11 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - exercised 
     val_range = _range_str(data.md.bars.iloc[lo:hi + 1])
     print("\nVALIDATION", val_range)
     print(pd.DataFrame(val_rows).T.reindex(columns=cols).round(4).to_string())
-    from aurum.backtest.metrics import daily_returns
+    from aurum.backtest.metrics import daily_returns, resolve_bar_duration
 
-    vr = daily_returns(res.val_eval.backtest.equity)
+    vbt = res.val_eval.backtest
+    vr = daily_returns(vbt.equity, bar_duration=resolve_bar_duration((vbt.meta or {}).get("timeframe"),
+                                                                     vbt.equity.index))
     n_trials = max(1, len(res.history))
     ss = sharpe_summary(vr.to_numpy(), 252, n_trials=n_trials, bootstrap=False)
     print(f"val daily Sharpe {ss.get('sharpe', float('nan')):.3f}  PSR {ss.get('psr', float('nan')):.3f}"

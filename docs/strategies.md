@@ -1662,8 +1662,8 @@ the daily configuration. **Stateful:** yes (the de-risk latch).
   of 0.5 holds about 5% annualised volatility of gold, a third of a fully invested position.
   It should be judged against buy-and-hold, not against zero.
 - *Result.* In the exploratory daily walk-forward (2016-2024, 18 folds, costs and financing
-  included) `managed_gold` had a Sharpe ratio of 0.19 (95% CI −0.54 to 0.88, DSR 0.061) with a
-  −14.5% maximum drawdown and an average forecast of 0.62, against 0.51 and −30.5% for
+  included) `managed_gold` had a Sharpe ratio of 0.17 (95% CI −0.52 to 0.84, DSR 0.062) with a
+  −14.5% maximum drawdown and an average forecast of 0.62, against 0.47 and −30.5% for
   buy-and-hold over the same days: shallower drawdowns, but no better risk-adjusted return. See
   [RESULTS.md](RESULTS.md); every configuration of it evaluated on real data is a new trial.
 
@@ -1854,7 +1854,7 @@ also the more persistent, it is "chaotic" most of the time and the forecast is c
   full-history probabilities after a few dozen observations; each value still uses returns up
   to the decision only. `warmup` (the base's 1,441 H1 bars, about 3 months) is far longer.
 - *Costs.* Switching between full size and zero is turnover. In the exploratory daily run the
-  filter turned daily `tsmom` from a Sharpe ratio of −0.37 to +0.14 (95% CI −0.59 to 0.84, DSR
+  filter turned daily `tsmom` from a Sharpe ratio of −0.32 to +0.12 (95% CI −0.54 to 0.77, DSR
   0.045) and cut its maximum drawdown from −17.1% to −9.7%, at 2.4 times the trading costs (about
   7,020 versus 2,980 USD on the same capital). Neither is significant; see
   [RESULTS.md](RESULTS.md).

@@ -95,6 +95,22 @@ def infer_bar_duration(index: pd.Index) -> pd.Timedelta | None:
     return min(pd.Timedelta(int(vals[k]), unit="ns"), pd.Timedelta(days=1))
 
 
+def resolve_bar_duration(timeframe: Any = None, index: pd.Index | None = None) -> pd.Timedelta | None:
+    """Bar length used to date equity marks by their bar's CLOSE (see :func:`trading_dates`).
+
+    The length of ``timeframe`` when it names one (``"H1"``, ``"D1"``, ...), else
+    :func:`infer_bar_duration` of ``index``; None (open-time dates) when neither applies.
+    For bars that do not straddle midnight (M1..H1, UTC-aligned H4/D1) close dates equal open
+    dates, so only bars such as New-York-close D1 (open 22:00 UTC) are dated differently.
+    """
+    if timeframe:
+        try:
+            return get_timeframe(timeframe).delta
+        except ValueError:
+            pass
+    return infer_bar_duration(index) if index is not None else None
+
+
 def trading_dates(index: pd.DatetimeIndex, *, fold_weekends: bool = True,
                   bar_duration: pd.Timedelta | str | None = None) -> pd.DatetimeIndex:
     """UTC trading date of each bar; Saturday/Sunday dates are moved to the next Monday.

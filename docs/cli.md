@@ -195,7 +195,7 @@ flowchart TD
 | `agents.enabled: true` and `ANTHROPIC_API_KEY` set | `desk run` | 2 |
 | `rl.params` and the env mapping build | `rl train` | 2 |
 | The runner's `LiveConfig` accepts the mapping; desk prerequisites | `live run` | 2 |
-| At least one `--grid` | `sweep` | 2 |
+| At least one `--grid`; `--strategy` resolves (a config id or name, else a registry name) and every `--grid` parameter is one the strategy declares | `sweep` | 2 |
 
 Exceptions to the "validate strictly first" rule, by design:
 
@@ -210,8 +210,6 @@ Exceptions to the "validate strictly first" rule, by design:
 - `desk replay` loads the data first, because its cost banner needs the number of bars in the
   window; the desk opt-in and the key are checked after the banner (see
   [`desk replay`](#aurum-desk-replay)).
-- `sweep` checks that its `--strategy` resolves only after loading the data (an unknown name
-  ends with `no valid grid point for strategy ...`, exit 2).
 
 ## Exit codes and error output
 
@@ -222,7 +220,7 @@ repeats them:
 |---|---|---|
 | 0 | `EXIT_OK` | Success, including `--help` and `--version`. Also `live reset-halt` when the kill switch is not engaged (nothing to reset, nothing logged). |
 | 1 | `EXIT_ERROR` | Runtime error: a missing input file (`FileNotFoundError`: no bars file, a `stress` run directory that does not exist, a run without `oos_forecasts.parquet` for `explain`, a missing `summary.json` or journal for `dashboard`), an unparseable timestamp, or any other unexpected exception. |
-| 2 | `EXIT_USAGE` | Usage or configuration error: argparse errors; any `ConfigError` (unknown key, bad value, unknown strategy or parameter, unknown `live.options` key, secret in YAML or `--set`, a missing config file); a missing run or data directory (`report`, `data info`); a refused holdout or budget argument; the desk not enabled or `ANTHROPIC_API_KEY` missing; an existing `--out`; the live runner rejecting the configuration or the desk prerequisites; a real-money account refused by the runner. **A refused `live reset-halt`** (a runner holds `runner.lock`, no state directory, no `risk_state.json`). `sweep` without `--grid`; `explain` with both `--run` and `--live` or with neither; an extension subcommand that sets no function. |
+| 2 | `EXIT_USAGE` | Usage or configuration error: argparse errors; any `ConfigError` (unknown key, bad value, unknown strategy or parameter, unknown `live.options` key (also inside `live.options.desk` and `live.options.mt5`), secret in YAML or `--set`, a missing config file); a missing run or data directory (`report`, `data info`); a refused holdout or budget argument; the desk not enabled or `ANTHROPIC_API_KEY` missing; an existing `--out`; the live runner rejecting the configuration or the desk prerequisites; a real-money account refused by the runner. **A refused `live reset-halt`** (a runner holds `runner.lock`, no state directory, no `risk_state.json`). `sweep` without `--grid`, with an unknown `--strategy` or an unknown `--grid` parameter; `explain` with both `--run` and `--live` or with neither; an extension subcommand that sets no function. |
 | 3 | `EXIT_UNAVAILABLE` | An optional component is missing: `aurum.live.runner` cannot be imported, the RL extras are not installed, `dashboard` without plotly. |
 | 4 | `EXIT_CONFIRM` | Confirmation required: `desk replay` without `--yes`; **`live reset-halt` without `--confirm RESET`**. |
 | 130 | | Interrupted with Ctrl-C (`KeyboardInterrupt`). The `live run` loop is the exception: while it runs, the runner traps SIGINT/SIGTERM, finishes the current cycle and exits normally. |
@@ -265,7 +263,7 @@ and `data info`.
 
 | Option | Type | Default | Meaning |
 |---|---|---|---|
-| `--config`, `-c` | path | required (optional for `config`, `data info`) | YAML config file (see `configs/`; `extends:` inheritance allowed). Without it, `config` and `data info` use the built-in defaults. |
+| `--config`, `-c` | path | required (optional for `config`, `data info`) | YAML config file (see `configs/`; `extends:` inheritance allowed). Without it, `config` uses the built-in defaults and `data info` reads `--dir`. |
 | `--set KEY=VALUE` | string, repeatable | none | Override one value by dotted path. Applied after `extends:` inheritance and before validation. |
 
 How `--set` works (`aurum.core.config.apply_overrides`):
@@ -370,8 +368,26 @@ usage: aurum data info [-h] [--dir DIR] [--config PATH] [--set KEY=VALUE]
 | Option | Type | Default | Meaning |
 |---|---|---|---|
 | `--dir` | path | `data_store` | Data store to inspect. Macro is read from `<dir>/macro`. Ignored when `--config` is given. |
-| `--config`, `-c` | path | none (`--dir` is used) | Use the config's `data.dir` and macro directory (`data.macro_dir` or `<data.dir>/macro`) instead. The `--help` text says "default: the built-in defaults", but without `--config` the command reads `--dir`. |
-| `--set` | `KEY=VALUE` | none | Config overrides (see above); only used together with `--config`. |
+| `--config`, `-c` | path | none (`--dir` is used) | Use the config's `data.dir` and macro directory (`data.macro_dir` or `<data.dir>/macro`) instead of `--dir`. |
+| `--set` | `KEY=VALUE` | none | Config overrides (see above); only applied together with `--config`, ignored without it. |
+
+`aurum data info --help` says the same:
+
+```text
+  --config PATH, -c PATH
+                        YAML config file (see configs/; `extends:` inheritance
+                        allowed); default: none, the --dir directory is
+                        inspected; a config's data.dir and macro directory
+                        (data.macro_dir or <data.dir>/macro) replace --dir
+  --set KEY=VALUE       override a config value by dotted path, YAML-parsed,
+                        e.g. --set walkforward.test=3M (repeatable; secrets
+                        cannot be set; only applied with --config, ignored
+                        without it)
+```
+
+So `aurum data info --set data.dir=nowhere` still lists `data_store/`, while
+`aurum data info -c configs/fast.yaml --set data.dir=nowhere` exits 2 with
+``aurum: data directory nowhere does not exist (run `aurum data download`)``.
 
 A file whose content does not match its stored hash is still listed, with
 `HASH MISMATCH (...)` in the `check` column. A missing directory exits with code 2. On a
@@ -501,12 +517,55 @@ usage: aurum backtest [-h] --config PATH [--set KEY=VALUE] [--strategy ID] [--st
 | `--end` | timestamp | `backtest.end` | Evaluation end. A date-only value includes the whole day. |
 | `--out` | path | `output.dir/backtest_<UTC>_<hash8>` | Report directory. |
 | `--jobs` | int | `walkforward.n_jobs` | Parallel workers (0 = auto). |
-| `--include-holdout` | flag | off | Also evaluate bars from `walkforward.holdout_start` on. This spends the holdout and records the look in the holdout ledger. |
-| `--no-write` | flag | off | Do not write the report directory (`output.save_results: false`). |
+| `--include-holdout` | flag | off | Also evaluate bars from `walkforward.holdout_start` on. This spends the holdout and records the look in the holdout ledger, also with `--no-write`. |
+| `--no-write` | flag | off | Do not write the report directory (`output.save_results: false`). A holdout look (`--include-holdout`) is still recorded, in `output.dir/holdout_ledger.jsonl`. |
 | `--no-tearsheet` | flag | off | Skip `tearsheet.html` (`output.tearsheet: false`). |
 
 Bars from `walkforward.holdout_start` on are dropped unless you pass `--include-holdout`. A
 `--start` inside the holdout is refused with exit 2.
+
+**Holdout looks.** A backtest that evaluates holdout bars is a look like a walk-forward's
+final evaluation: the holdout ledger is read first (looks by other configs raise the DSR
+`n_trials` and add a WARNING note), and the look is appended afterwards with
+`kind: "backtest"`. A written run uses `<out>/../holdout_ledger.jsonl` (`output.dir` for the
+default report directory). With `--no-write` the look goes to
+`output.dir/holdout_ledger.jsonl`, the same file `walkforward --no-write` uses, because the
+numbers were still shown. A backtest whose window ends before `holdout_start` records nothing.
+In the synthetic workspace, with the holdout moved into the data:
+
+```bash
+aurum backtest -c configs/fast.yaml --strategy tsmom --start 2020-06-01 --include-holdout --no-write \
+  --set walkforward.holdout_start=2020-09-01
+tail -n 1 runs/holdout_ledger.jsonl | python -m json.tool
+```
+
+The report carries the note `WARNING: the evaluation includes the holdout period (from
+2020-09-01); it is no longer an untouched holdout`, and the ledger line reads, trimmed (`...`):
+
+```text
+{
+    "config_hash": "b82f27eed9f9114c003e244386acf551de51d2d00ec5b5ca317231286cc682f6",
+    ...
+    "evaluated_end": "2020-12-11 03:00:00+00:00",
+    "evaluated_start": "2020-06-01 00:00:00+00:00",
+    ...
+    "holdout_end": "2020-12-11 03:00:00+00:00",
+    "holdout_start": "2020-09-01 00:00:00+00:00",
+    "in_sample": false,
+    "kind": "backtest",
+    ...
+    "metrics_window": "evaluated",
+    "n_holdout_bars": 1742,
+    ...
+    "run_dir": null,
+    ...
+}
+```
+
+`holdout_start`/`holdout_end` are the evaluated bars inside the holdout, `evaluated_start`/
+`evaluated_end` the whole evaluated window (whose statistics `metrics` holds), and `run_dir`
+is `null` because nothing was written. A written run records the same fields with its
+report directory.
 
 ```bash
 aurum backtest -c configs/fast.yaml --strategy tsmom --strategy macro_factor --no-write
@@ -687,8 +746,8 @@ usage: aurum sweep [-h] --config CONFIG [--set KEY=VALUE] --strategy STRATEGY
 |---|---|---|---|
 | `--config`, `-c` | path | required | YAML config: costs, sizing, research risk limits, walk-forward geometry, and the base params of the strategy when it is in `strategies`. |
 | `--set` | `KEY=VALUE`, repeatable | none | Config overrides, for example `--set data.start=2016-01-01`. |
-| `--strategy` | string | required | A config strategy id or name (its `params` are the base) or a registry name (registry defaults). |
-| `--grid` | `PARAM=V1,V2,...`, repeatable | none (at least one required, exit 2) | Grid values of one parameter, YAML-parsed. A range `a:b:step` expands inclusively when `b` falls on the step (`fast=10:40:10` is 10, 20, 30, 40). Numeric lists are sorted and de-duplicated. |
+| `--strategy` | string | required | A config strategy id or name (its `params` are the base) or a registry name (registry defaults). Checked before the data is loaded (exit 2). |
+| `--grid` | `PARAM=V1,V2,...`, repeatable | none (at least one required, exit 2) | Grid values of one parameter, YAML-parsed. `PARAM` must be one of the strategy's parameters (its `default_params`; exit 2 otherwise). A range `a:b:step` expands inclusively when `b` falls on the step (`fast=10:40:10` is 10, 20, 30, 40). Numeric lists are sorted and de-duplicated. |
 | `--metric` | string | `sharpe` | Ranking metric: any stats column (`sharpe`, `cagr`, `calmar`, `max_drawdown`, ...). Lower is better only for the `LOWER_IS_BETTER` columns. |
 | `--start` | timestamp | first bar | Research window start (inclusive). With `--single-split` it is the evaluation start instead. |
 | `--end` | timestamp | last bar | Research window end (inclusive; a date means the whole day). |
@@ -697,6 +756,23 @@ usage: aurum sweep [-h] --config CONFIG [--set KEY=VALUE] --strategy STRATEGY
 | `--executor` | `auto`, `process`, `thread`, `serial` | `auto` | How grid points run in parallel (`auto` = processes for 20k bars or more, threads otherwise). Each point runs its walk-forward serially, so results are identical across executors. |
 | `--single-split` | flag | off | One train/test split per point instead of the walk-forward (in-sample without `--start`; noted). |
 | `--no-ledger` | flag | off | Do not read or append the sweep ledger. |
+
+**Before any data is loaded**, `sweep` resolves `--strategy` the way the sweep itself does
+(a config strategy id or name first, then a registry name) and checks every `--grid`
+parameter name against that strategy's `default_params`. A typo exits 2 with one
+did-you-mean line and no data load:
+
+```text
+$ aurum sweep -c configs/fast.yaml --strategy ema_crosss --grid fast=16,32
+aurum: --strategy 'ema_crosss' is neither a strategy id/name of the config ['tsmom', 'ema_cross', 'donchian', 'zscore_fade', 'rsi2', 'macro_factor', 'intraday_seasonality'] nor a registered strategy; did you mean ['ema_cross']? (registered: ['bollinger_revert', 'donchian', 'ema_cross', 'intraday_seasonality', 'kalman_trend', 'macro_factor', 'managed_gold', 'meta_label', 'ml_gbm', 'orb', 'regime_switch', 'risk_off', 'rl_ppo', 'rsi2', 'tsmom', 'vol_squeeze', 'zscore_fade'])
+
+$ aurum sweep -c configs/fast.yaml --strategy ema_cross --grid fsat=16,32 --grid slow=64,128
+aurum: --grid: unknown parameter(s) ['fsat'] for strategy 'ema_cross' (did you mean 'fsat' -> 'fast'?); valid: ['fast', 'slow', 'vol_halflife', 'vol_min_periods']
+```
+
+Parameter **values** are still checked per point, after the data is loaded: a point the
+strategy rejects (such as `fast >= slow`) is `invalid` and not a trial, and a grid with no
+valid point ends with `no valid grid point for strategy ...` (exit 2).
 
 The holdout is never swept: the research window is cut at `walkforward.holdout_start`, at
 `--end`, and before the earliest window recorded in any `holdout_ledger.jsonl` in
@@ -1813,7 +1889,7 @@ All of these locations are git-ignored.
 | `data_store/` | `data download` | `--out`, `data.dir` |
 | `cache/dukascopy/`, `cache/macro/` | `data download` | `--cache`, `--macro-cache` |
 | `runs/walkforward_<UTC>_<hash8>/`, `runs/backtest_<UTC>_<hash8>/` | `walkforward`, `backtest`, `train-final` (its walk-forward) | `--out`, `output.dir`, `output.run_name` |
-| `runs/holdout_ledger.jsonl` | any holdout evaluation, `backtest --include-holdout`, a `desk replay` that reaches the holdout | next to the run (or replay) directory |
+| `runs/holdout_ledger.jsonl` | any holdout evaluation, `backtest --include-holdout`, a `desk replay` that reaches the holdout | next to the run (or replay) directory; `output.dir` with `--no-write` |
 | `runs/sweep_<strategy>_<UTC>/`, `runs/sweep_ledger.jsonl` | `sweep` | `--out` (the ledger goes to its parent), `output.dir` |
 | `<run>/analysis/stress/` | `stress` | `--out` |
 | `<run>/analysis/explain/`, `runs/analysis/explain_live/` | `explain --run`, `explain --live` | `--out` |

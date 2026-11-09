@@ -217,8 +217,9 @@ aurum.backtest.engine:
 
 aurum.backtest.metrics:
   compute_metrics(result_or_returns, *, bars_per_year=None, trades=None, positions=None, costs=None, equity=None, fills=None, bar_duration=None) -> dict   # all SPEC keys + n_bars, n_days, years, bars_per_year, final_equity
-  daily_returns(equity, *, initial=None, fold_weekends=True) -> Series
-  daily_equity(equity, *, fold_weekends=True); trading_dates(index, *, fold_weekends=True)
+  daily_returns(equity, *, initial=None, fold_weekends=True, bar_duration=None) -> Series   # bar_duration: date marks by bar close
+  daily_equity(equity, *, fold_weekends=True, bar_duration=None); trading_dates(index, *, fold_weekends=True, bar_duration=None)
+  infer_bar_duration(index) -> Timedelta | None; resolve_bar_duration(timeframe=None, index=None) -> Timedelta | None   # timeframe length, else modal index spacing
   drawdown_series(equity) -> Series (<=0); max_drawdown(equity); max_drawdown_duration_days(equity)
   TRADING_DAYS_PER_YEAR = 252
 
@@ -486,9 +487,11 @@ aurum.research.sweep:
   run_sweep(md, cfg, strategy_name, grid, *, metric="sharpe", maximize=None, walkforward=True, start=None, end=None,
             n_jobs=0, executor="auto", out_dir=None, write=None, ledger=None, holdout_ledgers=None,
             respect_holdout_ledgers=True, prior_trials=0, knife_edge_ratio=0.5, n_boot=None, seed=None) -> SweepResult
-    SweepResult(table, returns, best, plateau, n_trials, prior, pbo, window, notes, timing, settings, label="exploratory"; .plot(), .save(dir), .summary())
+    SweepResult(table, returns, best, plateau, n_trials, prior, pbo, window, notes, timing, settings, label="exploratory";
+      .plot(*, x=None, y=None, metric=None, mode=None), .save(dir), .summary())   # save: sweep.csv/json, returns.csv, sweep.png (+ sharpe.png)
   plateau_score(table, grid, metric="sharpe", *, maximize=None, knife_edge_ratio=0.5, plateau_ratio=0.75) -> dict
-  plot_sweep(table, grid, metric, *, maximize, x, y, best, robust, title, subtitle) -> Figure
+  plot_sweep(table, grid, metric="sharpe", *, maximize=None, x=None, y=None, best=None, robust=None, title="", subtitle="",
+             neighbourhood=True, mode=None) -> Figure
   research_window(md, cfg, *, start, end, holdout_ledgers, respect_holdout_ledgers) -> (MarketData, notes)
   parse_grid, grid_points, point_label, find_holdout_ledgers, read_sweep_ledger ; SWEEP_LEDGER, LOWER_IS_BETTER, NONPOSITIVE_METRICS
 aurum.research.montecarlo:
@@ -497,24 +500,29 @@ aurum.research.montecarlo:
   stress_run(source, *, book="combined", phase="research", n_paths, horizon, seed, mean_block, shocks, windows, price, bars,
              load_data=True, normalise=True, instrument=None) -> StressReport(.save(dir), .summary())
   stationary_bootstrap_paths(n_hist, n_paths, horizon, mean_block, rng) ; simulate_paths ; path_metrics ; drawdown_exceedance ;
-  risk_of_ruin ; fan_bands ; worst_windows ; gap_shock_table ; load_book ; parse_horizon ; plot_fan ; plot_distributions
+  risk_of_ruin ; fan_bands ; worst_windows ; gap_shock_table ; load_book ; parse_horizon
+  plot_fan(mc, *, n_sample_paths=12, title="", mode=None) -> Figure ; plot_distributions(mc, *, mode=None) -> Figure
 aurum.research.attribution:
   load_run(source, *, phase, book) -> RunData ; contributions(run) -> DataFrame
   explain_decision(source, at=None, *, phase, book, md=None, load_data=True) -> DecisionExplanation(table, sizing, risk, notes,
-    final_forecast=None, desk=None; .desk_delta, .plot(), .to_dict())
-  pnl_attribution(source, *, phase, component="net") -> PnLAttribution(per_bar, totals, by_component, by_year; .plot())
+    final_forecast=None, desk=None; .desk_delta, .plot(*, mode=None), .to_dict())
+  pnl_attribution(source, *, phase, component="net") -> PnLAttribution(per_bar, totals, by_component, by_year; .plot(*, mode=None))
   desk_journal_summary(path) -> DeskSummary(cycles, totals)
   live_decisions(state_dir | decisions.jsonl | records) -> DataFrame (one row per decision, c:<strategy> columns)
   explain_live_decision(source, at=None) -> DecisionExplanation (phase "live", with the LLM-desk step)
-  plot_waterfall(ex) ; plot_attribution(att)
+  plot_waterfall(ex, *, mode=None) -> Figure ; plot_attribution(att, *, top=7, mode=None) -> Figure
+  (every plot_* above and the .plot() methods draw with aurum.viz.style: mode "light" | "dark", None = the active
+   use_style mode, light outside one; the PNGs written by .save() and the CLI use that default)
 aurum.research.walkforward:
   record_holdout_look(output_dir, entry, *, cfg=None, md=None) -> Path | None ; data_source_kind(cfg, md) ; DATA_SOURCE_KINDS
+  book_statistics(result, *, n_trials=1, trial_sharpes=None, n_boot=1000, seed=0, bar_duration=None)   # daily returns dated by bar close (default: result.meta timeframe, else index spacing)
   prior_holdout_looks(..., data_source=None) ; run_single_backtest(..., holdout_ledger=None|path|False)
   forecast_contributions(forecasts, weights, *, fdm=None, residual=False) ; CLIP_COLUMN = "clip_adjustment"
   WalkForwardReport.strategy_keys / strategy_forecasts() / fold_weights() / fold_fdm() / bar_weights(include_fdm=True) / contributions(residual=False)
   HoldoutReport.strategy_forecasts() / contributions()
   ledger entries: + data_source, data_hash, metrics.benchmark_sharpe (strategy_sharpe excludes the benchmark)
 aurum.research.report: write_tearsheet / tearsheet_html(..., n_boot=None, seed=None) (explicit > extra["config"] > 1000/0)
+  charts drawn with the aurum.viz.style palette and chrome, one render per mode (dark_charts=True embeds the dark set)
 aurum.research (lazy): + run_sweep, plateau_score, SweepResult, monte_carlo, stress_run, MonteCarloResult, StressReport,
   explain_decision, explain_live_decision, live_decisions, pnl_attribution, desk_journal_summary, record_holdout_look,
   prior_holdout_looks, forecast_contributions
@@ -537,6 +545,7 @@ aurum.features.macro: MACRO_REQUIREMENT = "any" (macro_features.requires_macro),
 aurum.live.runner:
   LiveConfig: + desk_config (full DeskConfig mapping), heartbeat_seconds, .desk_enabled, .build_desk_config(), .heartbeat_every_seconds
   DESK_ON_ERROR = ("follow_quant", "flat", "hold") ; RunnerConfigError(ValueError) ; check_desk_prerequisites(config, *, desk, desk_client, env)
+  DESK_KEYS = ("enabled", "mode", "on_failure", "on_error", "max_abs_forecast", "min_confidence", "config")   # LiveConfig refuses any other desk key
   decisions.jsonl: + attribution {method, fdm, strategies{name: forecast, weight, contribution}, raw_combined, combined, clipped,
     unallocated, exact, final_forecast, desk_delta}, + venue_tz_confirmed (MT5) ; CycleResult.attribution
   heartbeat.json: + heartbeat_every_s, next_wake (in-sleep writes) ; broker_time may be null ; MT5_TZ_STATE_FILE = "mt5_server_tz.json"
@@ -545,7 +554,7 @@ aurum.live.mt5.MT5Broker(..., server_tz_fallback=None, tz_state_path=None, tz_re
 aurum.live.monitor: heartbeat_max_age(heartbeat_every_s, *, periods=3, grace_seconds=120) ;
   check_heartbeat(path, *, max_age_seconds=None, now=None, periods=3.0, grace_seconds=120.0)
 aurum.live (lazy runner names): + RunnerConfigError, check_desk_prerequisites, heartbeat_max_age
-aurum.viz.style: palette(mode), get_palette, use_style(mode), save_figure(fig_fn, path_stem, modes=("light","dark"), dpi=150, *, formats=("png",)),
+aurum.viz.style: palette(mode), get_palette, use_style(mode), current_mode(), save_figure(fig_fn, path_stem, modes=("light","dark"), dpi=150, *, formats=("png",)),
   figure, style_axes, add_legend, label_line_end, zero_line, shade_span, percent_axis, categorical(n<=8), series_color, sequential,
   diverging, sequential_cmap, diverging_cmap, plotly_template(mode), rc_params
 aurum.viz.dashboard: build_dashboard(run_dir, out_html=None, *, journal_dir=None, include_plotlyjs=True|"cdn"|False, title=None,

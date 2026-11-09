@@ -43,7 +43,12 @@ Protocol
    evaluated an overlapping holdout window before (holdout ledger, step 6), stationary
    bootstrap Sharpe CI (Politis & Romano 1994), PBO by CSCV over the per-strategy OOS daily
    return matrix (Bailey, Borwein, López de Prado & Zhu 2017), per-fold results, combiner
-   weights per fold and cost attribution.
+   weights per fold and cost attribution. Every equity mark is dated by its bar's CLOSE
+   (bar duration from the bars' timeframe, else ``available_at - open``; see
+   :func:`aurum.backtest.metrics.trading_dates`), the same daily series ``compute_metrics``
+   uses. For bars that do not straddle midnight (M1..H1, UTC-aligned H4/D1) this is the
+   open-time date; New-York-close D1 bars (open 21:00/22:00 UTC) get five days a week, not
+   four.
 6. **Holdout** (optional ``walkforward.holdout_start``): every bar from that timestamp on is
    physically removed from the research span (features, strategies, backtests of the folds
    never see it). After the folds, one final fit on the last training window is evaluated
@@ -102,9 +107,10 @@ import numpy as np
 import pandas as pd
 
 from aurum.backtest.engine import buy_and_hold_benchmark, run_backtest
-from aurum.backtest.metrics import daily_returns
+from aurum.backtest.metrics import daily_returns, infer_bar_duration
 from aurum.backtest.result import BacktestResult
 from aurum.core.config import AurumConfig, ConfigError, duration_to_bars
+from aurum.core.timeframes import get_timeframe
 from aurum.core.types import MarketData
 from aurum.portfolio.combiner import ForecastCombiner
 from aurum.research.splits import walk_forward_splits
@@ -611,9 +617,55 @@ def _halt_episodes(res: BacktestResult) -> int:
     return episodes
 
 
+def _timeframe_duration(tf: Any) -> pd.Timedelta | None:
+    if not tf:
+        return None
+    try:
+        return get_timeframe(tf).delta
+    except ValueError:
+        return None
+
+
+def _bars_duration(bars: pd.DataFrame | None, timeframe: Any = None) -> pd.Timedelta | None:
+    """Bar length of a run, used to date each equity mark by its bar's CLOSE in the daily
+    statistics (:func:`aurum.backtest.metrics.trading_dates`).
+
+    ``bars.attrs["timeframe"]`` (what the engine records as ``result.meta["timeframe"]``),
+    else the median ``available_at - open`` of the bars, else ``timeframe`` (the config's),
+    else the modal spacing of the index; None (open-time dates) when nothing applies. For
+    bars that do not straddle midnight (M1..H1, UTC-aligned H4/D1) the close date equals the
+    open date, so only bars such as New-York-close D1 (open 22:00 UTC) are dated differently.
+    """
+    if bars is None:
+        return _timeframe_duration(timeframe)
+    dur = _timeframe_duration(bars.attrs.get("timeframe"))
+    if dur is None and "available_at" in bars.columns and len(bars):
+        delta = pd.DatetimeIndex(pd.to_datetime(bars["available_at"], utc=True)) - pd.DatetimeIndex(bars.index)
+        med = pd.Series(delta).median()
+        if pd.notna(med) and med > pd.Timedelta(0):
+            dur = pd.Timedelta(med)
+    if dur is None:
+        dur = _timeframe_duration(timeframe)
+    if dur is None:
+        dur = infer_bar_duration(bars.index)
+    return dur
+
+
+def _result_duration(result: BacktestResult) -> pd.Timedelta | None:
+    """Bar length of a finished backtest, resolved like ``compute_metrics`` does
+    (``result.meta["timeframe"]``, else the modal spacing of the equity index)."""
+    dur = _timeframe_duration((result.meta or {}).get("timeframe"))
+    return dur if dur is not None else infer_bar_duration(result.equity.index)
+
+
 def book_statistics(result: BacktestResult, *, n_trials: int = 1, trial_sharpes: Sequence[float] | None = None,
-                    n_boot: int = 1000, seed: int = 0) -> dict[str, Any]:
+                    n_boot: int = 1000, seed: int = 0,
+                    bar_duration: pd.Timedelta | str | None = None) -> dict[str, Any]:
     """Headline statistics of one book on DAILY returns (SPEC §1).
+
+    Each equity mark is dated by its bar's CLOSE (``bar_duration``; default: resolved from
+    ``result.meta["timeframe"]`` or the index spacing, exactly as ``result.metrics`` was), so
+    ``sharpe`` and ``ann_vol``/``sortino`` describe the same daily series.
 
     * ``sharpe``/``psr``/``ci_*`` from :func:`aurum.research.stats.sharpe_summary` (Pearson
       kurtosis internally; the ``kurtosis`` reported here is Pearson, normal = 3).
@@ -630,7 +682,8 @@ def book_statistics(result: BacktestResult, *, n_trials: int = 1, trial_sharpes:
     """
     from aurum.research.stats import deflated_sharpe
 
-    dr = daily_returns(result.equity).dropna()
+    dur = bar_duration if bar_duration is not None else _result_duration(result)
+    dr = daily_returns(result.equity, bar_duration=dur).dropna()
     n_trials = max(1, int(n_trials))
     summ = sharpe_summary(dr.to_numpy(), 252.0, n_trials=n_trials, n_boot=n_boot, seed=seed) if len(dr) >= 3 else {}
     dsr_xs = math.nan
@@ -672,8 +725,11 @@ def cost_attribution(result: BacktestResult) -> dict[str, float]:
     return rec
 
 
-def _window_sharpe(equity: pd.Series, t0: pd.Timestamp, t1: pd.Timestamp) -> tuple[float, float]:
+def _window_sharpe(equity: pd.Series, t0: pd.Timestamp, t1: pd.Timestamp,
+                   bar_duration: pd.Timedelta | str | None = None) -> tuple[float, float]:
     """(annualised daily Sharpe, total return) of the decisions made at the closes of [t0, t1].
+
+    ``bar_duration`` dates the equity marks by bar close (see :func:`book_statistics`).
 
     A decision taken at the close of bar ``t`` fills at the open of ``t+1`` and earns its PnL
     over bar ``t+1`` (SPEC §1). A fold's PnL therefore runs from the equity marked at the
@@ -691,7 +747,7 @@ def _window_sharpe(equity: pd.Series, t0: pd.Timestamp, t1: pd.Timestamp) -> tup
     seg = equity.iloc[i0 + 1:min(i1 + 1, len(idx))]
     if len(seg) < 1 or not base:
         return math.nan, math.nan
-    dr = daily_returns(seg, initial=base).dropna()
+    dr = daily_returns(seg, initial=base, bar_duration=bar_duration).dropna()
     sr = sharpe(dr.to_numpy(), 252.0) if len(dr) >= 5 else math.nan
     return float(sr), float(seg.iloc[-1] / base - 1.0)
 
@@ -1459,16 +1515,19 @@ def _run_books(runner: _Runner, spec: _BookSpec, phase: str, forecasts: pd.DataF
 
 
 def _stats_table(combined: BacktestResult, books: Mapping[str, BacktestResult], bench: BacktestResult | None,
-                 n_trials: int, n_boot: int, seed: int) -> pd.DataFrame:
+                 n_trials: int, n_boot: int, seed: int,
+                 bar_duration: pd.Timedelta | str | None = None) -> pd.DataFrame:
+    dur = bar_duration if bar_duration is not None else _result_duration(combined)
     trial = []
     for r in books.values():
-        dr = daily_returns(r.equity).dropna()
+        dr = daily_returns(r.equity, bar_duration=dur).dropna()
         trial.append(sharpe(dr.to_numpy(), 252.0) if len(dr) >= 3 else math.nan)
-    rows = {_COMBINED: book_statistics(combined, n_trials=n_trials, trial_sharpes=trial, n_boot=n_boot, seed=seed)}
+    kw = {"n_boot": n_boot, "seed": seed, "bar_duration": dur}
+    rows = {_COMBINED: book_statistics(combined, n_trials=n_trials, trial_sharpes=trial, **kw)}
     for k, r in books.items():
-        rows[k] = book_statistics(r, n_trials=n_trials, trial_sharpes=trial, n_boot=n_boot, seed=seed)
+        rows[k] = book_statistics(r, n_trials=n_trials, trial_sharpes=trial, **kw)
     if bench is not None:
-        rows[_BENCHMARK] = book_statistics(bench, n_trials=1, n_boot=n_boot, seed=seed)
+        rows[_BENCHMARK] = book_statistics(bench, n_trials=1, **kw)
     return pd.DataFrame.from_dict(rows, orient="index")
 
 
@@ -1508,6 +1567,8 @@ def _run(md: MarketData, cfg: AurumConfig, strategies: dict[str, Strategy], plan
     exec_kind, n_jobs = _resolve_executor(cfg, n_research, max(n_tasks, len(strategies) + 2), heavy=heavy)
     logger.info("%s: %d strategies, %d folds, executor=%s(%d)", kind, len(strategies), len(plans), exec_kind, n_jobs)
     spec = _book_spec(cfg)
+    # daily statistics date each equity mark by its bar's close (NY-close D1: 5 days a week)
+    dur = _bars_duration(md.bars, cfg.data.timeframe)
     # DSR trials: strategy configurations evaluated in THIS run (one config x N strategies, or
     # walkforward.n_trials) + configurations evaluated before on the same holdout window
     # (holdout ledger): every earlier look is a selection opportunity the DSR must deflate.
@@ -1537,7 +1598,7 @@ def _run(md: MarketData, cfg: AurumConfig, strategies: dict[str, Strategy], plan
             hs, he = h_fc.index[0], h_fc.index[-1]
             h_comb, h_books, h_bench = _run_books(runner, spec, "holdout", h_fc, keys, hs, he,
                                                   strategies=wf.strategy_backtests, benchmark=cfg.backtest.benchmark)
-            h_stats = _stats_table(h_comb, h_books, h_bench, n_trials, wf.n_boot, cfg.seed)
+            h_stats = _stats_table(h_comb, h_books, h_bench, n_trials, wf.n_boot, cfg.seed, bar_duration=dur)
             hold_report = HoldoutReport(start=hs, end=he, combined=h_comb, strategy_results=h_books,
                                         benchmark=h_bench, stats=h_stats, weights=h_info[0]["weights"],
                                         fdm=h_info[0]["fdm"], costs=_costs_table(h_comb, h_books, h_bench),
@@ -1546,14 +1607,14 @@ def _run(md: MarketData, cfg: AurumConfig, strategies: dict[str, Strategy], plan
             timing["holdout_s"] = round(time.perf_counter() - t0, 3)
 
     t0 = time.perf_counter()
-    stats = _stats_table(comb, books, bench, n_trials, wf.n_boot, cfg.seed)
-    matrix = pd.DataFrame({k: daily_returns(r.equity) for k, r in books.items()}).dropna()
+    stats = _stats_table(comb, books, bench, n_trials, wf.n_boot, cfg.seed, bar_duration=dur)
+    matrix = pd.DataFrame({k: daily_returns(r.equity, bar_duration=dur) for k, r in books.items()}).dropna()
     pbo = _pbo(matrix, wf.pbo_splits) if len(books) >= 2 else None
     idx = md.bars.index
     fold_rows, fs_rows = [], {}
     for p, info in zip(plans, fold_info, strict=True):
         t0_, t1_ = idx[p.test_start], idx[p.test_end - 1]
-        sr, ret = _window_sharpe(comb.equity, t0_, t1_)
+        sr, ret = _window_sharpe(comb.equity, t0_, t1_, dur)
         w = info["weights"]
         fold_rows.append({
             "fold": p.key, "train_start": idx[p.train_start], "train_end": idx[p.train_end - 1],
@@ -1562,7 +1623,7 @@ def _run(md: MarketData, cfg: AurumConfig, strategies: dict[str, Strategy], plan
             "fdm": info["fdm"], "n_active": int((w > 1e-12).sum()),
             "top_weight": f"{w.idxmax()}={w.max():.2f}" if len(w) else "", "combiner_basis": info["basis"],
         })
-        fs_rows[p.key] = {k: _window_sharpe(r.equity, t0_, t1_)[0] for k, r in books.items()}
+        fs_rows[p.key] = {k: _window_sharpe(r.equity, t0_, t1_, dur)[0] for k, r in books.items()}
     folds = pd.DataFrame(fold_rows)
     fold_sharpe = pd.DataFrame.from_dict(fs_rows, orient="index")
     fold_sharpe.index.name = "fold"

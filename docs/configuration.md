@@ -170,7 +170,8 @@ flowchart TD
     I --> F["features: groups, overrides, then FeaturePipeline"]
     F --> G["strategies: every entry built from the registry"]
     G --> L["live runner: LiveConfig dry-built from the live mapping"]
-    L --> R["rl.params: rl_config_from_aurum"]
+    L --> M5["live.options.mt5: keys against the MT5Broker signature"]
+    M5 --> R["rl.params: rl_config_from_aurum"]
     R --> Rep["ValidationReport: problems, warnings, checked, skipped"]
 ```
 
@@ -208,7 +209,8 @@ and parameters get one suggestion; strategy names get up to three.
 | `backtest`, `walkforward` | Ranges and enumerations (durations parse, `pbo_splits` even and >= 2, `n_boot >= 100`, ...); see the reference tables. |
 | `agents` | `DecisionPolicy(...)` and `DeskConfig(...)` build; `replay_every >= 1`, `replay_max_cost_usd > 0`, `lookback_bars >= 2`. |
 | `live` | `live.use_desk: true` requires `agents.enabled: true`; `broker`, `magic`, `poll_seconds`, `history_bars`; `allow_live_real` with the paper broker; `live.options` may only **add** runner settings (no typed field, no typed section, no credentials; see [`live`](#live)). |
-| live runner | **Unknown `live.options` keys are problems** (with the list of keys you may add); the runner's own `LiveConfig` is dry-built from the mapping `aurum live run` would hand it, and a value it refuses (for example `heartbeat_seconds: 0` or `desk.on_error: ignore`) is a problem with `strict` and a *warning* otherwise. |
+| live runner | **Unknown `live.options` keys are problems** (with the list of keys you may add), and so are **unknown keys inside `live.options.desk`** (checked against the runner's `aurum.live.runner.DESK_KEYS`; when the closest key is one the typed config sets, the hint names that field); the runner's own `LiveConfig` is dry-built from the mapping `aurum live run` would hand it, and a value it refuses (for example `heartbeat_seconds: 0` or `desk.on_error: ignore`) is a problem with `strict` and a *warning* otherwise. |
+| `live.options.mt5` | **Every key against the keyword parameters of `aurum.live.mt5.MT5Broker`.** The signature is inspected and the broker is not built, so the Windows-only `MetaTrader5` package is not needed. An unknown key is a problem with a did-you-mean hint and the valid keys; `symbol`, `instrument`, `connect`, `mt5`, `env`, `clock` and `sleep` are refused (the runner or code sets them). *Skipped*, and listed as skipped with the unchecked keys, when `aurum.live.mt5` cannot be imported. Listed under `# checked:` only when the section has keys. Values are checked later (below). |
 | `rl` | `train_start < train_end < val_end`; `rl.params` and the environment mapping through `aurum.rl.train.rl_config_from_aurum` (when `sizing.method` is not `vol_target` and `rl.params.env.sizer` is not given, only `RLTrainConfig.from_dict(rl.params)` is checked). *Skipped*, and listed as skipped, when the RL stack cannot be imported. |
 
 ### Strict versus lenient
@@ -301,7 +303,7 @@ whose artifact does not exist yet:
 | `problems: list[str]` | Findings that make the config invalid. |
 | `warnings: list[str]` | Findings that do not (an RL artifact that does not exist yet; in lenient mode an unknown strategy name or a value the runner refuses). |
 | `checked: list[str]` | What was built from the config (the `# checked:` line). |
-| `skipped: list[str]` | Checks that could not run and why (an optional component is not installed). |
+| `skipped: list[str]` | Checks that could not run and why (an optional component is not installed, or `aurum.live.mt5` cannot be imported: then the unchecked `live.options.mt5` keys are listed). |
 | `.ok` | `True` when there are no problems. |
 | `.raise_if_problems()` | Raises `ConfigError` with every problem; returns the report otherwise. |
 
@@ -343,7 +345,7 @@ checked when the object that needs them is built:
 | Fold planning (start of `walkforward`, of every `sweep` point, and of the walk-forward `train-final` runs without `--from-run`) | Resolved `step >= test`, resolved `train >= min_train_bars`, at least one fold, a non-empty holdout. |
 | `desk run`, `desk replay` without `--fake` | `agents.enabled: true` and `ANTHROPIC_API_KEY` set (exit 2). |
 | `aurum live run`, before anything is written | The desk prerequisites when `live.use_desk` is on: the `anthropic` package and `ANTHROPIC_API_KEY`. |
-| The MT5 broker is constructed (`live run` with `broker: mt5` or `paper.data: mt5`) | The values inside `live.options.mt5` (for example `server_tz_fallback` must be a time-zone spec and needs `server_tz: auto`). `aurum config validate` does not build the broker. |
+| The MT5 broker is constructed (`live run` with `broker: mt5` or `paper.data: mt5`) | The values inside `live.options.mt5` (for example `server_tz_fallback` must be a time-zone spec and needs `server_tz: auto`). `aurum config validate` checks the keys against the broker's signature but does not build the broker. |
 | The runner starts | The account check (a real-money account needs both opt-ins), the state-directory lock, the artifact. |
 
 ## Secrets and environment variables
@@ -830,7 +832,9 @@ At load time it rejects:
   `max_abs_forecast`, `min_confidence` and `mode` and `on_failure` are rejected (they come
   from `live.use_desk` and `agents.policy`);
 - credential-looking keys (see [Secrets](#secrets-and-environment-variables));
-- **any key the runner does not know**, with a did-you-mean hint and the list below;
+- **any key the runner does not know**, with a did-you-mean hint and the list below, and
+  likewise any key inside `desk` other than `on_error` and the typed ones, and any key inside
+  `mt5` that is not an `MT5Broker` setting (both below);
 - a value the runner's own `LiveConfig` refuses (under `strict`).
 
 ```text
@@ -846,7 +850,17 @@ aurum: configuration error: 2 configuration problems:
 
 $ aurum config validate -c configs/default.yaml --set live.use_desk=true
 aurum: configuration error: live.use_desk: true requires agents.enabled: true (the LLM desk is opt-in and calls the paid Claude API; start from configs/desk_overlay.yaml, which enables both)
+
+$ aurum config validate -c configs/live_paper.yaml --set live.options.mt5.server_tzz=auto --set live.options.mt5.symbol=XAUUSD.a --set live.options.desk.on_eror=hold --set live.options.desk.max_abs_forcast=0.5
+aurum: configuration error: 4 configuration problems:
+  - live.options.desk.on_eror: unknown desk setting (did you mean 'on_error'?); valid keys: ['on_error']
+  - live.options.desk.max_abs_forcast: unknown desk setting (did you mean 'max_abs_forecast'? it is set from agents.policy.max_abs_forecast, not in live.options); valid keys: ['on_error']
+  - live.options.mt5.server_tzz: unknown MT5Broker setting (did you mean 'server_tz'?); valid keys: ['deviation_points', 'price_basis', 'requote_delay_s', 'requote_retries', 'server_tz', 'server_tz_fallback', 'tz_probe_seconds', 'tz_reprobe_seconds', 'tz_state_path']
+  - live.options.mt5.symbol: not a config setting (the runner passes live.symbol (default instrument.symbol)); valid keys: ['deviation_points', 'price_basis', 'requote_delay_s', 'requote_retries', 'server_tz', 'server_tz_fallback', 'tz_probe_seconds', 'tz_reprobe_seconds', 'tz_state_path']
 ```
+
+Before these checks a typo inside `desk` was silently ignored by the runner, and a typo
+inside `mt5` failed only when `aurum live run` constructed the broker.
 
 The keys `live.options` can add, with the runner's defaults
 (`aurum.live.runner.LiveConfig`):
@@ -865,14 +879,17 @@ The keys `live.options` can add, with the runner's defaults
 | `flatten_on_shutdown` | `false` | Must be a real boolean. |
 | `macro_refresh_hours` | `24.0` | How often the macro directory is reloaded. |
 | `macro_max_age_days` | `7.0` | A `macro_stale` warning alert (once a day) when the newest macro observation is older than this. |
-| `desk` | | The one runner setting that may be added here is `on_error`: what the runner does when the LLM desk **raises**. **Strictly** one of `follow_quant` (default), `flat`, `hold`; anything else is a configuration error. Other keys in this mapping are not read. (`desk.enabled`, set from `live.use_desk`, must be a real boolean: a quoted `"false"` no longer enables the desk.) |
+| `desk` | | The one runner setting that may be added here is `on_error`: what the runner does when the LLM desk **raises**. **Strictly** one of `follow_quant` (default), `flat`, `hold`; anything else is a configuration error. Any other key in this mapping is a configuration error too, with a did-you-mean hint that names the typed field (`live.use_desk`, `agents.policy.*`, `agents.desk`) when the closest key is one the typed config sets; the runner's own `LiveConfig` refuses keys outside `aurum.live.runner.DESK_KEYS` as well. (`desk.enabled`, set from `live.use_desk`, must be a real boolean: a quoted `"false"` no longer enables the desk.) |
 | `monitor` | | Drift and alert settings (`webhook_style`, `drift_every`, `drift_window`, `psi_warn`, `psi_alert`, `z_warn`, `z_alert`, `alert_cooldown_seconds`). |
 | `paper` | | Paper broker: `data` (`replay` or `mt5`), `bars_path`, `start`, `end`, `warmup_bars`, `initial_equity`, `hedging`. |
 | `mt5` | | `MT5Broker` keyword arguments, below. |
 | `oms` | | `OrderManager` keyword arguments (`dry_run`, `magic`, `symbol`, `state_path`, `sleep`, `broker`, `instrument`, `hedging` are reserved). |
 
-`live.options.mt5` (`aurum.live.mt5.MT5Broker`; checked when the broker is constructed, not
-by `aurum config validate`):
+`live.options.mt5` holds `aurum.live.mt5.MT5Broker` keyword arguments. `aurum config validate`
+checks the **keys** against the broker's signature (see the example above); the **values**
+are checked when the broker is constructed. The runner passes `symbol` (`live.symbol`, default
+`instrument.symbol`) and `instrument` itself, and `connect`, `mt5`, `env`, `clock` and `sleep`
+are code-level arguments, so all seven are refused here:
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -883,6 +900,8 @@ by `aurum config validate`):
 | `deviation_points` | `20` | Maximum accepted slippage for market orders, in points. |
 | `price_basis` | `bid` | MT5 bars are bid bars; `bid` converts to mid with `+spread/2`. `bid` or `mid`. |
 | `requote_retries` | `3` | Fresh-tick retries on a requote. |
+| `requote_delay_s` | `0.25` | Pause between those retries, in seconds. |
+| `tz_probe_seconds` | `5.0` | How long one probe for a fresh tick may wait (server time-zone detection). |
 
 With `server_tz: auto` and no fresh tick (market closed), the broker falls back to the zone
 persisted for the same account server, else to `server_tz_fallback`, and marks it
@@ -1082,6 +1101,17 @@ live:
       server_tz_fallback: NY+7    # assumed, UNCONFIRMED, when no tick and no saved zone
       tz_reprobe_seconds: 60
 ```
+
+Validated (from a scratch copy whose `extends:` pointed at `configs/default.yaml`), its
+`# checked:` line includes the broker keys:
+
+```text
+# checked: data, costs (CostModel), combiner (ForecastCombiner), sizing, risk.research, risk.live, backtest, walkforward, agents.policy (DecisionPolicy), agents.desk (DeskConfig), instrument (Instrument + ranges), features (FeaturePipeline, 12 groups), strategies (14 of 14 built from the registry), live runner settings (aurum.live.runner.LiveConfig), live.options.mt5 (MT5Broker keyword arguments), rl.params + env (rl_config_from_aurum)
+```
+
+Where `aurum.live.mt5` cannot be imported, the check is skipped instead and printed as
+`# skipped: live.options.mt5: aurum.live.mt5.MT5Broker cannot be inspected (...); keys not
+checked: ['server_tz', 'server_tz_fallback', 'tz_reprobe_seconds']`.
 
 **The desk in the live loop** with an explicit failure behaviour:
 

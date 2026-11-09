@@ -51,7 +51,7 @@ sequences and state machines are drawn as Mermaid diagrams.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/_assets/figures/research/dsr-null-dark.png">
-  <img src="docs/_assets/figures/research/dsr-null-light.png" alt="Left: histogram of the best annualised Sharpe among 23 simulated noise strategies over 2,346 days, centred near 0.6, with an orange line at SR0 0.643 and a dashed line at 0.094, the best trend_core book. Right: SR0 against the number of trials on a log axis for 2,346 and 1,862 days, with points at N 23 equal 0.643 and N 30 equal 0.763">
+  <img src="docs/_assets/figures/research/dsr-null-light.png" alt="Left: histogram of the best annualised Sharpe among 23 simulated noise strategies over 2,346 days, centred near 0.6, with an orange line at SR0 0.643 and a dashed line at 0.094, the best trend_core book. Right: SR0 against the number of trials on a log axis for 2,346 and 2,322 days, two nearly identical rising curves, with points at N 23 equal 0.643 and N 30 equal 0.683">
 </picture>
 
 *Why the deflated Sharpe ratio matters ([research](docs/research.md)): the best of 23 skill-less strategies over 2,346 days reaches an annualised Sharpe of about 0.64 by luck alone, far above the best `trend_core` strategy book (0.094), and the bar rises with the number of trials. Data: synthetic null (exact sampling of the Sharpe of iid normal returns, seed 23), not market data.*
@@ -90,7 +90,7 @@ sequences and state machines are drawn as Mermaid diagrams.
 | **LLM desk** | Claude CIO plus specialists (macro, quant, risk, execution) plus **ad-hoc agents created at runtime**; overlay/advisory/discretionary policies bounded by risk; JSONL audit journal; cost caps |
 | **Live** | Paper broker, MetaTrader 5 adapter (magic-number isolation, retcode handling, filling-mode fallback, persisted server time zone with orders deferred until confirmed), idempotent OMS, bar-close runner with per-decision attribution and in-sleep heartbeats, drift (PSI) and slippage monitoring, webhook alerts, `aurum live status` and a logged, confirmed `aurum live reset-halt` |
 
-About 44k lines of library code and 1,839 tests.
+About 44k lines of library code and 1,869 tests.
 
 ## Architecture
 
@@ -312,7 +312,7 @@ legacy/        the v1 Python code, kept for reference (not maintained)
 ## Testing
 
 ```bash
-pytest -m "not network and not slow"   # 1,832 tests, about 6 minutes on a 10-core machine
+pytest -m "not network and not slow"   # 1,862 tests, about 5 minutes on a 10-core machine
 ruff check aurum tests
 ```
 

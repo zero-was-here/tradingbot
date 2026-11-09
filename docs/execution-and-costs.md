@@ -947,10 +947,16 @@ numbers (NaN when a statistic is undefined).
 - **Day of an equity mark.** `equity[t]` is marked at the close of bar `t`, so each mark is
   assigned to the UTC date on which that close falls (a close at exactly 00:00 belongs to the
   previous day). The bar duration comes from `meta["timeframe"]` or the index spacing. The
-  walk-forward statistics in `stats.csv` (`book_statistics`) call `daily_returns` without a
-  bar duration and so date each mark by the bar's **open** time instead. On H1 bars the two
-  conventions give the same days; on D1 bars that open at 22:00 UTC they do not (see the note
-  under [Sharpe convention](research.md#sharpe-convention)).
+  walk-forward statistics (`stats.csv` through `book_statistics`, the per-fold Sharpes, the
+  DSR trial Sharpes and the PBO matrix) pass the run's bar duration too (the bars'
+  timeframe, else `available_at - open`), so they use the same days as `metrics.json`. On
+  H1 bars close dates and open dates are the same days; on D1 bars that open at 22:00 UTC
+  they are not, and dating by the open merges the Sunday and Monday bars (see
+  [Sharpe convention](research.md#sharpe-convention)). Every other daily-return path dates
+  by the close in the same way: the tearsheet's daily statistics, `aurum stress`, a
+  sweep's daily return matrix, the dashboard's daily equity and rolling Sharpe, and the
+  validation Sharpe printed by `aurum rl train`. They take the bar duration from the run's
+  timeframe through `aurum.backtest.metrics.resolve_bar_duration`, else the index spacing.
 - **Weekends are folded into Monday.** Gold reopens on Sunday around 22:00 UTC. Those short
   Sunday stubs (and any Saturday bars) join the following Monday instead of counting as
   near-zero "days". Days without bars are absent, not zero-return days.

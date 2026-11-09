@@ -55,7 +55,7 @@ aurum/                  the package (about 44k lines); layer diagram in architec
   viz/                  style.py (one palette for matplotlib and Plotly), dashboard.py, cli.py
   cli.py, __main__.py   the `aurum` command (cli.md)
   cli_ext.py            sweep, stress, explain and dashboard, registered into the parser
-tests/                  1,839 tests in 87 files, one or more test_<area>_*.py per module
+tests/                  1,869 tests in 90 files, one or more test_<area>_*.py per module
                         (test_v21_<area>_*.py for v2.1); conftest.py guards
 configs/                default, trend_core, fast, live_paper, desk_overlay, and the exploratory
                         d1_trend and managed_gold (configuration.md)
@@ -137,18 +137,20 @@ python -m pytest -m network                      # the two live-endpoint tests (
 python -m pytest tests/test_strategies_leakage.py -k tsmom   # one area while iterating
 ```
 
-The suite collects 1,839 tests in 87 files (`pytest --collect-only -q`); `-m "not network
-and not slow"` selects 1,832 of them and deselects the 2 network and 5 slow tests. v2.1 added
-381 tests, most of them in the `tests/test_v21_<area>_*.py` files named after the area they
-cover (`analytics`, `config_cli`, `core_fixes`, `live`, `strategies`, `viz`, plus
-`test_v21_integration.py`), and `tests/test_docs_assets.py` for the documentation. The timings
-below were measured on a 10-core Apple Silicon Mac with all extras installed: the first row on
-the v2.1 tree (2026-11-09, `-p no:cacheprovider`), the others on the v2.0 tree (1,458 tests),
+The suite collects 1,869 tests in 90 files (`pytest --collect-only`, 2026-11-09); `-m "not
+network and not slow"` selects 1,862 of them and deselects the 2 network and 5 slow tests.
+v2.1 added 411 tests, most of them in the `tests/test_v21_<area>_*.py` files named after the
+area they cover (`analytics`, `config_cli`, `core_fixes`, `live`, `strategies`, `viz`, plus
+`test_v21_integration.py`), `tests/test_docs_assets.py` for the documentation and
+`tests/test_conftest_guards.py` for the conftest guards. The timings below were measured on a
+10-core Apple Silicon Mac with all extras installed: the first row on this v2.1 tree
+(2026-11-09, `-p no:cacheprovider`, in a copy without the git-ignored `cache/`, so the one
+test that needs the local Dukascopy cache skipped), the others on the v2.0 tree (1,458 tests),
 with other jobs running at the same time. Expect different numbers on your machine.
 
 | Selection | Result | Wall time |
 |---|---|---|
-| `-m "not network and not slow"` (v2.1 tree) | 1,832 passed, 7 deselected | ~6 min |
+| `-m "not network and not slow"` (v2.1 tree) | 1,861 passed, 1 skipped, 7 deselected | ~5 min |
 | `-m "not network and not slow"` (v2.0 tree) | 1,451 passed, 7 deselected | ~14 min |
 | `-m slow` (v2.0 tree) | 4 passed, 1 skipped (the real-data audit) | ~3 min 45 s |
 | `-m network` | not run here (the INTERFACES notes put them at about 25 s, throttling included) | |
@@ -179,6 +181,17 @@ Opt-in environment variables:
   test's setup too, so module-scoped fixtures are guarded. A test that *tried* to connect
   fails even if the library caught the error and fell back silently. Loopback and Unix
   sockets still work, so local servers and process pools are fine.
+- **Nothing is written into the repository's `data_store/`**, which holds real market data on
+  a developer machine. `aurum.data.store.save_frame` and `save_bars`,
+  `aurum.data.macro.save_macro_dir` (and macro's own `save_frame` binding, which also writes
+  the Yahoo cache), `aurum.data.dukascopy.build_dataset`, `pyarrow.parquet.write_table` and
+  `pandas.DataFrame.to_parquet` are wrapped in `pytest_configure`, before collection, so a
+  test module that imports `save_bars` at the top gets the guarded writer and module-scoped
+  fixtures are covered. A write whose resolved target (relative paths against the working
+  directory, symlinks followed) is `data_store/` or inside it raises `DataStoreWriteError`
+  (a `PermissionError`) before the disk is touched, and the test fails even if the error was
+  caught. Writes to `tmp_path` and anywhere else are unaffected. Code that runs in a child
+  process is not wrapped. `tests/test_conftest_guards.py` proves each writer is refused.
 - **Headless plotting**: `MPLBACKEND=Agg` unless you set a backend.
 - **Optional dependencies** (torch, gymnasium, stable-baselines3, anthropic, yfinance,
   plotly) are handled per test with `pytest.importorskip`. The core-only install skips those
@@ -205,7 +218,7 @@ Opt-in environment variables:
 ```bash
 ruff check aurum tests          # exactly what CI runs
 ruff check aurum tests --fix    # apply the safe autofixes
-ruff check tools                # the documentation figure modules (not run by CI)
+ruff check tools docs/_hooks    # the figure modules and the MkDocs hook (the CI docs job)
 ```
 
 Settings (`pyproject.toml`): line length 110, target `py310`, rules `E`, `F`, `W`, `I`
@@ -464,9 +477,9 @@ ValueError: 9 categorical series requested; the palette has 8 fixed slot ...
 5. **Embed it** with the canonical block: one blank line before `<picture>`, the four lines
    below, one blank line, then a one-line italic caption that says what to look at and ends
    with `Data: <source>, <period>.` Alt text is plain words, without math or Markdown. Link
-   the code that draws it in the paragraph *before* the figure: the site hook copies the
-   caption into a `<figcaption>` without rewriting links that leave `docs/`, so a
-   `../tools/...` link inside a caption breaks `mkdocs build --strict`.
+   the code that draws it, in the paragraph before the figure or in the caption: the site
+   hook rewrites every link that leaves `docs/` (`../tools/...`) to a GitHub URL, inside a
+   `<figcaption>` too, so the link works on GitHub and passes `mkdocs build --strict`.
 
    ```html
    The figure below ([figure code](../tools/figures/fig_<page>.py)) shows ...
@@ -490,23 +503,27 @@ same way; everything under `docs/_assets/figures/` must come from a registered f
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on pushes to `main`, `master` and `aurum-v2`, on every pull
-request, and on manual dispatch. It has read-only repository permissions, and a newer run on
-the same ref cancels the older one. It sets `MPLBACKEND=Agg`. No job needs secrets, market
-data or the internet beyond package installation.
+`.github/workflows/ci.yml` runs on pushes to `main`, on every pull request, and on manual
+dispatch. It has read-only repository permissions, and a newer run on the same ref cancels
+the older one. It sets `MPLBACKEND=Agg`. No job needs secrets, market data or the internet
+beyond package installation.
 
 | Job | Python | Steps |
 |---|---|---|
 | `core` (45 min timeout) | 3.10, 3.12 | `pip install -e ".[dev]"` (no optional extras) → `ruff check aurum tests` → **import check** → **CLI smoke** → `pytest -m "not network and not slow" -ra --durations=15` |
+| `docs` (20 min timeout) | 3.12 | `pip install -e ".[dev,docs]"` → `ruff check tools docs/_hooks` → `python tools/figures/build.py --check` → `pytest tests/test_docs_assets.py -ra` → `mkdocs build --strict` into the runner's temporary directory |
 | `all-extras` (60 min timeout) | 3.10, 3.12 | CPU-only torch → `pip install -e ".[all]"` → the same pytest selection |
 | `min-deps` (45 min timeout) | 3.10 | `uv pip install --system --resolution lowest-direct -e ".[dev]"` (the lowest versions `pyproject.toml` allows, for example pandas 2.1) → prints the numpy/pandas/scipy/scikit-learn versions → the same pytest selection |
 
 The **import check** in `core` imports `aurum.agents`, `aurum.cli`, `aurum.live`,
 `aurum.research.walkforward` and `aurum.strategies` without the extras installed. It
-asserts that at least 15 strategies are registered, `rl_ppo` among them, and that none of
-torch, gymnasium, stable_baselines3, anthropic or yfinance was imported along the way.
-Keep optional imports lazy, inside the function that needs them. The **CLI smoke** step
-runs `aurum --help`, `aurum strategies list` and `aurum desk demo`.
+asserts that at least 17 strategies are registered (the registry has 17), `rl_ppo` among
+them, and that none of torch, gymnasium, stable_baselines3, anthropic or yfinance was
+imported along the way. Keep optional imports lazy, inside the function that needs them.
+The **CLI smoke** step runs `aurum --help`, `aurum strategies list` and `aurum desk demo`.
+The `docs` job checks the committed figure PNGs and embeds without re-rendering them, so it
+needs no `data_store/` or `runs/`; it sets `NO_MKDOCS_2_WARNING=1` only to keep Material's
+end-of-life banner out of the log.
 
 Before you push, run the same things locally:
 

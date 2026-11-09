@@ -593,8 +593,12 @@ where
 - $E_d$ is the equity at the close of the last bar of trading day $d$ (the first day is
   measured against the starting equity), from
   [`aurum.backtest.metrics.daily_returns`](execution-and-costs.md#metrics): a day is the UTC
-  date of the bar **open** time, Saturday and Sunday bars are folded into the following
-  Monday, and days without bars are absent rather than counted as zero-return days;
+  date on which the bar **closes** (open + bar duration, the duration taken from the bars'
+  timeframe or `available_at`; a close at exactly 00:00 belongs to the day that ended),
+  Saturday and Sunday bars are folded into the following Monday, and days without bars are
+  absent rather than counted as zero-return days. For bars that do not straddle midnight
+  (H1 and shorter, UTC-aligned D1) this is the date of the open; for New York close D1 bars
+  (open 22:00 UTC) it is the session date, five per week;
 - $\bar r$ and $s_r$ are the sample mean and standard deviation (`ddof=1`) of the daily
   returns, with a **zero risk-free rate**: financing is already inside the equity curve;
 - $\widehat{SR}$ is the **per-period** (daily) Sharpe that every function in
@@ -606,14 +610,9 @@ what looks like excess kurtosis. The per-bar Sharpe (`sharpe_bar`) is in each bo
 `metrics.json`; it is not the headline number.
 
 > [!NOTE]
-> **D1 bars that open at 22:00 UTC.** The walk-forward statistics date a day by the bar's
-> open time. On the New York close bars used by `configs/d1_trend.yaml` and
-> `configs/managed_gold.yaml`, the Sunday 22:00 and Monday 22:00 bars both fall on Monday,
-> so a week has four daily returns, one of them spanning two sessions. The annualised
-> Sharpe and its interval in `stats.csv` are then about 10% larger in magnitude than with
-> close-time dates, which `metrics.json` uses (buy and hold 0.514 against 0.467). PSR and
-> DSR work on per-period values and are essentially unaffected. [RESULTS.md](RESULTS.md#additional-trials-exploratory-v21)
-> shows both numbers. H1 bars are not affected.
+> Before the v2.1 fix the walk-forward statistics dated New York close D1 bars by their open
+> (four returns a week, Sharpe 10–13% too large); the exploratory D1 runs were re-run, and
+> no H1 number changed.
 
 Symbols used below: $\widehat{SR}$ is the per-period Sharpe, $T$ the number of daily
 returns, $g_3$ the skewness, $g_4$ the Pearson kurtosis (both biased sample moments,
@@ -759,10 +758,10 @@ Two variants are reported:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/research/dsr-null-dark.png">
-  <img src="_assets/figures/research/dsr-null-light.png" alt="Left: histogram of the best annualised Sharpe among 23 simulated noise strategies over 2,346 days, centred near 0.6, with an orange line at SR0 0.643 and a dashed line at 0.094, the best trend_core book. Right: SR0 against the number of trials on a log axis for 2,346 and 1,862 days, with points at N 23 equal 0.643 and N 30 equal 0.763">
+  <img src="_assets/figures/research/dsr-null-light.png" alt="Left: histogram of the best annualised Sharpe among 23 simulated noise strategies over 2,346 days, centred near 0.6, with an orange line at SR0 0.643 and a dashed line at 0.094, the best trend_core book. Right: SR0 against the number of trials on a log axis for 2,346 and 2,322 days, two nearly identical rising curves, with points at N 23 equal 0.643 and N 30 equal 0.683">
 </picture>
 
-*The best of 23 skill-less strategies over 2,346 days averages an annualised Sharpe of 0.632 (the formula gives 0.643), and every one of 20,000 simulated experiments (lowest maximum 0.116) beats the best `trend_core` strategy book, `ema_cross` at 0.094, and even the best book of the `default` run, `ema_cross` at 0.113; the bar rises with the number of trials and is higher on the shorter D1 sample (0.763 at N = 30). Data: synthetic null (exact sampling of the Sharpe of iid normal returns, seed 23), not market data.*
+*The best of 23 skill-less strategies over 2,346 days averages an annualised Sharpe of 0.632 (the formula gives 0.643), and every one of 20,000 simulated experiments (lowest maximum 0.116) beats the best `trend_core` strategy book, `ema_cross` at 0.094, and even the best book of the `default` run, `ema_cross` at 0.113; the bar rises with the number of trials (0.683 at N = 30 on the 2,322 daily returns of the D1 runs, almost the same sample length). Data: synthetic null (exact sampling of the Sharpe of iid normal returns, seed 23), not market data.*
 
 `N` is `n_trials` for the run:
 
@@ -994,7 +993,7 @@ evaluation and the write:
 | `aurum train-final` without `--from-run`, cutoff after `holdout_start` | Yes (it runs the walk-forward) | Yes (`walkforward`) |
 | `aurum train-final` with a cutoff before `holdout_start` | No (runs without a holdout, and says so) | No |
 | `aurum train-final --from-run DIR` | No new evaluation (reuses that run's forecasts) | No |
-| `aurum backtest --include-holdout` whose window reaches `holdout_start` | Yes | Yes (`backtest`), next to the run directory; with `--no-write` only a note says it was not recorded |
+| `aurum backtest --include-holdout` whose window reaches `holdout_start` | Yes | Yes (`backtest`), next to the run directory; with `--no-write` in `output.dir/holdout_ledger.jsonl` |
 | `aurum desk replay` whose window reaches `holdout_start` | Yes | Yes (`desk_replay`), in `<out>/../holdout_ledger.jsonl` (`output.dir/` by default), under the config hash plus `:desk` (`:desk-fake` with `--fake`) |
 | `record_holdout_look(output_dir, entry, cfg=...)` | Whatever you looked at | Yes (`look`, or the `kind` you pass) |
 | `run_walk_forward(...)` / `run_single_backtest(...)` with `write=False` and the default `holdout_ledger=None` | Yes | **No** (a note in the report says so); pass `holdout_ledger=PATH` to record it |
@@ -1387,7 +1386,7 @@ aurum backtest -c configs/trend_core.yaml --start 2020-01-01 --end 2021-12-31
 | `--end E` | Evaluation end; a date-only value includes that whole day. Defaults to `backtest.end`. |
 | no `--start` | **In-sample**: strategies and combiner are fitted on the evaluated period. The command prints an `IN-SAMPLE` banner before loading data, the report header says so, and the notes repeat it (example below). |
 | `--strategy ID` | Restrict to these strategy ids or names (repeatable). |
-| `--include-holdout` | Also evaluate bars from `walkforward.holdout_start` on. This spends the holdout: the ledger is read first (other configurations' looks raise `n_trials`) and a `backtest` entry is appended afterwards when the run is written. Without it, holdout bars are removed, and a `--start` inside the holdout is a configuration error (exit code 2). |
+| `--include-holdout` | Also evaluate bars from `walkforward.holdout_start` on. This spends the holdout: the ledger is read first (other configurations' looks raise `n_trials`) and a `backtest` entry is appended afterwards (next to the run directory, or in `output.dir/holdout_ledger.jsonl` with `--no-write`). Without it, holdout bars are removed, and a `--start` inside the holdout is a configuration error (exit code 2). |
 | `--out`, `--jobs`, `--no-write`, `--no-tearsheet` | As for `walkforward`. |
 
 Without `--start` (synthetic bars, `--no-write`):
@@ -1508,12 +1507,12 @@ template and [RESULTS.md](RESULTS.md) the write-up. To run your own study:
 - **`n_trials` is self-reported.** The DSR is only as honest as the count of configurations
   you tried. The ledger counts other configurations' holdout looks automatically, but not
   your exploratory runs on the research span.
-- **Remaining gaps in the ledger.** `run_walk_forward(write=False)` and
-  `run_single_backtest(write=False)` (including `aurum backtest --include-holdout --no-write`)
-  evaluate holdout bars without recording a look unless you pass a ledger path, and looks
-  taken outside Aurum are recorded only through `record_holdout_look`. An LLM desk replay
-  is recorded, but a model may have memorised historical prices; anonymisation mitigates
-  that look-ahead without removing it ([llm-desk.md](llm-desk.md)).
+- **Remaining gaps in the ledger.** In library code, `run_walk_forward(write=False)` and
+  `run_single_backtest(write=False)` evaluate holdout bars without recording a look unless
+  you pass a ledger path (the CLI's `--no-write` passes `output.dir/holdout_ledger.jsonl`),
+  and looks taken outside Aurum are recorded only through `record_holdout_look`. An LLM
+  desk replay is recorded, but a model may have memorised historical prices; anonymisation
+  mitigates that look-ahead without removing it ([llm-desk.md](llm-desk.md)).
 - **Hash granularity.** Any hashed change, including settings that do not affect research
   results (the `live`, `agents` and `rl` sections, `data.dir`), makes a new config for the
   ledger. That over-counts rather than under-counts.
@@ -1524,9 +1523,6 @@ template and [RESULTS.md](RESULTS.md) the write-up. To run your own study:
   estimate is noisy.
 - **The benchmark is not risk-matched.** Buy-and-hold runs at 1x notional and gold's own
   volatility; compare risk-adjusted numbers.
-- **Daily dating of 22:00 UTC bars.** On D1 New York close bars the reported annualised
-  Sharpe is about 10% larger in magnitude than the close-date convention would give (see
-  the note under [Sharpe convention](#sharpe-convention)).
 - **Synthetic data proves plumbing, not edge.** Synthetic runs use fallback financing
   rates and generated macro series.
 

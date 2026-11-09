@@ -143,6 +143,35 @@ def test_mkdocs_hook_converts_picture_and_protects_currency():
     assert "<figure" not in nested and "    ![An \\[example\\] figure](_assets/figures/p/x-dark.png#only-dark)" in nested
 
 
+def test_mkdocs_hook_rewrites_outside_links_in_figure_captions():
+    """A caption link that leaves docs/ becomes a GitHub URL, like any other line (mkdocs --strict
+    would otherwise fail on ``../tools/...``); links inside docs/ are left to MkDocs."""
+    hook = _load(REPO / "docs" / "_hooks" / "mkdocs_hooks.py", "aurum_docs_hooks_under_test")
+    repo = "https://github.com/o/r"
+    block = [
+        "<picture>",
+        '  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/p/x-dark.png">',
+        '  <img src="_assets/figures/p/x-light.png" alt="A figure">',
+        "</picture>",
+        "",
+        "*Costs $5 ([figure code](../tools/figures/fig_x.py#L10), [run](../runs/), [results](RESULTS.md#top)). "
+        "Data: synthetic.*",
+    ]
+    code_url = f"{repo}/blob/v2/tools/figures/fig_x.py#L10"
+    out = "\n".join(hook._convert(block, "", repo, "v2"))
+    assert (f'<figcaption markdown="span">*Costs \\$5 ([figure code]({code_url}), [run]({repo}/tree/v2/runs), '
+            "[results](RESULTS.md#top)). Data: synthetic.*</figcaption>") in out
+    assert "](../" not in out
+    # a page one level down (docs/sub/page.md) climbs two levels to leave docs/
+    sub = "\n".join(hook._convert([*block[:5], "*See [figure code](../../tools/figures/fig_x.py).*"], "sub", repo, "main"))
+    assert f"[figure code]({repo}/blob/main/tools/figures/fig_x.py)" in sub
+    # emitted as plain paragraphs inside an alert: the caption is rewritten there too
+    nested = "\n".join(hook._convert(["> [!NOTE]", ">"] + ["> " + x for x in block], "", repo, "v2"))
+    assert "<figure" not in nested and f"    *Costs \\$5 ([figure code]({code_url})," in nested
+    # without a repo_url nothing is rewritten (the same as for ordinary lines)
+    assert "](../tools/figures/fig_x.py#L10)" in "\n".join(hook._convert(block, "", "", "main"))
+
+
 def test_figure_loaders_stop_at_the_cutoff():
     with pytest.raises(C.FigureDataError):
         C.bars("D1", end="2025-01-02", synthetic=True)

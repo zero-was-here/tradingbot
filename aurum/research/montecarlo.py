@@ -63,7 +63,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from aurum.backtest.metrics import daily_returns
+from aurum.backtest.metrics import daily_returns, resolve_bar_duration
 
 logger = logging.getLogger(__name__)
 
@@ -540,7 +540,11 @@ def stress_run(source: Any, *, book: str = "combined", phase: str = "research", 
     eq = bd.equity.dropna()
     if len(eq) < 3:
         raise ValueError("the book has fewer than three equity marks")
-    dr = daily_returns(eq).dropna()
+    tf = ((bd.config or {}).get("data") or {}).get("timeframe")
+    if tf is None and hasattr(source, "meta"):
+        tf = (getattr(source, "meta", None) or {}).get("timeframe")
+    # date each mark by its bar's close (New-York-close D1 bars open 22:00 UTC the day before)
+    dr = daily_returns(eq, bar_duration=resolve_bar_duration(tf, eq.index)).dropna()
     last_eq = float(eq.iloc[-1])
     mc = monte_carlo(dr, n_paths=n_paths, horizon=horizon, mean_block=mean_block, seed=seed,
                      initial_equity=1.0 if normalise else last_eq)
@@ -605,12 +609,13 @@ def _contract(instrument: Any) -> float:
 def _gold_moves(bars: pd.DataFrame, windows: Sequence[int], lots: float, price: float, equity: float,
                 instrument: Any) -> pd.DataFrame:
     """Worst k-day close-to-close DROP and RISE of gold (daily closes) applied to ``lots``."""
-    from aurum.backtest.metrics import daily_equity
+    from aurum.backtest.metrics import daily_equity, resolve_bar_duration
     from aurum.core.instrument import XAUUSD
     from aurum.risk.var import gap_shock
 
     inst = instrument or XAUUSD
-    close = daily_equity(bars["close"].astype(float))
+    close = daily_equity(bars["close"].astype(float),
+                         bar_duration=resolve_bar_duration(bars.attrs.get("timeframe"), bars.index))
     lr = np.log(close).diff().dropna()
     rows = []
     for k in windows:

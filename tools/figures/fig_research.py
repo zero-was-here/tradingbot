@@ -427,7 +427,7 @@ def dsr_null(pal):
     """Null distribution of the best of N skill-less Sharpes, and SR0 against N."""
     cats = pal["categorical"]
     blue, orange = cats[0], cats[1]
-    t_h1, t_d1 = 2346, 1862        # daily returns in the H1 protocol runs and the D1 runs
+    t_h1, t_d1 = 2346, 2322        # daily returns in the H1 protocol runs and the D1 runs (close-dated)
     rng = np.random.default_rng(23)
     n_exp, n_trials = 20000, 23
     # exact sampling of the sample Sharpe of T iid normal returns with true SR 0:
@@ -455,7 +455,7 @@ def dsr_null(pal):
 
     n = np.unique(np.round(np.logspace(0, 3, 120)).astype(int))
     for i, (t, lab) in enumerate(((t_h1, "T = 2,346 days (H1 protocol runs)"),
-                                  (t_d1, "T = 1,862 days (D1 runs)"))):
+                                  (t_d1, "T = 2,322 days (D1 runs)"))):
         y = [expected_max_sharpe(int(k), 1.0 / (t - 1)) * math.sqrt(DAYS) for k in n]
         ax1.plot(n, y, color=cats[i], label=lab)
     for nn, t, c in ((23, t_h1, blue), (30, t_d1, orange)):
@@ -466,7 +466,7 @@ def dsr_null(pal):
     ax1.set_xscale("log")
     ax1.set_xlabel("number of trials N (log scale)")
     ax1.set_ylabel("SR0, annualised")
-    ax1.set_title("The bar rises with N and falls with T", fontsize=10.5)
+    ax1.set_title("The bar rises with the number of trials N", fontsize=10.5)
     add_legend(ax1, loc="upper left", fontsize=7.5)
     style_axes(ax1, grid="both")
     source_note(fig, "Synthetic null: 20,000 experiments, seed 23. SR0: aurum.research.stats.expected_max_sharpe, "

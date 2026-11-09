@@ -5,7 +5,8 @@ conventions when the pages are built into a site, without changing the source fi
 
 * Relative links that leave ``docs/`` (``../SPEC.md``, ``../aurum/cli.py``, ...) point at
   files that are not part of the site. They are rewritten to URLs on the GitHub repository
-  (``repo_url`` + ``extra.source_ref``), so they work in both places.
+  (``repo_url`` + ``extra.source_ref``), so they work in both places. This includes the
+  caption of a figure (``[figure code](../tools/figures/fig_x.py)``).
 * GitHub alert blocks (``> [!WARNING]`` followed by ``> ...`` lines) become admonitions.
 * ``<details><summary>...</summary> ... </details>`` blocks become collapsible
   ``pymdownx.details`` blocks, so the Markdown inside them is rendered.
@@ -76,6 +77,13 @@ def _outside_link(match: re.Match, page_dir: str, repo: str, ref: str) -> str:
     return f"{match.group(1)}{repo}/{kind}/{ref}/{path}{match.group(3) or ''}{match.group(4)}"
 
 
+def _rewrite_links(line: str, page_dir: str, repo: str, ref: str) -> str:
+    """Rewrite every relative link in ``line`` that leaves ``docs/`` to a URL on ``repo``."""
+    if not repo:
+        return line
+    return _LINK.sub(lambda mm: _outside_link(mm, page_dir, repo, ref), line)
+
+
 # ---------------------------------------------------------------------------------------
 # currency dollars
 # ---------------------------------------------------------------------------------------
@@ -127,12 +135,16 @@ def _md_alt(text: str) -> str:
     return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]").replace("\n", " ")
 
 
-def _picture(lines: list[str], i: int, page: str, nested: bool) -> tuple[list[str], int] | None:
+def _picture(lines: list[str], i: int, page: str, nested: bool, page_dir: str = "", repo: str = "",
+             ref: str = "main") -> tuple[list[str], int] | None:
     """Convert the ``<picture>`` block starting at ``lines[i]``; return (new lines, next i).
 
     At the top level the result is an unindented ``<figure markdown="span">`` (md_in_html).
     Inside alerts, ``<details>`` or any indented context md_in_html does not apply, so the two
-    images and the italic caption are emitted as plain Markdown paragraphs instead.
+    images and the italic caption are emitted as plain Markdown paragraphs instead. Every line
+    emitted gets the same treatment as an ordinary line: currency dollars in the caption are
+    escaped and links that leave ``docs/`` (``[figure code](../tools/figures/fig_x.py)``) are
+    rewritten to ``repo`` URLs.
     """
     indent = _PICTURE_OPEN.match(lines[i]).group(1)
     j = i
@@ -161,8 +173,9 @@ def _picture(lines: list[str], i: int, page: str, nested: bool) -> tuple[list[st
             caption = cm.group(1) or cm.group(2)
             k += 2
     a = _md_alt(alt)
-    images = [f"![{a}]({light}#only-light){{ loading=lazy }}", f"![{a}]({dark}#only-dark){{ loading=lazy }}"]
-    cap = f"*{_protect_dollars(caption)}*" if caption else None
+    images = [_rewrite_links(f"![{a}]({src}#only-{mode}){{ loading=lazy }}", page_dir, repo, ref)
+              for src, mode in ((light, "light"), (dark, "dark"))]
+    cap = _rewrite_links(f"*{_protect_dollars(caption)}*", page_dir, repo, ref) if caption else None
     if nested or indent:
         out = [indent + x for x in images] + ([indent.rstrip(), indent + cap] if cap else []) + [""]
     else:
@@ -230,15 +243,12 @@ def _convert(lines: list[str], page_dir: str, repo: str, ref: str, page: str = "
             i = j + 1
             continue
         if _PICTURE_OPEN.match(line):
-            converted = _picture(lines, i, page, nested)
+            converted = _picture(lines, i, page, nested, page_dir, repo, ref)
             if converted is not None:
                 new, i = converted
                 out.extend(new)
                 continue
-        line = _protect_dollars(line)
-        if repo:
-            line = _LINK.sub(lambda mm: _outside_link(mm, page_dir, repo, ref), line)
-        out.append(line)
+        out.append(_rewrite_links(_protect_dollars(line), page_dir, repo, ref))
         i += 1
     return out
 

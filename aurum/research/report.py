@@ -97,14 +97,35 @@ def _utc_index(s: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
     return out.sort_index()
 
 
-def daily_returns_from_equity(equity: pd.Series, initial_equity: float | None = None) -> pd.Series:
+def _bar_duration(timeframe: Any, index: pd.DatetimeIndex) -> pd.Timedelta | None:
+    """Bar length for close-dating the daily returns (``aurum.backtest.metrics.resolve_bar_duration``
+    when importable; else the timeframe's length, else None = open-time dates)."""
+    try:
+        from aurum.backtest.metrics import resolve_bar_duration  # noqa: PLC0415
+
+        return resolve_bar_duration(timeframe, index)
+    except ImportError:
+        pass
+    if timeframe:
+        try:
+            from aurum.core.timeframes import get_timeframe  # noqa: PLC0415
+
+            return get_timeframe(timeframe).delta
+        except (ImportError, ValueError):
+            return None
+    return None
+
+
+def daily_returns_from_equity(equity: pd.Series, initial_equity: float | None = None, *,
+                              bar_duration: pd.Timedelta | str | None = None) -> pd.Series:
     """Simple returns of end-of-UTC-day equity; the first day is measured from ``initial_equity``.
 
     Same convention as ``aurum.backtest.metrics.daily_returns`` (which is used when it is
-    importable, so the tearsheet's statistics always agree with the metrics table): days
-    are UTC dates of bar open times, Saturday/Sunday bars (gold reopens Sunday ~22:00 UTC)
-    are folded into the following Monday, and days without bars are absent rather than
-    zero-return days (which would deflate volatility and inflate the Sharpe ratio).
+    importable, so the tearsheet's statistics always agree with the metrics table): each
+    mark is dated by its bar's CLOSE when ``bar_duration`` is given (else by its open time),
+    Saturday/Sunday dates (gold reopens Sunday ~22:00 UTC) are folded into the following
+    Monday, and days without bars are absent rather than zero-return days (which would
+    deflate volatility and inflate the Sharpe ratio).
     """
     eq = _utc_index(equity.astype(float)).dropna()
     if eq.empty:
@@ -112,14 +133,17 @@ def daily_returns_from_equity(equity: pd.Series, initial_equity: float | None = 
     try:
         from aurum.backtest.metrics import daily_returns as _peer_daily  # noqa: PLC0415
 
-        r = _peer_daily(eq, initial=initial_equity)
+        r = _peer_daily(eq, initial=initial_equity, bar_duration=bar_duration)
         return r.rename("daily_return")
     except ImportError:
         pass
     except Exception:  # noqa: BLE001 - fall back to the local implementation
         logger.warning("aurum.backtest.metrics.daily_returns failed; using local version",
                        exc_info=True)
-    dates = eq.index.normalize()
+    idx = eq.index
+    if bar_duration is not None:
+        idx = idx + (pd.Timedelta(bar_duration) - pd.Timedelta(1, unit="ns"))
+    dates = idx.normalize()
     wd = dates.weekday.to_numpy()
     shift = np.where(wd == 5, 2, np.where(wd == 6, 1, 0))
     if shift.any():
@@ -1008,7 +1032,8 @@ def tearsheet_html(
     initial = _initial_equity(result)
     if not np.isfinite(initial) or initial <= 0:
         initial = float(eq.iloc[0])
-    daily = daily_returns_from_equity(eq, initial)
+    bar_dur = _bar_duration(result.meta.get("timeframe") or result.equity.attrs.get("timeframe"), eq.index)
+    daily = daily_returns_from_equity(eq, initial, bar_duration=bar_dur)
     metrics, metrics_source = _resolve_metrics(result, daily, initial)
     years = (eq.index[-1] - eq.index[0]).total_seconds() / (365.25 * 86400)
 
@@ -1040,7 +1065,7 @@ def tearsheet_html(
                        + (" versus rebased benchmark" if bench is not None else "")
                        + " on a log scale", size=(10.0, 3.6))
     if bench is not None:
-        bd = daily_returns_from_equity(bench, float(bench.iloc[0]))
+        bd = daily_returns_from_equity(bench, float(bench.iloc[0]), bar_duration=bar_dur)
         joined = pd.concat([daily.rename("s"), bd.rename("b")], axis=1).dropna()
         bstats: list[tuple[str, str]] = [
             ("Benchmark total return", _esc(_fmt(float(bench.iloc[-1] / bench.iloc[0] - 1), "total_return"))),

@@ -211,9 +211,16 @@ Rules:
   with a word.
 - Every figure needs a title, axis labels with units (`USD per ounce`, `annualised
   volatility`, `date (UTC)`, `bars`), alt text and a caption.
-- aurum's own analytics plots (`plot_fan`, `plot_waterfall`, `plot_sweep`, `research/report.py`)
-  use hard-coded light palettes. Redraw them from the returned data with these helpers. Do
-  not copy their PNGs.
+- aurum's own analytics plots draw with these helpers and take `mode="light"` or `"dark"`
+  (default: the active `use_style` mode, light outside one): `plot_sweep` and
+  `SweepResult.plot` (`aurum.research.sweep`), `plot_fan` and `plot_distributions`
+  (`aurum.research.montecarlo`), `plot_waterfall`, `plot_attribution` and the `.plot()` of
+  `DecisionExplanation` / `PnLAttribution` (`aurum.research.attribution`). Inside `draw(pal)`
+  call them with `mode=pal["mode"]` and return the figure, after relabelling axes or adding a
+  `source_note` if needed (see [fig_analytics.py](fig_analytics.py)), or redraw from the data
+  they return. The tearsheet charts of `research/report.py` use the same palette and chrome.
+  Never copy a PNG from `runs/` or a tearsheet into `docs/_assets/figures/`: `--check` refuses
+  files that no registered figure produces.
 
 ## 5. Embedding a figure
 
@@ -242,8 +249,10 @@ write the caption **on a single line** wrapped in `*...*`:
   picks the image. Inside alerts, `<details>` or indented blocks the hook emits the two images
   and the caption as plain paragraphs instead. A malformed block (missing dark `<source>`,
   `<img>` or alt text) is a warning, so `mkdocs build --strict` fails on it.
-- Link the code that draws a figure: `[figure code](../tools/figures/fig_strategies.py)` (on
-  the site, links that leave `docs/` are rewritten to GitHub).
+- Link the code that draws a figure: `[figure code](../tools/figures/fig_strategies.py)`, in
+  the paragraph before the figure or in the caption. On the site, the hook rewrites every link
+  that leaves `docs/` to a GitHub URL, the caption's included, so the link works on GitHub and
+  passes `mkdocs build --strict` on the site (`tests/test_docs_assets.py` checks the rewrite).
 - Images that cannot be drawn (a screenshot) go in `docs/_assets/static/` and are embedded
   the same way when both variants exist. Everything under `docs/_assets/figures/` must come
   from a registered figure.

@@ -104,6 +104,43 @@ def _cli_error(msg: str, code: int | None = None) -> Exception:
 # ----------------------------------------------------------------------------------------
 # sweep
 # ----------------------------------------------------------------------------------------
+def _sweep_preflight(cfg: Any, name: str, grid: dict[str, list[Any]]) -> str:
+    """Resolve ``--strategy`` and check the ``--grid`` parameter names BEFORE any data is
+    loaded, exactly as :func:`aurum.research.sweep.run_sweep` resolves them: a config strategy
+    id or name (its registry name and params are the base), else a registry name. An unknown
+    name or parameter is a usage error (exit 2) with a did-you-mean hint, reported once.
+    Returns the registry name."""
+    import difflib
+
+    from aurum.strategies.base import list_strategies
+
+    registry = list_strategies()
+    reg_name = next((s.name for s in cfg.strategies if name in (s.key, s.name)), None)
+    if reg_name is None and name in registry:
+        reg_name = name
+    if reg_name is None:
+        configured = list(dict.fromkeys([*(s.key for s in cfg.strategies), *(s.name for s in cfg.strategies)]))
+        close = difflib.get_close_matches(name, list(dict.fromkeys([*configured, *sorted(registry)])), n=3)
+        hint = f"; did you mean {close}?" if close else ""
+        raise _cli_error(f"--strategy {name!r} is neither a strategy id/name of the config {configured} nor a "
+                         f"registered strategy{hint} (registered: {sorted(registry)})")
+    cls = registry.get(reg_name)
+    if cls is None:   # a config entry whose registry name is unknown fails strict validation first
+        raise _cli_error(f"--strategy {name!r}: strategy {reg_name!r} is not registered")
+    defaults = [str(k) for k in cls.default_params()]
+    unknown = [k for k in grid if k not in defaults]
+    if unknown:
+        hints = []
+        for k in unknown:
+            close = difflib.get_close_matches(k, defaults, n=1)
+            if close:
+                hints.append(f"{k!r} -> {close[0]!r}")
+        hint = f" (did you mean {', '.join(hints)}?)" if hints else ""
+        raise _cli_error(f"--grid: unknown parameter(s) {unknown} for strategy {reg_name!r}{hint}; "
+                         f"valid: {sorted(defaults)}")
+    return reg_name
+
+
 def cmd_sweep(args: argparse.Namespace) -> int:
     from aurum.cli import EXIT_OK, _load_cfg
     from aurum.research.sweep import parse_grid, run_sweep
@@ -112,6 +149,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         raise _cli_error("sweep needs at least one --grid param=v1,v2,...")
     cfg = _load_cfg(args)
     grid = parse_grid(args.grid)
+    _sweep_preflight(cfg, args.strategy, grid)      # before the data: a typo must not cost a load
     t0 = time.perf_counter()
     md = cfg.data.load()
     print(f"loaded {len(md.bars)} {cfg.data.timeframe} bars {md.bars.index[0]} -> {md.bars.index[-1]} "

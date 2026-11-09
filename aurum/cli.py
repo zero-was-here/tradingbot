@@ -339,15 +339,17 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     print(f"loaded {len(md.bars)} {cfg.data.timeframe} bars {md.bars.index[0]} -> {md.bars.index[-1]} "
           f"({time.time() - t0:.1f}s)")
     rep = run_single_backtest(md, cfg, only=args.strategy or None, start=args.start, end=args.end,
-                              out_dir=args.out, include_holdout=args.include_holdout)
+                              out_dir=args.out, include_holdout=args.include_holdout,
+                              holdout_ledger=_cli_holdout_ledger(cfg))
     _print_report(rep.summary())
     return EXIT_OK
 
 
 def _cli_holdout_ledger(cfg: Any) -> Path | None:
-    """Holdout ledger for a CLI walk-forward: the default (next to the run directories) when
-    results are written; with ``--no-write`` the holdout is still SHOWN to a human, so the look
-    is recorded in ``output.dir/holdout_ledger.jsonl`` all the same."""
+    """Holdout ledger for a CLI walk-forward or ``backtest --include-holdout``: the default
+    (next to the run directories) when results are written; with ``--no-write`` the holdout is
+    still SHOWN to a human, so the look is recorded in ``output.dir/holdout_ledger.jsonl`` all
+    the same (a backtest that evaluates no holdout bar records nothing either way)."""
     if cfg.output.save_results:
         return None
     from aurum.research.walkforward import HOLDOUT_LEDGER
@@ -1446,13 +1448,16 @@ def cmd_live_reset_halt(args: argparse.Namespace) -> int:
 _EXECUTORS = ["auto", "process", "thread", "serial"]
 
 
-def _add_config(p: argparse.ArgumentParser, *, required: bool = True) -> None:
+def _add_config(p: argparse.ArgumentParser, *, required: bool = True, default: str = "the built-in defaults",
+                set_note: str = "") -> None:
+    """``--config``/``--set``. ``default`` describes what an optional command does without
+    ``--config``; ``set_note`` is appended to the ``--set`` help."""
     p.add_argument("--config", "-c", required=required, metavar="PATH",
                    help="YAML config file (see configs/; `extends:` inheritance allowed)"
-                        + ("" if required else "; default: the built-in defaults"))
+                        + ("" if required else f"; default: {default}"))
     p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                    help="override a config value by dotted path, YAML-parsed, e.g. --set walkforward.test=3M "
-                        "(repeatable; secrets cannot be set)")
+                        "(repeatable; secrets cannot be set" + (f"; {set_note}" if set_note else "") + ")")
 
 
 class _GuardedSubparsers:
@@ -1560,7 +1565,10 @@ def build_parser() -> argparse.ArgumentParser:
     di = dsub.add_parser("info", help="summarise bar files and macro series")
     di.add_argument("--dir", default="data_store", metavar="DIR",
                     help="data store to inspect (default: data_store; ignored with --config)")
-    _add_config(di, required=False)
+    _add_config(di, required=False,
+                default="none, the --dir directory is inspected; a config's data.dir and macro directory "
+                        "(data.macro_dir or <data.dir>/macro) replace --dir",
+                set_note="only applied with --config, ignored without it")
     di.set_defaults(func=cmd_data_info)
 
     # config
@@ -1584,7 +1592,9 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--jobs", type=int, default=None, metavar="N", help="parallel workers (0 = auto)")
     bt.add_argument("--include-holdout", action="store_true",
                     help="also evaluate bars after walkforward.holdout_start (spends the holdout)")
-    bt.add_argument("--no-write", action="store_true", help="do not write the report directory")
+    bt.add_argument("--no-write", action="store_true",
+                    help="do not write the report directory (an --include-holdout look is still recorded in "
+                         "the ledger)")
     bt.add_argument("--no-tearsheet", action="store_true", help="do not write tearsheet.html")
     bt.set_defaults(func=cmd_backtest)
 

@@ -234,10 +234,18 @@ def load_desk_journal(journal_dir: str | Path) -> pd.DataFrame:
 # =======================================================================================
 # series helpers
 # =======================================================================================
+def _bar_duration(ts: pd.DataFrame) -> pd.Timedelta | None:
+    """Bar length of a book's timeseries, so each mark is dated by its bar's CLOSE (as in the
+    run's own statistics; New-York-close D1 bars open at 22:00 UTC the day before)."""
+    from aurum.backtest.metrics import resolve_bar_duration
+
+    return resolve_bar_duration(ts.attrs.get("timeframe"), ts.index)
+
+
 def _daily_equity(ts: pd.DataFrame) -> pd.Series:
     from aurum.backtest.metrics import daily_equity
 
-    eq = daily_equity(ts["equity"])
+    eq = daily_equity(ts["equity"], bar_duration=_bar_duration(ts))
     eq.index = pd.DatetimeIndex(eq.index)
     return eq
 
@@ -245,7 +253,7 @@ def _daily_equity(ts: pd.DataFrame) -> pd.Series:
 def _daily_returns(ts: pd.DataFrame) -> pd.Series:
     from aurum.backtest.metrics import daily_returns
 
-    r = daily_returns(ts["equity"])
+    r = daily_returns(ts["equity"], bar_duration=_bar_duration(ts))
     r.index = pd.DatetimeIndex(r.index)
     return r
 

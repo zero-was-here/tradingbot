@@ -786,7 +786,7 @@ with `p_flat` 0.5 and `p_full` 0.9 (`regime_scale` in
 [strategies.md](strategies.md)). Each daily probability becomes usable at that day's
 `available_at` and is joined onto the trading bars with `asof_join`. In the exploratory D1 run
 `runs/v21_managed_gold` (OOS 2016-01-03 to 2024-12-30, data to 2024 only), `regime_switch` had
-a Sharpe of 0.141 (95% CI −0.594 to 0.836) against −0.366 for plain daily `tsmom`. Its maximum
+a Sharpe of 0.124 (95% CI −0.542 to 0.766) against −0.325 for plain daily `tsmom`. Its maximum
 drawdown was −9.7% against −17.1%, and it paid 7,021 against 2,979 in costs. Read
 [RESULTS.md](RESULTS.md) before drawing any conclusion: no confidence interval excludes zero.
 

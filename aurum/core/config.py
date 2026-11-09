@@ -20,8 +20,10 @@ the dataclass tree with strict checking:
   every ``strategies[]`` entry through the strategy registry with its params (unknown
   parameter -> error), ``ForecastCombiner``, the sizer, both ``RiskLimits``,
   ``DecisionPolicy``, ``DeskConfig``, the live runner's own ``LiveConfig`` dry-built from the
-  mapping ``aurum live run`` would hand it (unknown ``live.options`` keys -> error; values the
-  runner refuses -> error when strict, warning otherwise) and
+  mapping ``aurum live run`` would hand it (unknown ``live.options`` keys and unknown keys in
+  ``live.options.desk`` -> error; values the runner refuses -> error when strict, warning
+  otherwise), the ``live.options.mt5`` keys against ``MT5Broker``'s signature (inspected,
+  never constructed; skipped and listed when ``aurum.live.mt5`` cannot be imported) and
   ``rl.params`` through ``aurum.rl.train.rl_config_from_aurum`` (skipped, and listed as
   skipped, when the optional RL stack cannot be imported). A strategy NAME missing from the
   registry is a warning at library load time (user code may register a custom strategy
@@ -1271,6 +1273,7 @@ def _semantic_report(cfg: AurumConfig, *, strict: bool = False) -> ValidationRep
     _check_features(cfg.features, rep)
     _check_strategies(cfg, rep, strict=strict)
     _check_live(cfg, rep, strict=strict)
+    _check_mt5(cfg, rep)
     _check_rl(cfg, rep)
     return rep
 
@@ -1598,12 +1601,43 @@ def _check_strategies(cfg: AurumConfig, rep: ValidationReport, *, strict: bool) 
 _LIVE_OVERLAP = ("data.timeframe", "live.", "backtest.", "agents.desk")
 
 
+#: where the typed config sets each key of the runner's ``desk`` mapping (``live.options.desk``
+#: may only add the runner's other desk keys, today ``on_error``)
+_DESK_TYPED_SOURCE: dict[str, str] = {"enabled": "live.use_desk", "mode": "agents.policy.mode",
+                                      "on_failure": "agents.policy.on_failure",
+                                      "max_abs_forecast": "agents.policy.max_abs_forecast",
+                                      "min_confidence": "agents.policy.min_confidence", "config": "agents.desk"}
+
+
+def _desk_option_problems(desk_opts: Mapping[str, Any], desk_keys: Sequence[str],
+                          base_desk: Mapping[str, Any]) -> list[str]:
+    """Keys of ``live.options.desk`` the runner's ``desk`` section does not have (it would
+    ignore them silently): a did-you-mean hint, pointing to the typed field when the closest
+    key is one the typed config sets, and the keys that may be added here."""
+    addable = sorted(k for k in desk_keys if k not in base_desk and ("desk", k) not in _LIVE_TYPED_NESTED)
+    out: list[str] = []
+    for k in desk_opts:
+        if k in desk_keys:
+            continue
+        close = difflib.get_close_matches(str(k), [str(d) for d in desk_keys], n=1)
+        if close and close[0] in addable:
+            hint = f" (did you mean {close[0]!r}?)"
+        elif close:
+            hint = (f" (did you mean {close[0]!r}? it is set from "
+                    f"{_DESK_TYPED_SOURCE.get(close[0], 'the typed config')}, not in live.options)")
+        else:
+            hint = ""
+        out.append(f"live.options.desk.{k}: unknown desk setting{hint}; valid keys: {addable}")
+    return out
+
+
 def _check_live(cfg: AurumConfig, rep: ValidationReport, *, strict: bool) -> None:
     """Dry-build :class:`aurum.live.runner.LiveConfig` from the mapping ``aurum live run``
-    would hand it. Unknown ``live.options`` keys are always problems; a value the runner's
-    own ``LiveConfig`` refuses is a problem when ``strict`` (CLI, ``aurum config validate``)
-    and a warning otherwise: the runner refuses it again when it starts, so a lenient library
-    load never weakens that guard, it only reports it later."""
+    would hand it. Unknown ``live.options`` keys, and unknown keys inside
+    ``live.options.desk`` (checked against the runner's ``DESK_KEYS``), are always problems; a
+    value the runner's own ``LiveConfig`` refuses is a problem when ``strict`` (CLI,
+    ``aurum config validate``) and a warning otherwise: the runner refuses it again when it
+    starts, so a lenient library load never weakens that guard, it only reports it later."""
     core = list(rep.problems)
     try:
         runner = importlib.import_module("aurum.live.runner")
@@ -1624,8 +1658,19 @@ def _check_live(cfg: AurumConfig, rep: ValidationReport, *, strict: bool) -> Non
         if k not in known:
             rep.problems.append(f"live.options.{k}: unknown live-runner setting{_did_you_mean(str(k), addable)}; "
                                 f"valid keys: {addable}")
+    desk_opts = opts.get("desk") if "desk" in known else None
+    desk_keys = getattr(runner, "DESK_KEYS", None)
+    if isinstance(desk_opts, Mapping) and desk_opts:
+        if desk_keys is None:
+            rep.skipped.append(f"live.options.desk keys: aurum.live.runner exposes no DESK_KEYS; not checked: "
+                               f"{sorted(str(k) for k in desk_opts)}")
+        else:
+            base_desk = base.get("desk") if isinstance(base.get("desk"), Mapping) else {}
+            rep.problems.extend(_desk_option_problems(desk_opts, tuple(desk_keys), base_desk))
     if not any(pr.startswith(_LIVE_OVERLAP) for pr in core):
         extra = {k: v for k, v in opts.items() if k in known and k not in _LIVE_TYPED_SECTIONS}
+        if desk_keys is not None and isinstance(extra.get("desk"), Mapping):   # reported above, not twice
+            extra["desk"] = {k: v for k, v in extra["desk"].items() if k in desk_keys}
         try:
             live_cls.from_mapping(_deep_merge(base, copy.deepcopy(extra)))
         except (TypeError, ValueError) as exc:
@@ -1633,6 +1678,57 @@ def _check_live(cfg: AurumConfig, rep: ValidationReport, *, strict: bool) -> Non
             (rep.problems if strict else rep.warnings).append(
                 msg if strict else f"{msg} (aurum.live.runner refuses this configuration when it starts)")
     rep.checked.append("live runner settings (aurum.live.runner.LiveConfig)")
+
+
+#: ``MT5Broker`` parameters ``live.options.mt5`` must not set, and why: the runner passes the
+#: symbol and the instrument itself, ``connect: false`` would skip the venue checks made on
+#: connecting, and the rest are code-level injections (``env`` is also caught as a credential)
+_MT5_RESERVED: dict[str, str] = {
+    "symbol": "the runner passes live.symbol (default instrument.symbol)",
+    "instrument": "the runner passes the instrument section",
+    "connect": "the runner's broker always connects, which checks the venue's contract and time zone",
+    "mt5": "a code-level injection (tests), not a config setting",
+    "env": "credentials come from the environment only",
+    "clock": "a code-level injection (tests), not a config setting",
+    "sleep": "a code-level injection (tests), not a config setting",
+}
+
+
+def _check_mt5(cfg: AurumConfig, rep: ValidationReport) -> None:
+    """``live.options.mt5`` keys against the keyword parameters of
+    :class:`aurum.live.mt5.MT5Broker` (the runner passes the section as ``**kwargs``, so a typo
+    would otherwise fail only when the broker is constructed). The class signature is
+    inspected, never called: ``aurum.live.mt5`` imports the Windows-only ``MetaTrader5``
+    package lazily, on connect. Skipped, and listed with the unchecked keys, when the module
+    cannot be imported. Values are still checked when the broker is built. Nothing is
+    reported or listed when the section is empty."""
+    opts = cfg.live.options if isinstance(cfg.live.options, Mapping) else {}
+    mt5_opts = opts.get("mt5")
+    if not isinstance(mt5_opts, Mapping) or not mt5_opts:
+        return                                   # a non-mapping is reported by the runner check
+    keys = [str(k) for k in mt5_opts]
+    try:
+        broker_cls = importlib.import_module("aurum.live.mt5").MT5Broker
+        params = list(inspect.signature(broker_cls.__init__).parameters.values())[1:]
+    except (ImportError, AttributeError, TypeError, ValueError) as exc:
+        rep.skipped.append(f"live.options.mt5: aurum.live.mt5.MT5Broker cannot be inspected ({_exc_text(exc)}); "
+                           f"keys not checked: {sorted(keys)}")
+        return
+    if any(q.kind is inspect.Parameter.VAR_KEYWORD for q in params):
+        rep.skipped.append(f"live.options.mt5: MT5Broker accepts **kwargs; keys not checked: {sorted(keys)}")
+        return
+    names = {q.name for q in params
+             if q.kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)}
+    valid = sorted(names - set(_MT5_RESERVED))
+    for k in keys:
+        if _SECRET_KEY_RE.search(k):
+            continue                             # reported as a credential by the core checks
+        where = f"live.options.mt5.{k}"
+        if k in _MT5_RESERVED:
+            rep.problems.append(f"{where}: not a config setting ({_MT5_RESERVED[k]}); valid keys: {valid}")
+        elif k not in names:
+            rep.problems.append(f"{where}: unknown MT5Broker setting{_did_you_mean(k, valid)}; valid keys: {valid}")
+    rep.checked.append("live.options.mt5 (MT5Broker keyword arguments)")
 
 
 def _check_rl(cfg: AurumConfig, rep: ValidationReport) -> None:

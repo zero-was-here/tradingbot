@@ -228,8 +228,13 @@ bars), 18 folds, embargo 1 bar; OOS from the 2016-01-04 session to the 2024-12-3
 (2,322 bars). Costs, financing (Fed funds + 2.5%), sizing (10% vol target), combiner and
 research risk limits are those of the protocol (`configs/d1_trend.yaml` extends
 `default.yaml`). The new strategies, `managed_gold` and `regime_switch`, are described on
-[strategies.md](strategies.md). **Provenance:** git `39c33b4` plus the uncommitted v2.1
-working tree (`git_dirty: true`), D1 data hash `b13ae1067193`, pandas 3.0.6, numpy 2.5.3.
+[strategies.md](strategies.md). Daily statistics date each equity mark by its bar's close:
+one return per session, 2,322 in all and five in 444 of the 470 weeks. The first v2.1 runs
+dated these 22:00 UTC bars by their open, which merged the Sunday and Monday bars (1,862
+returns, mostly four a week) and made the Sharpes 10–13% too large in magnitude; v2.1 fixed
+the walk-forward statistics and re-ran both configs. **Provenance:** git `ec0a0f4` plus the
+uncommitted v2.1 working tree (`git_dirty: true`), D1 data hash `b13ae1067193`, pandas 3.0.6,
+numpy 2.5.3.
 
 ### Daily trend following: `d1_trend`
 
@@ -238,13 +243,13 @@ a 55/20-day `donchian` channel.
 
 | Book | Sharpe | 95% CI | DSR | CAGR | Vol | Max DD | Trades |
 |---|---|---|---|---|---|---|---|
-| **Combined** | **−0.29** | [−0.98, 0.38] | 0.002 | −1.1% | 3.9% | −14.1% | 60 |
-| tsmom | −0.37 | [−1.08, 0.33] | 0.001 | −1.5% | 4.4% | −17.1% | 128 |
-| ema_cross | −0.20 | [−0.88, 0.52] | 0.004 | −1.0% | 4.8% | −15.7% | 43 |
-| donchian | −0.29 | [−0.98, 0.40] | 0.002 | −1.2% | 4.1% | −16.5% | 37 |
-| *Buy & hold (with financing)* | *0.51* | *[−0.22, 1.21]* | *0.919* | *6.6%* | *16.3%* | *−30.5%* | |
+| **Combined** | **−0.26** | [−0.88, 0.32] | 0.002 | −1.1% | 3.9% | −14.1% | 60 |
+| tsmom | −0.32 | [−0.85, 0.13] | 0.001 | −1.5% | 4.4% | −17.1% | 128 |
+| ema_cross | −0.18 | [−0.82, 0.47] | 0.004 | −1.0% | 4.8% | −15.7% | 43 |
+| donchian | −0.26 | [−0.87, 0.37] | 0.002 | −1.2% | 4.1% | −16.5% | 37 |
+| *Buy & hold (with financing)* | *0.47* | *[−0.23, 1.17]* | *0.921* | *6.6%* | *16.3%* | *−30.5%* | |
 
-PBO is 0.62, and the probability that the in-sample best strategy loses OOS is 0.92. In 6
+PBO is 0.61, and the probability that the in-sample best strategy loses OOS is 0.93. In 6
 of the 18 folds (4 and 13 to 17) no strategy had a positive net Sharpe on the earlier OOS
 history, so the combiner held the whole book flat; the combined book also had 2 research
 risk-halt episodes (the daily-loss limit, in the 2020-02-28 and 2020-08-11 sessions). Daily monthly-horizon
@@ -258,19 +263,19 @@ regime) and the same daily `tsmom` as a control.
 
 | Book | Sharpe | 95% CI | DSR | CAGR | Vol | Max DD | Trades |
 |---|---|---|---|---|---|---|---|
-| **Combined** | **0.12** | [−0.63, 0.76] | 0.040 | 0.4% | 4.5% | −10.7% | 79 |
-| managed_gold | 0.19 | [−0.54, 0.88] | 0.061 | 0.9% | 6.4% | −14.5% | 24 |
-| regime_switch | 0.14 | [−0.59, 0.84] | 0.045 | 0.5% | 4.3% | −9.7% | 289 |
-| tsmom (daily, as above) | −0.37 | [−1.08, 0.33] | 0.001 | −1.5% | 4.4% | −17.1% | 128 |
-| *Buy & hold (with financing)* | *0.51* | *[−0.22, 1.21]* | *0.919* | *6.6%* | *16.3%* | *−30.5%* | |
+| **Combined** | **0.11** | [−0.58, 0.72] | 0.040 | 0.4% | 4.5% | −10.7% | 79 |
+| managed_gold | 0.17 | [−0.52, 0.84] | 0.062 | 0.9% | 6.4% | −14.5% | 24 |
+| regime_switch | 0.12 | [−0.54, 0.77] | 0.045 | 0.5% | 4.3% | −9.7% | 289 |
+| tsmom (daily, as above) | −0.32 | [−0.85, 0.13] | 0.001 | −1.5% | 4.4% | −17.1% | 128 |
+| *Buy & hold (with financing)* | *0.47* | *[−0.23, 1.17]* | *0.921* | *6.6%* | *16.3%* | *−30.5%* | |
 
-PBO is 0.82; the probability that the in-sample best strategy loses OOS is 0.39.
+PBO is 0.84; the probability that the in-sample best strategy loses OOS is 0.40.
 
 - `managed_gold` held an average forecast of 0.62 and was de-risked on 3.2% of the OOS days
   (5.4% over all of 2013–2024, mostly in 2014, 2015, 2018 and 2022). It did **not** beat
-  buy and hold on a risk-adjusted basis: Sharpe 0.19 against 0.51, and a drawdown of 2.3
+  buy and hold on a risk-adjusted basis: Sharpe 0.17 against 0.47, and a drawdown of 2.3
   times its volatility against 1.9 times for buy and hold.
-- The HMM filter turned daily `tsmom` from −0.37 to +0.14 and cut its maximum drawdown from
+- The HMM filter turned daily `tsmom` from −0.32 to +0.12 and cut its maximum drawdown from
   −17.1% to −9.7%, at 2.4 times the trading costs (7.0k against 3.0k USD).
 
 <picture>
@@ -345,48 +350,10 @@ costs already inside the returns.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/results/forest-exploratory-dark.png">
-  <img src="_assets/figures/results/forest-exploratory-light.png" alt="Forest plot of the exploratory trials in three groups, d1_trend, managed_gold and the ema_cross sweep: each book's Sharpe as a dot with a 95 percent interval and its DSR on the right; every interval crosses zero, the highest DSR among the trials is 0.192 for the sweep's 16/64 point, and buy and hold reaches 0.51">
+  <img src="_assets/figures/results/forest-exploratory-light.png" alt="Forest plot of the exploratory trials in three groups, d1_trend, managed_gold and the ema_cross sweep: each book's Sharpe as a dot with a 95 percent interval and its DSR on the right; every interval crosses zero, the highest DSR among the trials is 0.192 for the sweep's 16/64 point, and buy and hold reaches 0.47">
 </picture>
 
-*Every interval includes zero; the best DSR is the sweep's 16/64 point at 0.192 with only its own 8 trials counted (0.056 with all 38), and the best daily book is `managed_gold` at 0.061. Data: stats.csv of runs/v21_d1_trend and runs/v21_managed_gold (n_trials 30), sweep.csv and returns.csv of runs/v21_demo/sweep_ema_cross (DSR recomputed with N = 8, matching its sweep.json); exploratory.*
-
-### A caveat on the daily-bar Sharpe ratios
-
-The walk-forward statistics date each day by the bar's open time. A New York close bar
-opens at 22:00 UTC, so the Sunday and Monday bars both fall on Monday and a week has four
-daily returns instead of five. Annualised with $\sqrt{252}$, the D1 Sharpes and intervals
-in the two tables above are about 10% larger in magnitude than with close-time dates (which
-the books' `metrics.json` use). PSR and DSR are computed on per-period values and barely
-move (for `managed_gold`, DSR 0.061 either way to two significant figures). Recomputed from
-the runs' equity curves:
-
-```python
-import numpy as np
-import pandas as pd
-from aurum.backtest.metrics import daily_returns
-
-for run, book in [("v21_d1_trend", "combined"), ("v21_managed_gold", "combined"),
-                  ("v21_managed_gold", "managed_gold"), ("v21_managed_gold", "benchmark")]:
-    eq = pd.read_parquet(f"runs/{run}/books/{book}/timeseries.parquet")["equity"]
-    for label, r in (("open date (reported)", daily_returns(eq)),
-                     ("close date", daily_returns(eq, bar_duration="1D"))):
-        r = r.dropna()
-        print(f"{run:<17} {book:<13} {label:<21} {len(r):>5} days  Sharpe {r.mean() / r.std() * np.sqrt(252):+.3f}")
-```
-
-```text
-v21_d1_trend      combined      open date (reported)   1862 days  Sharpe -0.293
-v21_d1_trend      combined      close date             2322 days  Sharpe -0.263
-v21_managed_gold  combined      open date (reported)   1862 days  Sharpe +0.118
-v21_managed_gold  combined      close date             2322 days  Sharpe +0.106
-v21_managed_gold  managed_gold  open date (reported)   1862 days  Sharpe +0.193
-v21_managed_gold  managed_gold  close date             2322 days  Sharpe +0.174
-v21_managed_gold  benchmark     open date (reported)   1862 days  Sharpe +0.514
-v21_managed_gold  benchmark     close date             2322 days  Sharpe +0.467
-```
-
-With close-time dates buy and hold's 0.467 matches the H1 runs' 0.463 over the same years.
-The H1 protocol numbers are not affected.
+*Every interval includes zero; the best DSR is the sweep's 16/64 point at 0.192 with only its own 8 trials counted (0.056 with all 38), and the best daily book is `managed_gold` at 0.062. Data: stats.csv of runs/v21_d1_trend and runs/v21_managed_gold (n_trials 30), sweep.csv and returns.csv of runs/v21_demo/sweep_ema_cross (DSR recomputed with N = 8, matching its sweep.json); exploratory.*
 
 ### Verdict on the additional trials
 

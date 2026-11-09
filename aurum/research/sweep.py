@@ -73,7 +73,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from aurum.backtest.metrics import daily_returns
+from aurum.backtest.metrics import daily_returns, resolve_bar_duration
 from aurum.core.config import AurumConfig, ConfigError, config_from_dict
 from aurum.core.types import MarketData
 
@@ -459,7 +459,9 @@ def _evaluate_point(label: str, cfg_dict: dict[str, Any], walkforward: bool, sta
     else:
         rep = run_single_backtest(md, cfg, start=start, write=False)
     row = {k: _py(v) for k, v in rep.stats.loc[_BOOK].to_dict().items()}
-    dr = daily_returns(rep.combined.equity).dropna()
+    comb = rep.combined
+    dr = daily_returns(comb.equity, bar_duration=resolve_bar_duration((comb.meta or {}).get("timeframe"),
+                                                                     comb.equity.index)).dropna()
     oos = rep.oos_forecasts.index
     return {"label": label, "row": row, "daily": dr, "n_folds": len(rep.folds),
             "oos_start": str(oos[0]) if len(oos) else None, "oos_end": str(oos[-1]) if len(oos) else None,

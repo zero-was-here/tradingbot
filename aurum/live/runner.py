@@ -193,6 +193,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ARTIFACT_FORMAT",
     "ARTIFACT_VERSION",
+    "DESK_KEYS",
     "DESK_ON_ERROR",
     "ArtifactError",
     "CycleResult",
@@ -505,6 +506,9 @@ _OMS_RESERVED = ("dry_run", "magic", "symbol", "state_path", "sleep", "broker", 
 #: what the runner does when the LLM desk RAISES (``desk.on_error``); a typo must not silently
 #: become a third behaviour
 DESK_ON_ERROR = ("follow_quant", "flat", "hold")
+#: every key the ``desk`` section may hold (the runner reads nothing else from it, so any other
+#: key would be silently ignored: it is refused instead)
+DESK_KEYS = ("enabled", "mode", "on_failure", "on_error", "max_abs_forecast", "min_confidence", "config")
 
 
 class RunnerConfigError(ValueError):
@@ -560,7 +564,7 @@ class LiveConfig:
     paper broker and the slippage monitor), ``desk`` (``enabled`` (a real boolean),
     ``mode``, ``on_failure``, ``on_error`` (one of :data:`DESK_ON_ERROR`, checked strictly),
     ``max_abs_forecast``, ``min_confidence``, ``config`` = flat DeskConfig kwargs, kept for
-    backward compatibility), ``desk_config`` (the FULL
+    backward compatibility; :data:`DESK_KEYS`, any other key raises), ``desk_config`` (the FULL
     :class:`~aurum.agents.config.DeskConfig` as a mapping, nested ``chief``/``specialist``/
     ``role_models``/``prices`` included — see :meth:`build_desk_config`),
     ``monitor`` (``webhook``, ``webhook_style``, ``drift_every``, ``drift_window``,
@@ -653,6 +657,13 @@ class LiveConfig:
 
     def _validate_desk(self) -> None:
         dc = self.desk
+        unknown = sorted(str(k) for k in dc if k not in DESK_KEYS)
+        if unknown:
+            import difflib
+
+            hints = [f"{k!r} -> {c[0]!r}" for k in unknown if (c := difflib.get_close_matches(k, DESK_KEYS, n=1))]
+            raise ValueError(f"desk: unknown key(s) {unknown}" + (f" (did you mean {', '.join(hints)}?)" if hints else "")
+                             + f"; valid keys: {list(DESK_KEYS)}")
         if "enabled" in dc and dc["enabled"] is not None:
             _strict_bool("desk.enabled", dc["enabled"])
         on_error = dc.get("on_error")
