@@ -978,6 +978,25 @@ def _prepare_benchmark(benchmark: Any, eq: pd.Series) -> pd.Series | None:
     return aligned / aligned.iloc[0] * float(eq.loc[first])
 
 
+#: bootstrap defaults when neither an argument nor ``extra["config"]`` sets them
+DEFAULT_N_BOOT = 1000
+DEFAULT_SEED = 0
+
+
+def _bootstrap_settings(config: Any, n_boot: int | None, seed: int | None) -> tuple[int, int]:
+    """(n_boot, seed): explicit arguments, else ``walkforward.n_boot`` / ``seed`` of a config
+    dict (``AurumConfig.to_dict()``), else :data:`DEFAULT_N_BOOT` / :data:`DEFAULT_SEED`."""
+    cfg = config if isinstance(config, Mapping) else {}
+    wf = cfg.get("walkforward") if isinstance(cfg.get("walkforward"), Mapping) else {}
+    if n_boot is None:
+        v = wf.get("n_boot")
+        n_boot = int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else DEFAULT_N_BOOT
+    if seed is None:
+        v = cfg.get("seed")
+        seed = int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else DEFAULT_SEED
+    return int(n_boot), int(seed)
+
+
 def tearsheet_html(
     result: BacktestResult,
     *,
@@ -986,11 +1005,12 @@ def tearsheet_html(
     extra: Mapping[str, Any] | None = None,
     n_trials: int | None = None,
     dark_charts: bool = True,
-    n_boot: int = 1000,
-    seed: int = 0,
+    n_boot: int | None = None,
+    seed: int | None = None,
 ) -> str:
     """Build the tearsheet HTML string (see :func:`write_tearsheet`)."""
     extra = dict(extra or {})
+    n_boot, seed = _bootstrap_settings(extra.get("config"), n_boot, seed)
     charts = _Charts(dark=dark_charts)
     eq = _utc_index(result.equity.astype(float)).dropna()
     if eq.empty:
@@ -1213,8 +1233,8 @@ def write_tearsheet(
     extra: Mapping[str, Any] | None = None,
     n_trials: int | None = None,
     dark_charts: bool = True,
-    n_boot: int = 1000,
-    seed: int = 0,
+    n_boot: int | None = None,
+    seed: int | None = None,
 ) -> Path:
     """Write a single self-contained HTML tearsheet and return its path.
 
@@ -1238,7 +1258,10 @@ def write_tearsheet(
                   matplotlib Figure -> image).
     n_trials    : overrides ``extra["n_trials"]``.
     dark_charts : also embed dark-surface renders of each chart (≈2x file size).
-    n_boot, seed: stationary-bootstrap replications and seed for the Sharpe CI.
+    n_boot, seed: stationary-bootstrap replications and seed for the Sharpe CI. ``None``
+                  (default) takes ``walkforward.n_boot`` / ``seed`` from ``extra["config"]``
+                  (an ``AurumConfig.to_dict()``) when present, else 1000 / 0 — so a run's
+                  tearsheet and its statistics table use the same bootstrap.
     """
     out = Path(path)
     if out.is_dir() or out.suffix == "":

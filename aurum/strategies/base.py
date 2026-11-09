@@ -122,6 +122,8 @@ def _ensure_loaded() -> None:
         "aurum.strategies.seasonal",
         "aurum.strategies.ml",
         "aurum.strategies.rl",
+        "aurum.strategies.allocation",
+        "aurum.strategies.regime",
     ):
         try:
             importlib.import_module(mod)

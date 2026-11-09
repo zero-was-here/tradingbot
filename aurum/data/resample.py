@@ -5,10 +5,22 @@ Higher-timeframe (HTF) bars are labelled by their OPEN time (like MT5) and carry
 forward-filled them onto M5 bars from 00:00, leaking 55 minutes of future. Here, an HTF bar
 is only visible to base bars whose own ``available_at`` >= the HTF bar's ``available_at``.
 
-An HTF bar is emitted only if it is *complete* with respect to the base data: the last
-base bar that falls inside it must end exactly at the HTF bar's end, OR a later base bar
-exists (market closed early, e.g. Friday). The trailing in-progress HTF bar is dropped
-(unless the caller asserts the data is final via ``complete_until``).
+An HTF bar is emitted only if it is *complete* with respect to the base data:
+
+* **tail** — the last base bar that falls inside it must end exactly at the HTF bar's end,
+  OR a later base bar exists (market closed early, e.g. Friday). The trailing in-progress
+  HTF bar is dropped (unless the caller asserts the data is final via ``complete_until``).
+* **head** — when the data STARTS inside a bucket (a live sliding window that begins at
+  10:00, a download cut mid-day), the first bucket only holds the tail of its period: its
+  open, high, low and volume would differ from the same bar computed on a longer history,
+  so a value at time ``t`` would depend on where the history window starts. That leading
+  bucket is dropped unless its first base bar opens exactly at the bucket open, or the
+  caller passes ``complete_from`` (the base data is known to be complete from that
+  instant, e.g. the market was closed before the first bar).
+
+With both rules, resampling any suffix ``bars[k:]`` yields bars that are identical to the
+corresponding bars of the full-history resample (a subset of them): HTF values never
+depend on the history start (``tests/test_v21_core_fixes_resample.py``).
 
 Bucketing uses fixed-length rules (``Timedelta``) anchored at UTC midnight (+ the optional
 daily anchor for H4/D1): pandas 3 treats ``"1D"`` as a calendar-day offset and silently
@@ -33,12 +45,22 @@ _AGG = {
 }
 
 
+#: ``complete_from`` default: strict head rule, except with ``complete_until`` (see below)
+COMPLETE_FROM_AUTO = "auto"
+
+
+def _utc(ts: pd.Timestamp | str) -> pd.Timestamp:
+    t = pd.Timestamp(ts)
+    return t.tz_localize("UTC") if t.tz is None else t.tz_convert("UTC")
+
+
 def resample_bars(
     bars: pd.DataFrame,
     to: str | Timeframe,
     *,
     daily_anchor_hour_utc: int = 0,
     complete_until: pd.Timestamp | str | None = None,
+    complete_from: pd.Timestamp | str | None = COMPLETE_FROM_AUTO,
 ) -> pd.DataFrame:
     """Aggregate canonical bars to a higher timeframe.
 
@@ -50,11 +72,26 @@ def resample_bars(
     complete even if their last base bar ends early (market closed), so a dataset ending on
     a Friday keeps its Friday D1/H4 bars. It never makes a bar *available* earlier: an HTF
     bar's ``available_at`` is still its bucket end. Leave ``None`` for live data.
+
+    ``complete_from`` (UTC): the base data is known to be complete from this instant on
+    (nothing is missing after it). The LEADING bucket - the one holding the first base bar -
+    is emitted only if that bar opens exactly at the bucket open or the bucket opens at or
+    after ``complete_from``; otherwise it holds only part of its period and is dropped
+    (module doc). ``None``: strict. ``"auto"`` (default): strict, except when
+    ``complete_until`` is given - a caller asserting a final historical download keeps the
+    previous behaviour (the head is trusted; :mod:`aurum.data.dukascopy` drops buckets cut
+    by its requested start itself), so datasets built from downloads are unchanged.
     """
     validate_bars(bars)
     tf = get_timeframe(to)
     if not 0 <= int(daily_anchor_hour_utc) < 24:
         raise ValueError("daily_anchor_hour_utc must be in [0, 24)")
+    if isinstance(complete_from, str) and complete_from == COMPLETE_FROM_AUTO:
+        trust_head = complete_until is not None
+        head_from = None
+    else:
+        trust_head = False
+        head_from = None if complete_from is None else _utc(complete_from)
     if len(bars) == 0:
         out = bars[BAR_COLS].copy()
         out.attrs["timeframe"] = tf.name
@@ -82,11 +119,18 @@ def resample_bars(
     # base data after the bucket (early close / missing tail bars).
     data_end = bars["available_at"].max()
     if complete_until is not None:
-        cu = pd.Timestamp(complete_until)
-        cu = cu.tz_localize("UTC") if cu.tz is None else cu.tz_convert("UTC")
-        data_end = max(data_end, cu)
-    complete = (last_base_end >= htf_end) | (htf_end <= data_end)
-    out = out.loc[complete.to_numpy()]
+        data_end = max(data_end, _utc(complete_until))
+    complete = ((last_base_end >= htf_end) | (htf_end <= data_end)).to_numpy(copy=True)
+    # Head: the first non-empty bucket holds the first base bar. Unless that bar opens at
+    # the bucket open (or the data is known complete from the bucket open on), the bucket
+    # misses the start of its period - its open/high/low/volume would depend on where the
+    # history starts - so it is not complete.
+    if len(out) and not trust_head:
+        first_bucket = out.index[0]
+        head_ok = bars.index[0] == first_bucket or (head_from is not None and first_bucket >= head_from)
+        if not head_ok:
+            complete[0] = False
+    out = out.loc[complete]
     # Available when the bucket is over — but never earlier than the last base bar in it.
     avail = pd.Series(out.index + tf.delta, index=out.index)
     out["available_at"] = avail.where(avail >= last_base_end.loc[out.index], last_base_end.loc[out.index])

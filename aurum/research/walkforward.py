@@ -54,6 +54,16 @@ Protocol
    DIFFERENT config the run logs a WARNING, notes it in the report (and the holdout
    tearsheet) and adds those configs to the DSR ``n_trials``. The holdout OOS forecasts are
    kept (``holdout/oos_forecasts.parquet``) so the production fit can weight on them.
+   Entries record ``data_source`` (``"real"`` / ``"synthetic"``, :func:`data_source_kind`)
+   and only looks on the same kind of data count (entries without it count as before);
+   ``metrics.strategy_sharpe`` holds strategies only (``benchmark_sharpe`` separately). Other
+   looks are ledgered too: :func:`run_single_backtest` with ``include_holdout=True``
+   (``kind: "backtest"``) and anything recorded through :func:`record_holdout_look` (e.g. an
+   LLM-desk replay).
+7. **Attribution**: :meth:`WalkForwardReport.contributions` (and
+   :func:`forecast_contributions` on a run directory's files) gives each strategy's per-bar
+   contribution ``FDM_k * w_{k,i} * f_i[t]`` to the combined forecast; ``fold_weights``,
+   ``fold_fdm``, ``bar_weights`` and ``strategy_forecasts`` are the stable accessors.
 
 Known bias of ``combiner_fit="train"`` (documented, not hidden): the combiner is then
 fitted on *in-sample* forecasts of trainable strategies over the training window (their
@@ -104,12 +114,15 @@ from aurum.strategies.base import Strategy
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DATA_SOURCE_KINDS",
     "HOLDOUT_LEDGER",
     "FoldPlan",
     "HoldoutReport",
     "QuantBook",
     "append_holdout_ledger",
+    "data_source_kind",
     "fit_quant_book",
+    "forecast_contributions",
     "load_summary",
     "WalkForwardReport",
     "book_statistics",
@@ -118,6 +131,7 @@ __all__ = [
     "prior_holdout_looks",
     "provenance",
     "read_holdout_ledger",
+    "record_holdout_look",
     "run_single_backtest",
     "run_walk_forward",
     "train_feature_reference",
@@ -768,13 +782,37 @@ def read_holdout_ledger(path: str | Path) -> list[dict[str, Any]]:
     return out
 
 
+#: ``data_source`` values recorded in ledger entries (see :func:`data_source_kind`)
+DATA_SOURCE_KINDS: tuple[str, ...] = ("real", "synthetic")
+
+
+def data_source_kind(cfg: AurumConfig | None = None, md: MarketData | None = None) -> str:
+    """``"synthetic"`` or ``"real"``: the kind of data a run evaluated (holdout ledger).
+
+    Synthetic when the config generates its bars (``data.synthetic``) or the bars say so
+    (``md.bars.attrs["source"]`` starting with ``"synthetic"``); real otherwise. Callers that
+    pass their own synthetic ``MarketData`` with a non-synthetic config should set
+    ``bars.attrs["source"] = "synthetic"`` so their looks do not count against real holdouts.
+    """
+    if cfg is not None and getattr(cfg.data, "synthetic", None) is not None:
+        return "synthetic"
+    if md is not None and str(md.bars.attrs.get("source", "")).lower().startswith("synthetic"):
+        return "synthetic"
+    return "real"
+
+
 def prior_holdout_looks(entries: Sequence[Mapping[str, Any]], *, start: Any, end: Any, config_hash: str,
-                        symbol: str | None = None) -> dict[str, Any]:
+                        symbol: str | None = None, data_source: str | None = None) -> dict[str, Any]:
     """Earlier evaluations of a holdout window overlapping ``[start, end]`` (same symbol).
 
     ``n_prior_looks`` counts every overlapping entry; ``n_prior_configs`` the DISTINCT config
     hashes other than ``config_hash`` among them — re-running the same (deterministic) config
     is not a new trial, evaluating a different one is (it is a selection opportunity).
+
+    ``data_source`` (``"real"`` / ``"synthetic"``, :func:`data_source_kind`): entries that
+    record a DIFFERENT ``data_source`` are ignored — a smoke test on synthetic bars never
+    "spends" the real holdout, and vice versa. Entries written before the field existed
+    (no ``data_source``) are counted as before.
     """
     s, e = _utc(start), _utc(end)
     looks = []
@@ -784,6 +822,8 @@ def prior_holdout_looks(entries: Sequence[Mapping[str, Any]], *, start: Any, end
         except (KeyError, TypeError, ValueError):
             continue
         if symbol is not None and rec.get("symbol") not in (None, symbol):
+            continue
+        if data_source is not None and rec.get("data_source") not in (None, data_source):
             continue
         if rs <= e and s <= re_:
             looks.append(rec)
@@ -805,26 +845,115 @@ def append_holdout_ledger(path: str | Path, entry: Mapping[str, Any]) -> Path:
     return p
 
 
-def _ledger_entry(report: WalkForwardReport, cfg: AurumConfig, run_dir: Path | None) -> dict[str, Any]:
-    h = report.holdout
-    assert h is not None
-    stats = h.stats
+def record_holdout_look(output_dir: str | Path, entry: Mapping[str, Any], *, cfg: AurumConfig | None = None,
+                        md: MarketData | None = None) -> Path | None:
+    """Record one look at the walk-forward holdout in the ledger (public; e.g. the LLM-desk
+    replay over a window that reaches into ``walkforward.holdout_start``).
+
+    ``output_dir``: the output ROOT (``config.output.dir``, the parent of the run
+    directories), whose ``holdout_ledger.jsonl`` :func:`run_walk_forward` reads; a path ending
+    in ``.jsonl`` is taken as the ledger file itself.
+
+    ``entry`` gives the window either as ``holdout_start`` / ``holdout_end`` (the part of the
+    evaluation inside the holdout) or as ``start`` / ``end`` (the evaluated window; with
+    ``cfg`` it is clipped to ``walkforward.holdout_start``, and nothing is recorded - the
+    function returns ``None`` - when it ends before the holdout or the config has none).
+    Missing fields are filled: ``timestamp``, ``kind`` (``"look"``), from ``cfg``
+    ``config_hash`` / ``name`` / ``symbol`` / ``timeframe``, and ``data_source``
+    (:func:`data_source_kind`) / ``data_hash`` from ``cfg`` / ``md``. Every DISTINCT
+    ``config_hash`` other than a later walk-forward's own raises that run's DSR ``n_trials``,
+    so give a desk replay its own hash (e.g. ``f"{cfg.config_hash()}:desk"``) to have it count
+    as a separate trial. Returns the ledger path.
+    """
+    e = dict(entry)
+    if "holdout_start" not in e or "holdout_end" not in e:
+        if "start" not in e or "end" not in e:
+            raise ValueError("record_holdout_look: entry needs holdout_start/holdout_end or start/end")
+        hs = cfg.walkforward.holdout_start if cfg is not None else None
+        if hs is None:
+            if cfg is None:
+                raise ValueError("record_holdout_look: pass cfg to clip start/end to walkforward.holdout_start")
+            return None
+        s0, e0 = _utc(e["start"]), _utc(e["end"])
+        if e0 < _utc(hs):
+            return None
+        e.setdefault("evaluated_start", s0)
+        e.setdefault("evaluated_end", e0)
+        e["holdout_start"], e["holdout_end"] = max(s0, _utc(hs)), e0
+    hs_, he_ = _utc(e["holdout_start"]), _utc(e["holdout_end"])   # validates the window
+    if he_ < hs_:
+        raise ValueError(f"record_holdout_look: holdout_end {he_} is before holdout_start {hs_}")
+    e.setdefault("timestamp", pd.Timestamp.now(tz="UTC").isoformat())
+    e.setdefault("kind", "look")
+    if cfg is not None:
+        e.setdefault("config_hash", cfg.config_hash())
+        e.setdefault("name", cfg.name)
+        e.setdefault("symbol", cfg.data.symbol)
+        e.setdefault("timeframe", cfg.data.timeframe)
+    if cfg is not None or md is not None:
+        e.setdefault("data_source", data_source_kind(cfg, md))
+    if md is not None and "data_hash" not in e:
+        from aurum.data.store import frame_hash
+
+        e["data_hash"] = frame_hash(md.bars)
+    p = Path(output_dir)
+    ledger = p if p.suffix == ".jsonl" else p / HOLDOUT_LEDGER
+    append_holdout_ledger(ledger, e)
+    logger.info("holdout look (%s, %s -> %s) recorded in %s", e["kind"], hs_, he_, ledger)
+    return ledger
+
+
+def _ledger_metrics(stats: pd.DataFrame) -> dict[str, Any]:
+    """Ledger metrics of one stats table: combined book, per-STRATEGY Sharpe (the
+    buy-and-hold benchmark is not a strategy and is recorded separately)."""
     keep = ("sharpe", "psr", "dsr", "total_return", "cagr", "ann_vol", "max_drawdown", "n_trades", "total_costs",
             "n_days")
     comb = {k: stats.loc[_COMBINED, k] for k in keep if _COMBINED in stats.index and k in stats.columns}
-    per = {str(k): stats.loc[k, "sharpe"] for k in stats.index if k != _COMBINED and "sharpe" in stats.columns}
+    has = "sharpe" in stats.columns
+    per = {str(k): stats.loc[k, "sharpe"] for k in stats.index if k not in (_COMBINED, _BENCHMARK) and has}
+    out: dict[str, Any] = {"combined": comb, "strategy_sharpe": per}
+    if has and _BENCHMARK in stats.index:
+        out["benchmark_sharpe"] = stats.loc[_BENCHMARK, "sharpe"]
+    return out
+
+
+def _ledger_entry(report: WalkForwardReport, cfg: AurumConfig, run_dir: Path | None, *,
+                  stats: pd.DataFrame | None = None, start: Any = None, end: Any = None,
+                  n_bars: int | None = None, prior_looks: Mapping[str, Any] | None = None,
+                  data_source: str | None = None, extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """One ledger line. Defaults describe the walk-forward's final holdout evaluation; a
+    holdout-including single backtest passes its own ``stats`` / window / ``extra``."""
+    h = report.holdout
+    if stats is None:
+        assert h is not None
+        stats, start, end, n_bars = h.stats, h.start, h.end, len(h.combined.equity)
+        prior_looks = h.prior_looks if prior_looks is None else prior_looks
     prov = report.provenance or {}
-    return {
+    entry = {
         "timestamp": pd.Timestamp.now(tz="UTC").isoformat(), "kind": report.kind,
         "name": cfg.name, "config_hash": report.config_hash, "data_hash": report.data_hash,
+        "data_source": data_source or data_source_kind(cfg),
         "symbol": cfg.data.symbol, "timeframe": cfg.data.timeframe,
-        "holdout_start": h.start, "holdout_end": h.end, "n_holdout_bars": len(h.combined.equity),
-        "strategies": sorted(report.strategy_results) or [c for c in report.oos_forecasts.columns
-                                                          if c not in (_COMBINED, "fold")],
-        "n_trials": report.n_trials, "prior_looks": h.prior_looks,
-        "metrics": {"combined": comb, "strategy_sharpe": per},
+        "holdout_start": start, "holdout_end": end, "n_holdout_bars": n_bars,
+        "strategies": sorted(report.strategy_results) or report.strategy_keys,
+        "n_trials": report.n_trials, "prior_looks": dict(prior_looks or {}),
+        "metrics": _ledger_metrics(stats),
         "run_dir": run_dir, "git_sha": prov.get("git_sha"),
     }
+    entry.update(extra or {})
+    return entry
+
+
+def _resolve_ledger(holdout_ledger: str | Path | bool | None, run_dir: Path | None, cfg: AurumConfig) -> Path | None:
+    """Ledger path: an explicit path; ``None`` -> ``<run dir>/../holdout_ledger.jsonl`` when the
+    run is written (``output.dir`` when ``holdout_ledger is True``), else not recorded;
+    ``False`` -> off."""
+    if isinstance(holdout_ledger, (str, Path)):
+        return Path(holdout_ledger)
+    if holdout_ledger is False:
+        return None
+    root = run_dir.parent if run_dir is not None else (Path(cfg.output.dir) if holdout_ledger else None)
+    return root / HOLDOUT_LEDGER if root is not None else None
 
 
 # ============================================================================================
@@ -857,6 +986,72 @@ def _safe_name(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s) or "book"
 
 
+#: column :func:`forecast_contributions` adds with ``residual=True``
+CLIP_COLUMN = "clip_adjustment"
+
+
+def _strategy_columns(columns: Sequence[Any]) -> list[str]:
+    return [str(c) for c in columns if c not in (_COMBINED, "fold", "fdm")]
+
+
+def forecast_contributions(forecasts: pd.DataFrame, weights: pd.DataFrame | pd.Series | Mapping[str, float], *,
+                           fdm: float | None = None, residual: bool = False) -> pd.DataFrame:
+    """Per-bar contribution of each strategy to the combined forecast (attribution).
+
+    The combiner sets ``combined[t] = clip(FDM_k * sum_i w_{k,i} * f_i[t], -1, 1)`` with the
+    weights ``w_k`` and multiplier ``FDM_k`` of the fold ``k`` that bar ``t`` belongs to
+    (:meth:`aurum.portfolio.combiner.ForecastCombiner.combine`). This returns
+    ``c_i[t] = FDM_k * w_{k,i} * f_i[t]`` (``f`` clipped to [-1, 1], NaN -> 0, exactly as
+    ``combine`` does), one column per strategy, indexed like ``forecasts``. The columns sum
+    to the PRE-clip combined forecast; with ``residual=True`` a :data:`CLIP_COLUMN` column
+    ``clip(sum) - sum`` is added so that every row sums exactly to ``combined``.
+
+    Inputs (the in-memory report or a run directory's files):
+
+    * per-fold: ``forecasts`` with a ``fold`` column (``oos_forecasts.parquet``) and
+      ``weights`` = fold x strategy DataFrame with an ``fdm`` column (``weights.csv`` read
+      with ``index_col="fold"``; fold labels are compared as strings);
+    * one fold (holdout, quant book): ``weights`` = Series / mapping of strategy -> weight and
+      ``fdm`` (or an ``"fdm"`` entry in ``weights``).
+
+    Other columns of ``forecasts`` (``combined``, ``fold``) are ignored. A strategy in
+    ``weights`` but missing from ``forecasts`` raises ``KeyError``.
+    """
+    if isinstance(weights, pd.DataFrame):
+        if "fold" not in forecasts.columns:
+            raise KeyError("per-fold weights need a 'fold' column in forecasts")
+        if "fdm" not in weights.columns:
+            raise KeyError("per-fold weights need an 'fdm' column")
+        w = weights.copy()
+        w.index = w.index.astype(str)
+        keys = _strategy_columns(w.columns)
+        folds = forecasts["fold"].astype(str)
+        unknown = sorted(set(folds) - set(w.index))
+        if unknown:
+            raise KeyError(f"forecasts reference folds without weights: {unknown}")
+        per_bar = w.reindex(folds.to_numpy())
+        wmat = per_bar[keys].to_numpy(dtype=float)
+        fdm_arr = per_bar["fdm"].to_numpy(dtype=float)[:, None]
+    else:
+        wser = pd.Series(dict(weights) if not isinstance(weights, pd.Series) else weights, dtype=float)
+        if fdm is None:
+            if "fdm" not in wser.index:
+                raise ValueError("pass fdm= (or an 'fdm' entry in weights) for single-fold weights")
+            fdm = float(wser["fdm"])
+        keys = _strategy_columns(wser.index)
+        wmat = np.broadcast_to(wser[keys].to_numpy(dtype=float), (len(forecasts), len(keys)))
+        fdm_arr = np.full((len(forecasts), 1), float(fdm))
+    missing = [k for k in keys if k not in forecasts.columns]
+    if missing:
+        raise KeyError(f"forecasts lack strategies {missing}")
+    f = forecasts[keys].astype(float).clip(-1.0, 1.0).fillna(0.0).to_numpy()
+    contrib = pd.DataFrame(f * wmat * fdm_arr, index=forecasts.index, columns=keys)
+    if residual:
+        tot = contrib.sum(axis=1).to_numpy()
+        contrib[CLIP_COLUMN] = np.clip(tot, -1.0, 1.0) - tot
+    return contrib
+
+
 @dataclass
 class HoldoutReport:
     """Final holdout evaluated ONCE with the model fitted on the last training window."""
@@ -880,6 +1075,18 @@ class HoldoutReport:
                           "weights": self.weights, "fdm": self.fdm, "combiner_basis": self.combiner_basis,
                           "costs": self.costs.to_dict(orient="index"), "prior_looks": self.prior_looks,
                           "ledger": self.ledger_path})
+
+    def strategy_forecasts(self) -> pd.DataFrame:
+        """Holdout forecasts of each strategy (columns = strategy keys, no ``combined``)."""
+        if self.forecasts is None:
+            raise ValueError("this holdout report carries no forecasts")
+        return self.forecasts[_strategy_columns(self.forecasts.columns)].copy()
+
+    def contributions(self, *, residual: bool = False) -> pd.DataFrame:
+        """Per-bar ``w_i * f_i * FDM`` per strategy (:func:`forecast_contributions`)."""
+        if self.forecasts is None:
+            raise ValueError("this holdout report carries no forecasts")
+        return forecast_contributions(self.forecasts, self.weights, fdm=self.fdm, residual=residual)
 
 
 @dataclass
@@ -911,6 +1118,45 @@ class WalkForwardReport:
     @property
     def data_hash(self) -> str | None:
         return (self.provenance.get("data") or {}).get("bars_hash")
+
+    # ---- stable accessors for attribution (documented API; prefer them to raw frames) ----
+    @property
+    def strategy_keys(self) -> list[str]:
+        """Strategy columns of the stitched OOS forecasts, in combiner order."""
+        return _strategy_columns(self.oos_forecasts.columns)
+
+    def strategy_forecasts(self) -> pd.DataFrame:
+        """Stitched out-of-sample forecast of each strategy (bars x strategies, in [-1, 1])."""
+        return self.oos_forecasts[self.strategy_keys].copy()
+
+    def fold_weights(self) -> pd.DataFrame:
+        """Combiner weights per fold (index ``fold`` as str, one column per strategy)."""
+        w = self.weights.drop(columns="fdm", errors="ignore").copy()
+        w.index = w.index.astype(str)
+        w.index.name = "fold"
+        return w[[k for k in self.strategy_keys if k in w.columns]]
+
+    def fold_fdm(self) -> pd.Series:
+        """Forecast diversification multiplier per fold (index ``fold`` as str)."""
+        f = self.weights["fdm"].astype(float).copy()
+        f.index = f.index.astype(str)
+        f.index.name = "fold"
+        return f.rename("fdm")
+
+    def bar_weights(self, *, include_fdm: bool = True) -> pd.DataFrame:
+        """The weights in force on every OOS bar (its fold's), plus ``fdm`` by default."""
+        w = self.weights.copy()
+        w.index = w.index.astype(str)
+        per_bar = w.reindex(self.oos_forecasts["fold"].astype(str).to_numpy())
+        per_bar.index = self.oos_forecasts.index
+        cols = self.strategy_keys + (["fdm"] if include_fdm else [])
+        return per_bar[cols]
+
+    def contributions(self, *, residual: bool = False) -> pd.DataFrame:
+        """Per-bar contribution ``w_i * f_i * FDM`` of each strategy to the combined OOS
+        forecast (:func:`forecast_contributions`; ``residual=True`` adds the clip column so
+        rows sum exactly to ``oos_forecasts["combined"]``)."""
+        return forecast_contributions(self.oos_forecasts, self.weights, residual=residual)
 
     def summary(self) -> dict[str, Any]:
         """JSON-safe summary (what ``summary.json`` holds)."""
@@ -1008,8 +1254,12 @@ class WalkForwardReport:
                      "notes": list(self.notes), "config": self.config}
             if self.pbo is not None:
                 extra["pbo"] = self.pbo
+        # the tearsheet's bootstrap CI uses the run's settings, like the stats table does
+        wf = self.config.get("walkforward") or {}
         write_tearsheet(result, path, benchmark=bench.equity if bench is not None else None, title=title,
-                        extra=extra, dark_charts=dark)
+                        extra=extra, dark_charts=dark,
+                        n_boot=int(1000 if wf.get("n_boot") is None else wf["n_boot"]),
+                        seed=int(self.config.get("seed") or 0))
 
 
 # ============================================================================================
@@ -1388,17 +1638,14 @@ def run_walk_forward(md: MarketData, config: AurumConfig, *,
     notes: list[str] = []
     ledger: Path | None = None
     prior: dict[str, Any] = {}
+    source = data_source_kind(config, md)
     if holdout is not None:
-        if isinstance(holdout_ledger, (str, Path)):
-            ledger = Path(holdout_ledger)
-        elif holdout_ledger is not False:
-            # default location: the ROOT of the output directory, next to the run directories
-            root = run_dir.parent if run_dir is not None else (Path(config.output.dir) if holdout_ledger else None)
-            ledger = root / HOLDOUT_LEDGER if root is not None else None
+        # default location: the ROOT of the output directory, next to the run directories
+        ledger = _resolve_ledger(holdout_ledger, run_dir, config)
         if ledger is not None:
             prior = prior_holdout_looks(read_holdout_ledger(ledger), start=idx[holdout.test_start],
                                         end=idx[holdout.test_end - 1], config_hash=config.config_hash(),
-                                        symbol=config.data.symbol)
+                                        symbol=config.data.symbol, data_source=source)
             if prior["n_prior_configs"]:
                 msg = (f"the holdout window {idx[holdout.test_start]} -> {idx[holdout.test_end - 1]} was "
                        f"evaluated before by {prior['n_prior_configs']} other config(s) "
@@ -1425,7 +1672,7 @@ def run_walk_forward(md: MarketData, config: AurumConfig, *,
         report.save(run_dir, tearsheet=config.output.tearsheet, dark_charts=config.output.dark_charts)
     if report.holdout is not None and ledger is not None:
         # recorded AFTER the evaluation (and the write): the ledger lists looks that happened
-        append_holdout_ledger(ledger, _ledger_entry(report, config, report.out_dir))
+        append_holdout_ledger(ledger, _ledger_entry(report, config, report.out_dir, data_source=source))
         logger.info("holdout evaluation recorded in %s", ledger)
     report.timing["wall_s"] = round(time.perf_counter() - t0, 3)
     if report.out_dir is not None:
@@ -1439,13 +1686,22 @@ def run_single_backtest(md: MarketData, config: AurumConfig, *,
                         strategies: Sequence[Strategy] | Mapping[str, Strategy] | None = None,
                         only: Sequence[str] | None = None, start: Any = None, end: Any = None,
                         out_dir: str | Path | None = None, write: bool | None = None,
-                        include_holdout: bool = False) -> WalkForwardReport:
+                        include_holdout: bool = False,
+                        holdout_ledger: str | Path | bool | None = None) -> WalkForwardReport:
     """One train/test split: fit on bars before ``start`` (minus purge/embargo), evaluate
     ``[start, end]``. Without ``start`` everything is fitted and evaluated IN-SAMPLE (the
     report says so loudly) — use :func:`run_walk_forward` for honest estimates.
 
     Bars from ``walkforward.holdout_start`` on are removed unless ``include_holdout`` (the
-    holdout must only be looked at once, by the walk-forward's final evaluation).
+    holdout must only be looked at once, by the walk-forward's final evaluation). A backtest
+    that DOES evaluate holdout bars is a look like any other: the holdout ledger
+    (``holdout_ledger``, same rules as :func:`run_walk_forward`; by default
+    ``<run dir>/../holdout_ledger.jsonl`` when the run is written) is read first - earlier
+    looks by other configs add to the DSR ``n_trials`` and a WARNING note - and the look is
+    appended afterwards (``kind: "backtest"``, ``holdout_start`` / ``holdout_end`` = the
+    evaluated bars inside the holdout, ``evaluated_start`` / ``evaluated_end`` = the whole
+    evaluated window, whose statistics ``metrics`` holds; ``in_sample`` flags a fit on the
+    evaluated period).
     """
     t0 = time.perf_counter()
     strats = _resolve_strategies(config, strategies, only)
@@ -1501,11 +1757,44 @@ def run_single_backtest(md: MarketData, config: AurumConfig, *,
                 "test": plan.n_test, "step": plan.n_test, "purge": purge, "embargo": embargo,
                 "anchored": True, "n_folds": 1, "holdout_start": None, "stitched_gaps": False,
                 "in_sample": start is None}
-    report = _run(md, config, strats, [plan], None, settings, kind="backtest", notes=notes)
     write = config.output.save_results if write is None else write
-    if write:
-        d = Path(out_dir) if out_dir is not None else _default_out_dir(config, "backtest")
-        report.save(d, tearsheet=config.output.tearsheet, dark_charts=config.output.dark_charts)
+    run_dir = (Path(out_dir) if out_dir is not None else _default_out_dir(config, "backtest")) if write else None
+    # A holdout-including evaluation is a holdout LOOK: read the ledger first (other configs'
+    # looks raise n_trials), record this one afterwards.
+    look: tuple[pd.Timestamp, pd.Timestamp, int] | None = None
+    ledger: Path | None = None
+    prior: dict[str, Any] = {}
+    source = data_source_kind(config, md)
+    if include_holdout and hs is not None:
+        ev_idx = idx[plan.test_start:]
+        inside = ev_idx[ev_idx >= _utc(hs)]
+        if len(inside):
+            look = (inside[0], inside[-1], len(inside))
+            ledger = _resolve_ledger(holdout_ledger, run_dir, config)
+            if ledger is not None:
+                prior = prior_holdout_looks(read_holdout_ledger(ledger), start=look[0], end=look[1],
+                                            config_hash=config.config_hash(), symbol=config.data.symbol,
+                                            data_source=source)
+                if prior["n_prior_configs"]:
+                    msg = (f"the holdout window {look[0]} -> {look[1]} was evaluated before by "
+                           f"{prior['n_prior_configs']} other config(s) ({prior['n_prior_looks']} prior look(s), "
+                           f"ledger {ledger}); DSR n_trials is raised by {prior['n_prior_configs']}")
+                    logger.warning(msg)
+                    notes.append("WARNING: " + msg)
+            else:
+                notes.append("holdout look NOT recorded in a holdout ledger (results not written; pass "
+                             "holdout_ledger=PATH to record it)")
+    report = _run(md, config, strats, [plan], None, settings, kind="backtest", notes=notes,
+                  extra_trials=int(prior.get("n_prior_configs", 0)))
+    if run_dir is not None:
+        report.save(run_dir, tearsheet=config.output.tearsheet, dark_charts=config.output.dark_charts)
+    if look is not None and ledger is not None:
+        append_holdout_ledger(ledger, _ledger_entry(
+            report, config, report.out_dir, stats=report.stats, start=look[0], end=look[1], n_bars=look[2],
+            prior_looks=prior, data_source=source,
+            extra={"evaluated_start": idx[plan.test_start], "evaluated_end": idx[-1],
+                   "in_sample": start is None, "metrics_window": "evaluated"}))
+        logger.info("holdout look of the backtest recorded in %s", ledger)
     report.timing["wall_s"] = round(time.perf_counter() - t0, 3)
     return report
 

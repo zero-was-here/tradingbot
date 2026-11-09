@@ -21,6 +21,21 @@ Safety properties
   history window spanning a DST switch converts correctly. A configured ``server_tz`` that
   disagrees with a fresh detection is a fatal misconfiguration (bars would be shifted by
   hours and a forming bar could be taken for a closed one).
+* **No fresh tick with ``server_tz="auto"``** (weekend, daily break, quiet market): the
+  adapter falls back to the last offset it DETECTED on this account's server (persisted in
+  ``tz_state_path``; the runner keeps it in ``<state_dir>/mt5_server_tz.json``) or else to
+  ``server_tz_fallback``, logs a WARNING and marks the time zone UNCONFIRMED
+  (:attr:`MT5Broker.tz_confirmed` is False, :attr:`MT5Broker.tz_status` says why). Bars and
+  quotes are converted with the provisional zone (``server_time`` is the machine clock, never
+  a tick converted with an unconfirmed offset), so dry-run decisions proceed, but every
+  order (``place_order``, ``close_position``, ``modify_protection``) is REFUSED until a fresh
+  tick confirms the offset: each attempt first probes for one; without it the result is
+  ``market_closed`` (the OMS defers and the runner retries the same intent when quotes
+  return). If the fresh tick shows a DIFFERENT offset, the detected zone is adopted (and
+  persisted) and that order is rejected, since it was decided on mis-timed bars.
+  ``latest_bars`` also re-probes (at most every ``tz_reprobe_seconds``) so the zone is
+  usually confirmed before the first decision after the reopen. Without a persisted offset
+  or a fallback, connecting fails as before.
 * **Retcodes.** Requote / price-changed / price-off / invalid-price are retried with a
   FRESH tick; an unsupported filling mode falls back FOK → IOC → RETURN; market closed,
   no money, invalid volume/stops, trading disabled are rejections; timeouts and connection
@@ -46,6 +61,7 @@ import re
 import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -205,6 +221,17 @@ def _tz_offset_now(server_tz: str, utc_now: pd.Timestamp) -> pd.Timedelta:
     return pd.Timestamp(utc_now).tz_convert(spec).utcoffset()
 
 
+def _valid_tz_spec(spec: Any) -> bool:
+    """True if ``spec`` is a zone :func:`_tz_offset_now` understands (never raises)."""
+    if not isinstance(spec, str) or not spec.strip():
+        return False
+    try:
+        off = _tz_offset_now(spec, pd.Timestamp.now(tz="UTC"))
+    except Exception:  # noqa: BLE001 - unknown zone names raise various errors
+        return False
+    return off is not None
+
+
 def _get(obj: Any, name: str, default: Any = None) -> Any:
     if obj is None:
         return default
@@ -222,6 +249,13 @@ class MT5Broker:
     instrument      : contract spec (lot grid is refreshed from ``symbol_info`` on connect).
     server_tz       : ``"auto"`` (detect from a fresh tick), or any spec accepted by
                       :func:`aurum.data.loaders.to_utc_index` (e.g. ``"NY+7"``).
+    server_tz_fallback : with ``server_tz="auto"`` only: the zone to assume, UNCONFIRMED, when
+                      no fresh tick arrives and no offset was persisted (e.g. ``"NY+7"``).
+    tz_state_path   : JSON file where every fresh detection is persisted (zone, offset, account
+                      server) and read back as the first fallback; ``None`` disables.
+    tz_reprobe_seconds : minimum wall time between the opportunistic re-probes ``latest_bars``
+                      makes while the zone is unconfirmed (each probe can wait up to
+                      ``tz_probe_seconds``).
     deviation_points: max accepted slippage for market orders, in points.
     price_basis     : MT5 bars are BID bars; ``"bid"`` converts to mid with ``+spread/2``.
     requote_retries : fresh-tick retries on requote / price changed / price off.
@@ -241,6 +275,9 @@ class MT5Broker:
         requote_retries: int = 3,
         requote_delay_s: float = 0.25,
         tz_probe_seconds: float = 5.0,
+        server_tz_fallback: str | None = None,
+        tz_state_path: str | os.PathLike[str] | None = None,
+        tz_reprobe_seconds: float = 60.0,
         mt5: Any | None = None,
         env: dict[str, str] | None = None,
         clock: Clock | None = None,
@@ -249,9 +286,21 @@ class MT5Broker:
     ) -> None:
         if price_basis not in ("bid", "mid"):
             raise ValueError("price_basis must be 'bid' or 'mid'")
+        if server_tz_fallback is not None:
+            if server_tz != "auto":
+                raise ValueError("server_tz_fallback only applies with server_tz='auto' (an explicit server_tz is "
+                                 "used as configured)")
+            if str(server_tz_fallback).strip().lower() == "auto" or not _valid_tz_spec(server_tz_fallback):
+                raise ValueError(f"server_tz_fallback {server_tz_fallback!r} is not a time-zone spec "
+                                 "(e.g. 'NY+7', 'UTC+02:00', 'Europe/Athens')")
+        if not float(tz_reprobe_seconds) >= 0:
+            raise ValueError("tz_reprobe_seconds must be >= 0")
         self.symbol = symbol
         self.instrument = instrument
         self.server_tz_config = server_tz
+        self.server_tz_fallback = server_tz_fallback
+        self.tz_state_path = Path(tz_state_path) if tz_state_path is not None else None
+        self.tz_reprobe_seconds = float(tz_reprobe_seconds)
         self.deviation_points = int(deviation_points)
         self.price_basis = price_basis
         self.requote_retries = int(requote_retries)
@@ -262,6 +311,11 @@ class MT5Broker:
         self.clock = clock or SystemClock()
         self._sleep = sleep if sleep is not None else time.sleep
         self._server_tz: str | None = None if server_tz == "auto" else server_tz
+        #: True when the zone in use is configured explicitly or was detected from a fresh tick
+        #: in this process; False while running on a persisted/fallback offset (orders refused)
+        self.tz_confirmed: bool = server_tz != "auto"
+        self._tz_source: str | None = None if server_tz == "auto" else "config"
+        self._tz_last_probe: float | None = None
         self._filling: str | None = None
         self._symbol_info: Any = None
         self.point = 0.01
@@ -385,25 +439,174 @@ class MT5Broker:
                 return cur / 1000.0
         return None
 
-    def _check_server_tz(self) -> None:
-        """Detect the server offset from a fresh tick and reconcile it with the config."""
+    def _detect_offset(self) -> tuple[pd.Timedelta | None, pd.Timestamp]:
         tick_s = self._fresh_tick_time()
         now = self.clock.now()
-        detected = detect_server_offset(tick_s, now) if tick_s is not None else None
+        return (detect_server_offset(tick_s, now) if tick_s is not None else None), now
+
+    def _check_server_tz(self) -> None:
+        """Detect the server offset from a fresh tick and reconcile it with the config.
+
+        Explicit ``server_tz``: a fresh detection that disagrees is fatal; without one the
+        configured zone is trusted. ``"auto"``: a fresh detection is adopted (and persisted);
+        without one, a zone already in use is kept, else the persisted offset or
+        ``server_tz_fallback`` is used UNCONFIRMED (orders refused until a fresh tick), else
+        connecting fails."""
+        detected, now = self._detect_offset()
+        if self.server_tz_config != "auto":
+            if detected is None:
+                logger.info("MT5 server offset not detectable now (no fresh tick); using configured %s",
+                            self._server_tz)
+                return
+            expected = _tz_offset_now(self._server_tz, now)
+            if abs((expected - detected).total_seconds()) >= 900:
+                raise BrokerError(f"configured server_tz {self._server_tz!r} implies offset {expected}, but the "
+                                  f"server clock is at {detected}: fix server_tz (bars would be mis-timed)")
+            return
+        if detected is not None:
+            if self.tz_confirmed and self._server_tz is not None:
+                expected = _tz_offset_now(self._server_tz, now)
+                if abs((expected - detected).total_seconds()) >= 900:
+                    raise BrokerError(f"server_tz 'auto' detected {self._server_tz!r} (offset {expected}) earlier, but "
+                                      f"the server clock is now at {detected}: restart to re-detect, or set server_tz "
+                                      "explicitly (bars would be mis-timed)")
+                return
+            self._adopt_detected(detected, now)
+            return
+        if self._server_tz is not None:
+            logger.info("MT5 server offset not detectable now (no fresh tick); keeping %s (%s, %s)", self._server_tz,
+                        self._tz_source, "confirmed" if self.tz_confirmed else "UNCONFIRMED")
+            return
+        spec, source = self._provisional_tz(now)
+        if spec is None:
+            raise BrokerError("cannot detect the MT5 server time offset (no fresh tick: market closed?); "
+                              "set server_tz explicitly (e.g. 'NY+7') or server_tz_fallback")
+        self._server_tz, self._tz_source, self.tz_confirmed = spec, source, False
+        logger.warning("MT5 server offset not detectable (no fresh tick: market closed?); using the %s zone %s "
+                       "UNCONFIRMED: orders are refused until a fresh tick confirms it", source, spec)
+
+    def _adopt_detected(self, detected: pd.Timedelta, now: pd.Timestamp) -> str:
+        """Use the zone of a FRESH detection (auto mode); persist it. Returns ``"confirmed"``
+        when it matches the zone already in use (or none was in use), ``"corrected"`` when it
+        replaced a different provisional zone."""
+        previous, prev_source = self._server_tz, self._tz_source
+        outcome = "confirmed"
+        if previous is not None:
+            expected = _tz_offset_now(previous, now)
+            if abs((expected - detected).total_seconds()) >= 900:
+                outcome = "corrected"
+        spec = server_tz_for_offset(detected, now)
+        if outcome == "confirmed" and previous is not None:
+            spec = previous  # same offset now: keep the (possibly DST-aware) spec in use
+        self._server_tz, self._tz_source, self.tz_confirmed = spec, "detected", True
+        if previous is None:
+            logger.info("MT5 server time zone detected: %s (offset %s)", spec, detected)
+        elif outcome == "confirmed":
+            logger.info("MT5 server time zone %s (%s) confirmed by a fresh tick (offset %s)", spec, prev_source,
+                        detected)
+        else:
+            logger.error("MT5 server time zone %s (%s) was WRONG: a fresh tick shows offset %s -> using %s",
+                         previous, prev_source, detected, spec)
+        self._persist_tz(spec, detected, now)
+        return outcome
+
+    def _try_confirm_tz(self, *, force: bool) -> str:
+        """While the zone is unconfirmed, probe for a fresh tick: ``"confirmed"``,
+        ``"corrected"`` (a different offset was adopted) or ``"unconfirmed"``. ``force=False``
+        probes at most every ``tz_reprobe_seconds`` of wall time."""
+        if self.tz_confirmed:
+            return "confirmed"
+        mono = time.monotonic()
+        if not force and self._tz_last_probe is not None and mono - self._tz_last_probe < self.tz_reprobe_seconds:
+            return "unconfirmed"
+        self._tz_last_probe = mono
+        try:
+            detected, now = self._detect_offset()
+        except Exception as exc:  # noqa: BLE001 - a probe failure keeps the zone unconfirmed
+            logger.warning("MT5 server time-zone probe failed: %s", exc)
+            return "unconfirmed"
         if detected is None:
-            if self._server_tz is None:
-                raise BrokerError("cannot detect the MT5 server time offset (no fresh tick: market closed?); "
-                                  "set server_tz explicitly (e.g. 'NY+7')")
-            logger.info("MT5 server offset not detectable now (no fresh tick); using configured %s", self._server_tz)
+            return "unconfirmed"
+        return self._adopt_detected(detected, now)
+
+    def _account_server(self) -> str | None:
+        try:
+            server = _get(self.mt5.account_info(), "server")
+        except Exception:  # noqa: BLE001 - informational
+            return None
+        return str(server) if server else None
+
+    def _provisional_tz(self, now: pd.Timestamp) -> tuple[str | None, str | None]:
+        """Zone to assume (unconfirmed) without a fresh tick: the persisted detection of THIS
+        account server, else ``server_tz_fallback``."""
+        st = self._load_tz_state()
+        if st:
+            spec = st.get("server_tz")
+            saved_server, server = st.get("server"), self._account_server()
+            if not _valid_tz_spec(spec):
+                logger.warning("ignoring persisted MT5 server time zone %r in %s: not a zone spec", spec,
+                               self.tz_state_path)
+            elif saved_server and server and str(saved_server) != server:
+                logger.warning("ignoring persisted MT5 server time zone of server %r: connected to %r",
+                               saved_server, server)
+            else:
+                logger.warning("using the MT5 server time zone %s persisted at %s (detected %s)", spec,
+                               self.tz_state_path, st.get("detected_at"))
+                return str(spec), "persisted"
+        if self.server_tz_fallback is not None:
+            return str(self.server_tz_fallback), "fallback"
+        return None, None
+
+    def _load_tz_state(self) -> dict[str, Any] | None:
+        if self.tz_state_path is None:
+            return None
+        from aurum.live.state import StateCorruptError, read_json
+
+        try:
+            st = read_json(self.tz_state_path, default=None)
+        except (StateCorruptError, OSError) as exc:
+            logger.warning("persisted MT5 server time zone unreadable (%s): ignored", exc)
+            return None
+        return st if isinstance(st, dict) else None
+
+    def _persist_tz(self, spec: str, offset: pd.Timedelta, now: pd.Timestamp) -> None:
+        if self.tz_state_path is None:
             return
-        if self._server_tz is None:
-            self._server_tz = server_tz_for_offset(detected, now)
-            logger.info("MT5 server time zone detected: %s (offset %s)", self._server_tz, detected)
-            return
-        expected = _tz_offset_now(self._server_tz, now)
-        if abs((expected - detected).total_seconds()) >= 900:
-            raise BrokerError(f"configured server_tz {self._server_tz!r} implies offset {expected}, but the "
-                              f"server clock is at {detected}: fix server_tz (bars would be mis-timed)")
+        from aurum.live.state import atomic_write_json
+
+        try:
+            self.tz_state_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(self.tz_state_path, {"server_tz": spec, "offset_seconds": int(offset.total_seconds()),
+                                                   "detected_at": pd.Timestamp(now).isoformat(),
+                                                   "server": self._account_server(), "symbol": self.symbol})
+        except (OSError, TypeError, ValueError) as exc:  # never fail a connection over a cache file
+            logger.warning("could not persist the MT5 server time zone to %s: %s", self.tz_state_path, exc)
+
+    @property
+    def tz_status(self) -> dict[str, Any]:
+        """``{"server_tz", "source", "confirmed", "config"}``; ``source`` is ``config``,
+        ``detected`` (fresh tick), ``persisted`` or ``fallback`` (the last two unconfirmed)."""
+        return {"server_tz": self._server_tz, "source": self._tz_source, "confirmed": bool(self.tz_confirmed),
+                "config": self.server_tz_config}
+
+    def _tz_order_guard(self, client_id: str, ticket: int | None = None) -> OrderResult | None:
+        """None when orders may go out; otherwise the refusal (see the module docstring)."""
+        if self.tz_confirmed:
+            return None
+        outcome = self._try_confirm_tz(force=True)
+        if outcome == "confirmed":
+            return None
+        if outcome == "corrected":
+            msg = (f"MT5 server time zone corrected to {self._server_tz!r} by a fresh tick: this order was decided "
+                   "on mis-timed bars and is not sent")
+            logger.error("order %s refused: %s", client_id, msg)
+            return OrderResult(ok=False, retcode="server_tz_corrected", message=msg, status=OrderStatusCode.REJECTED,
+                               client_id=client_id, position_ticket=ticket)
+        msg = (f"MT5 server time zone {self._server_tz!r} ({self._tz_source}) not confirmed by a fresh tick: "
+               "order not sent (retried when the market is live)")
+        logger.warning("order %s deferred: %s", client_id, msg)
+        return OrderResult(ok=False, retcode="server_tz_unconfirmed", message=msg,
+                           status=OrderStatusCode.MARKET_CLOSED, client_id=client_id, position_ticket=ticket)
 
     @property
     def server_tz(self) -> str:
@@ -424,8 +627,12 @@ class MT5Broker:
 
     def server_time(self) -> pd.Timestamp:
         """UTC now. The machine clock (NTP) is authoritative; a fresh tick stamped ahead of it
-        reveals clock skew and wins (never act on a bar the server has not closed)."""
+        reveals clock skew and wins (never act on a bar the server has not closed) — but only
+        once the server zone is confirmed: converted with an unconfirmed (persisted/fallback)
+        offset, a tick could look hours ahead and pass forming bars off as closed."""
         now = self.clock.now()
+        if not self.tz_confirmed:
+            return now
         try:
             tick = self._raw_tick()
         except Exception:  # pragma: no cover - connection hiccup
@@ -545,6 +752,8 @@ class MT5Broker:
         """Last ``n`` CLOSED bars as canonical (UTC, mid) bars."""
         if symbol != self.symbol:
             raise BrokerError(f"MT5Broker is bound to {self.symbol}, not {symbol}")
+        if not self.tz_confirmed:
+            self._try_confirm_tz(force=False)  # convert with the confirmed zone as soon as ticks flow
         tf = get_timeframe(timeframe)
         code = self._c(f"TIMEFRAME_{tf.name}")
         rates = self.mt5.copy_rates_from_pos(symbol, code, 0, int(n) + 1)
@@ -611,6 +820,9 @@ class MT5Broker:
         if req.symbol != self.symbol:
             return OrderResult(ok=False, retcode="symbol", message=f"bound to {self.symbol}",
                                status=OrderStatusCode.REJECTED, client_id=req.client_id)
+        refused = self._tz_order_guard(req.client_id, req.position_ticket)
+        if refused is not None:
+            return refused
         side = int(req.side)
         pos_side = side  # side of the position the protective levels protect
         if req.position_ticket is not None:
@@ -785,6 +997,9 @@ class MT5Broker:
         pos, why = self._own_position(ticket, magic)
         if pos is None:
             return OrderResult(ok=False, retcode="ownership", message=why, status=OrderStatusCode.REJECTED)
+        refused = self._tz_order_guard(f"{magic}-sltp-{ticket}", int(ticket))
+        if refused is not None:
+            return refused
         tick = self._raw_tick()
         half = 0.5 * (float(_get(tick, "ask", 0.0)) - float(_get(tick, "bid", 0.0))) if tick is not None else 0.0
         side = 1 if pos.lots > 0 else -1
@@ -799,7 +1014,8 @@ class MT5Broker:
                            position_ticket=int(ticket))
 
     def __repr__(self) -> str:  # never include credentials
-        return f"MT5Broker(symbol={self.symbol!r}, server_tz={self._server_tz!r}, connected={self._connected})"
+        return (f"MT5Broker(symbol={self.symbol!r}, server_tz={self._server_tz!r}, "
+                f"tz_confirmed={self.tz_confirmed}, connected={self._connected})")
 
 
 def mt5_available() -> bool:

@@ -1,0 +1,44 @@
+# EXPLORATORY (not pre-registered) research direction from docs/RESULTS.md: daily-bar
+# (New-York-close) trend following with the classic monthly horizons. Every strategy here is a
+# NEW TRIAL on data the protocol already used, so walkforward.n_trials counts it (see below).
+#
+# The 2025-01-01+ holdout is USED UP (docs/RESULTS.md): this config stops the data at the
+# 2024-12-31 NY close and disables the holdout, so running it as-is cannot spend it again.
+extends: default.yaml
+name: d1_trend
+
+data:
+  timeframe: D1
+  # NY-close days (bar opens 22:00 UTC, closes 22:00 UTC next day). The UTC-midnight
+  # xauusd_D1.parquet has short Sunday bars, which distort daily returns and volatility.
+  bars_path: data_store/xauusd_D1_nyclose.parquet
+  start: "2013-01-01"
+  # Last bar = the 2024-12-31 session (opens 2024-12-30 22:00 UTC, closes 2024-12-31 22:00 UTC).
+  # A later end would include the 2025-01-02 session, which belongs to the used-up holdout.
+  end: "2024-12-31T21:59:59Z"
+
+# Costs, financing, sizing, risk and combiner are inherited unchanged from default.yaml.
+# Note: slippage_range_frac (2% of the execution bar's high-low range) was set for H1 bars; on
+# D1 bars it charges ~2% of the DAILY range per fill, which is conservative.
+
+strategies:
+  # Moskowitz-Ooi-Pedersen / Hurst-Ooi-Pedersen horizons: 1, 3, 6, 12 months of trading days.
+  - name: tsmom
+    params: {horizons: [21, 63, 126, 252], vol_halflife: 30, vol_min_periods: 20}
+  # Carver EWMAC 16/64 (a 1:4 ratio, like the H1 default 32/128).
+  - name: ema_cross
+    params: {fast: 16, slow: 64, vol_halflife: 30, vol_min_periods: 20}
+  # Turtle "System 2": 55-day entry, 20-day exit channel, 2N stop (Faith 2007).
+  - name: donchian
+    params: {entry_n: 55, exit_n: 20, atr_n: 20, stop_atr: 2.0}
+
+walkforward:
+  train: 3Y
+  test: 6M
+  embargo: 1                      # bars = one trading day on D1
+  holdout_start: null             # the 2025-26 holdout is used up (see the header)
+  # DSR trials: 23 pre-registered (docs/RESEARCH_PROTOCOL.md) + the exploratory v2.1 trials of
+  # d1_trend.yaml and managed_gold.yaml: tsmom_d1, ema_cross_d1, donchian_d1, managed_gold,
+  # regime_switch (5 new strategy configs; managed_gold.yaml's tsmom is identical to this one)
+  # + 2 combined books = 30.
+  n_trials: 30

@@ -48,8 +48,8 @@ from aurum.features.volatility import bar_minutes, log_pos, safe_div
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DEFAULT_YIELD_SERIES", "MACRO_LOOKBACK", "macro_features", "macro_lookback",
-           "session_date"]
+__all__ = ["DEFAULT_YIELD_SERIES", "MACRO_DEFAULT_BETA_SERIES", "MACRO_LOOKBACK", "MACRO_REQUIREMENT",
+           "macro_features", "macro_lookback", "session_date"]
 
 #: Series quoted in percent (yields/rates): changes are reported in basis points.
 DEFAULT_YIELD_SERIES: frozenset[str] = frozenset(
@@ -186,7 +186,20 @@ def _gold_daily(bars: pd.DataFrame, anchor: int) -> pd.DataFrame:
     return out[~out.index.duplicated(keep="last")]
 
 
-@register_feature("macro", family="macro", lookback=MACRO_LOOKBACK)
+#: What the ``macro`` group needs from ``md.macro``: ANY series (it computes columns for
+#: whichever series are present and returns an empty frame without macro data). The
+#: registry's ``requires_macro`` is a tuple of series NAMES that the pipeline enforces by
+#: skipping the whole group when one is missing, so declaring e.g. ``("dxy", "real10y")``
+#: there would drop every macro column for a FRED-only download (no yfinance -> no dxy) - a
+#: value change. The declared names therefore stay empty (enforced: nothing) and this
+#: marker records the requirement as metadata on the registered function
+#: (``get_feature("macro").fn.requires_macro``) for listings, docs and strategy code.
+MACRO_REQUIREMENT = "any"
+#: Series named by the defaults (the corr/beta columns): informational, not enforced.
+MACRO_DEFAULT_BETA_SERIES: tuple[str, ...] = ("dxy", "real10y")
+
+
+@register_feature("macro", family="macro", lookback=MACRO_LOOKBACK, requires_macro=())
 def macro_features(
     md: MarketData,
     *,
@@ -196,7 +209,7 @@ def macro_features(
     z_min_periods: int = 60,
     corr_window: int = 60,
     corr_min_periods: int = 40,
-    beta_series: Sequence[str] = ("dxy", "real10y"),
+    beta_series: Sequence[str] = MACRO_DEFAULT_BETA_SERIES,
     yield_series: Iterable[str] = DEFAULT_YIELD_SERIES,
     stale_days: float = 10.0,
     daily_anchor_hour_utc: int = 22,
@@ -291,3 +304,5 @@ def macro_features(
 
 
 macro_features.lookback_fn = macro_lookback  # type: ignore[attr-defined]
+#: registry metadata (see MACRO_REQUIREMENT): reads md.macro, any series
+macro_features.requires_macro = MACRO_REQUIREMENT  # type: ignore[attr-defined]

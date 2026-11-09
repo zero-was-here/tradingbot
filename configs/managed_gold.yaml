@@ -1,0 +1,38 @@
+# EXPLORATORY (not pre-registered) research direction from docs/RESULTS.md: a long-biased,
+# vol-targeted gold allocation with a trend overlay ("managed gold exposure"), next to a
+# regime-conditioned trend follower and plain daily TSMOM. This is an allocation product, not
+# an alpha claim; every strategy here is a NEW TRIAL and is counted in walkforward.n_trials.
+#
+# Inherits the daily NY-close data, the 2024-12-31 data end, the disabled (used-up) holdout,
+# costs, financing, sizing, risk and n_trials = 30 from d1_trend.yaml.
+extends: d1_trend.yaml
+name: managed_gold
+
+strategies:
+  # Base weight 0.5 + 0.5 x Carver-scaled 1/3/6/12-month momentum, cut to 0 when price is below
+  # its ~200-day EMA (half-life 69 days) while 1-week vol >= 1.25 x 6-month vol; long-only.
+  - name: managed_gold
+    params:
+      base_weight: 0.5
+      tilt_weight: 0.5
+      horizons: [21, 63, 126, 252]
+      trend_halflife: 69
+      vol_fast_halflife: 5
+      vol_slow_halflife: 126
+      vol_enter: 1.25
+      vol_exit: 1.0
+      floor: 0.0
+      vol_halflife: 30
+      vol_min_periods: 20
+  # Daily TSMOM scaled by a 2-state Gaussian HMM's filtered P(calm) on daily returns (fitted on
+  # each fold's training window); flat when the chaotic state is more likely than not.
+  - name: regime_switch
+    params:
+      base: tsmom
+      base_params: {horizons: [21, 63, 126, 252], vol_halflife: 30, vol_min_periods: 20}
+      returns: bar                # the bars ARE daily
+      p_flat: 0.5
+      p_full: 0.9
+  # The unconditioned trend follower the regime filter is judged against (same as d1_trend's).
+  - name: tsmom
+    params: {horizons: [21, 63, 126, 252], vol_halflife: 30, vol_min_periods: 20}

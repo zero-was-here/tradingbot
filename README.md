@@ -1,10 +1,11 @@
 # Aurum: systematic gold (XAUUSD) research and trading
 
 Aurum v2 is a rebuild of this repo as an institutional-style systematic trading stack for spot
-gold. It covers point-in-time data, a leakage-tested feature library, 15 strategies
+gold. It covers point-in-time data, a leakage-tested feature library, 17 strategies
 (rule-based, machine learning, reinforcement learning), net-of-cost portfolio construction,
 volatility targeting, a hard risk manager, an event-driven simulator with realistic costs and
-financing, and walk-forward research with deflated statistics. On top sits an **LLM trading
+financing, walk-forward research with deflated statistics, and robustness analytics
+(parameter sweeps, Monte Carlo, decision explanations). On top sits an **LLM trading
 desk**: a Claude-powered Chief Investment Officer that consults specialist agents, **creates
 new agents on demand**, and makes the call. It can never bypass the risk manager.
 
@@ -47,14 +48,15 @@ new agents on demand**, and makes the call. It can never bypass the risk manager
 | **Data** | Free Dukascopy **bid/ask** history (M1 → M15/H1/H4/D1, 2012 onward) with real spreads; MT5 CSV import with broker-timezone/DST handling; Yahoo and FRED macro (DXY, 10y, **real yields**, breakevens, VIX, S&P, silver, oil, Fed funds) stamped with publication lags; NFP/FOMC calendar |
 | **Point-in-time core** | Every frame carries `available_at`. Higher-timeframe bars and macro data are joined only once published. v1 leaked up to 55 minutes of future per bar. |
 | **Features** | 12 causal groups: returns, trend, momentum, mean-reversion, range, 5 volatility estimators (Parkinson, Garman–Klass, Rogers–Satchell, Yang–Zhang…), microstructure, DST-aware sessions, multi-timeframe, macro betas/correlations, event proximity, regime. Every group passes a future-perturbation leakage test. |
-| **Strategies** | 15 registered: TSMOM, EWMAC, Donchian, Kalman trend, z-score fade, RSI(2), Bollinger, volatility squeeze, London/NY opening-range breakout, macro factor, risk-off, cost-aware seasonality, calibrated GBM, **meta-labelling** (triple barrier), **PPO reinforcement learning** |
+| **Strategies** | 17 registered: TSMOM, EWMAC, Donchian, Kalman trend, z-score fade, RSI(2), Bollinger, volatility squeeze, London/NY opening-range breakout, macro factor, risk-off, cost-aware seasonality, calibrated GBM, **meta-labelling** (triple barrier), **PPO reinforcement learning**, **managed gold** (strategic allocation + trend tilt + de-risk switch), **HMM regime switch** (v2.1) |
 | **Models** | GARCH(1,1), HAR-RV, EWMA vol, Gaussian HMM regimes (causal forward filter) |
 | **Portfolio** | Forecast combiner (net-of-cost Sharpe-shrinkage / inverse-vol / HRP / equal) with a forecast diversification multiplier; volatility-targeting sizer with drawdown de-risking and a rebalance band |
 | **Risk** | Pre-trade limits (leverage, margin, lots, spread, trades per day, stale data), NFP/FOMC blackouts, daily-loss and max-drawdown **kill switch that survives restarts**, VaR/ES, stress tests |
 | **Execution** | One event-driven simulator shared by research, RL, paper and live: fill at next open, mid ± half spread ± slippage, intrabar SL/TP (stop first), commission, **rate-based financing** (Fed funds + markup, triple Wednesday) |
 | **Research** | Walk-forward with per-fold refits, purge and embargo, stitched OOS; purged k-fold and CPCV; PSR, **Deflated Sharpe**, **PBO**, bootstrap CIs; holdout ledger; HTML tearsheets; full provenance |
+| **Analytics** (v2.1) | `aurum sweep`: parameter grids, each point a full walk-forward, DSR over the grid, PBO and a **plateau / knife-edge score** with a heatmap (never touches the holdout). `aurum stress`: **block-bootstrap Monte Carlo** (drawdown, recovery, risk of ruin, fan chart) and historical/gap stress. `aurum explain`: **decision waterfall** (weight x forecast x FDM -> sizing -> risk) and exact **PnL attribution** by strategy, for research runs and live/paper logs (`--live`). `aurum dashboard`: interactive HTML dashboard of a run (light/dark) |
 | **LLM desk** | Claude CIO plus specialists (macro, quant, risk, execution) plus **ad-hoc agents created at runtime**; overlay/advisory/discretionary policies bounded by risk; JSONL audit journal; cost caps |
-| **Live** | Paper broker, MetaTrader 5 adapter (magic-number isolation, retcode handling, filling-mode fallback), idempotent OMS, bar-close runner, drift (PSI) and slippage monitoring, webhook alerts |
+| **Live** | Paper broker, MetaTrader 5 adapter (magic-number isolation, retcode handling, filling-mode fallback, persisted server time zone with orders deferred until confirmed), idempotent OMS, bar-close runner with per-decision attribution and in-sleep heartbeats, drift (PSI) and slippage monitoring, webhook alerts, `aurum live status` and a logged, confirmed `aurum live reset-halt` |
 
 About 35k lines of library code and about 1,450 tests.
 
@@ -96,6 +98,13 @@ aurum report --run runs/walkforward_<utc>_<hash>
 aurum desk demo                      # offline LLM-desk demo (scripted client, no API key)
 aurum strategies list
 aurum features list
+
+# v2.1 analytics on a finished run (read-only) and a research-window sweep
+aurum explain   --run runs/walkforward_<utc>_<hash> --attribution   # decision waterfall + PnL by strategy
+aurum stress    --run runs/walkforward_<utc>_<hash>                 # Monte Carlo + stress
+aurum dashboard --run runs/walkforward_<utc>_<hash>                 # interactive HTML (pip install -e ".[viz]")
+aurum sweep -c configs/trend_core.yaml --strategy ema_cross --grid fast=16,32,64 --grid slow=64,128,256 \
+            --end 2024-12-31 --set walkforward.holdout_start=null    # exploratory: every grid point is a trial
 ```
 
 The core-only install has no Yahoo macro download (`[data]`: yfinance), no live Claude calls
@@ -176,7 +185,9 @@ Treat desk replays as illustrative, not as evidence.
 | Learned | `intraday_seasonality` | Hour-of-week drift with empirical-Bayes shrinkage, cost-aware |
 | | `ml_gbm` | Calibrated gradient boosting on 12 feature groups, triple-barrier labels, validation **skill gate** |
 | | `meta_label` | Machine learning sizes or filters a primary signal (López de Prado, AFML ch. 3 and 10) |
-| | `rl_ppo` | PPO on the shared simulator (random starts, PIT observations, reward kept separate from equity) |
+| | `rl_ppo` | PPO on the shared simulator (random starts, PIT observations, reward kept separate from equity); a pre-trained artifact is loaded with a look-ahead guard |
+| Allocation | `managed_gold` | Long-only base weight plus a multi-horizon trend tilt, capped while a latched de-risk switch is on (price below its EMA and fast/slow volatility high) (v2.1) |
+| Regime | `regime_switch` | A base trend forecast scaled by a 2-state Gaussian HMM's causal filtered P(calm), flat in the chaotic regime (v2.1) |
 
 Add your own: subclass `aurum.strategies.base.Strategy`, implement `generate()`, and decorate
 it with `@register_strategy` in one of the `aurum/strategies/` modules (a new module must be
@@ -245,7 +256,7 @@ aurum/
   features/    12 causal feature groups + scaler pipeline
   models/      EWMA / GARCH / HAR volatility, Gaussian HMM
   labels/      triple-barrier labels, uniqueness weights
-  strategies/  15 strategies + registry
+  strategies/  17 strategies + registry
   portfolio/   forecast combiner, sizers
   risk/        risk manager (kill switch, blackouts), VaR/ES
   execution/   cost & financing model, event-driven simulator
@@ -254,8 +265,10 @@ aurum/
   rl/          Gymnasium env on the shared simulator, PPO training
   agents/      LLM trading desk (Claude): CIO, specialists, ad-hoc agents, policy, journal
   live/        brokers (paper, MT5), OMS, runner, monitor
+  viz/         figure style (light/dark palette) and the interactive run dashboard
   cli.py       `aurum` command
-configs/       default, trend_core, fast, live_paper, desk_overlay
+  cli_ext.py   analytics commands: sweep, stress, explain (+ dashboard)
+configs/       default, trend_core, fast, live_paper, desk_overlay, d1_trend, managed_gold (exploratory, end 2024)
 docs/          RESEARCH_PROTOCOL, RESULTS, INTERFACES
 SPEC.md        binding engineering contract between modules
 mt5_ea/        GoldHedgerPro v4 (standalone MQL5 grid EA from v1, see warning below)
@@ -265,7 +278,7 @@ legacy/        the v1 Python code, kept for reference (not maintained)
 ## Testing
 
 ```bash
-pytest -m "not network"          # ~1,450 tests, a few minutes
+pytest -m "not network and not slow"   # ~1,900 tests, 10-15 minutes
 ruff check aurum tests
 ```
 

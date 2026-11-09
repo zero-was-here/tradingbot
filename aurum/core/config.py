@@ -13,11 +13,20 @@ the dataclass tree with strict checking:
 
 * unknown keys raise :class:`ConfigError` with the valid keys and a "did you mean" hint;
 * scalar types are checked (YAML dates are accepted where a string is expected);
-* semantic validation builds the REAL downstream objects (``Instrument``, ``CostModel``,
-  ``VolTargetSizer``, ``RiskLimits``, ``ForecastCombiner``, ``DecisionPolicy``,
-  ``DeskConfig``) and reports every problem at once. Strategy names/params, feature groups,
-  ``instrument.triple_swap_weekday``, ``rl.params`` and unknown ``live.options`` keys are only
-  checked when a command builds the object that uses them.
+* semantic validation (:meth:`AurumConfig.check` / :meth:`AurumConfig.validate`) builds the
+  REAL downstream objects and reports every problem at once: ``Instrument`` (with range
+  checks such as ``triple_swap_weekday`` in 0..4), ``CostModel``, the ``FeaturePipeline``
+  (unknown groups, overrides for groups or parameters that do not exist, negative warm-up),
+  every ``strategies[]`` entry through the strategy registry with its params (unknown
+  parameter -> error), ``ForecastCombiner``, the sizer, both ``RiskLimits``,
+  ``DecisionPolicy``, ``DeskConfig``, the live runner's own ``LiveConfig`` dry-built from the
+  mapping ``aurum live run`` would hand it (unknown ``live.options`` keys -> error; values the
+  runner refuses -> error when strict, warning otherwise) and
+  ``rl.params`` through ``aurum.rl.train.rl_config_from_aurum`` (skipped, and listed as
+  skipped, when the optional RL stack cannot be imported). A strategy NAME missing from the
+  registry is a warning at library load time (user code may register a custom strategy
+  after loading the config; building it still fails clearly) and an error with
+  ``strict=True``, which every CLI command and ``aurum config validate`` use.
 
 Secrets
 -------
@@ -48,6 +57,8 @@ import dataclasses
 import datetime as dt
 import difflib
 import hashlib
+import importlib
+import inspect
 import json
 import logging
 import math
@@ -88,6 +99,7 @@ __all__ = [
     "SizingConfig",
     "StrategyConfig",
     "SyntheticDataConfig",
+    "ValidationReport",
     "WalkForwardConfig",
     "apply_overrides",
     "config_from_dict",
@@ -105,6 +117,31 @@ class ConfigError(ValueError):
         msg = self.problems[0] if len(self.problems) == 1 else (
             f"{len(self.problems)} configuration problems:\n  - " + "\n  - ".join(self.problems))
         super().__init__(msg)
+
+
+@dataclass
+class ValidationReport:
+    """Outcome of :meth:`AurumConfig.check`: every problem at once, plus what was checked.
+
+    ``problems`` make the config invalid (``validate`` raises :class:`ConfigError` with all
+    of them); ``warnings`` do not (e.g. an RL artifact a strategy points at does not exist
+    yet); ``checked`` names what was built from the config; ``skipped`` lists checks that
+    could not run (an optional component such as the RL stack is not installed) and why.
+    """
+
+    problems: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    checked: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.problems
+
+    def raise_if_problems(self) -> ValidationReport:
+        if self.problems:
+            raise ConfigError(self.problems)
+        return self
 
 
 class Secret:
@@ -730,22 +767,28 @@ class AurumConfig:
         """Instantiate enabled strategies from the registry: ``{id: Strategy}``.
 
         A strategy whose ``default_params`` has a ``seed`` gets ``self.seed`` unless set.
+        Unknown names and parameter names not in the strategy's ``default_params`` raise
+        :class:`ConfigError` (all problems at once; indices refer to ``strategies[]``).
         """
         from aurum.strategies.base import get_strategy, list_strategies
 
         registry = list_strategies()
+        position = {id(s): i for i, s in enumerate(self.strategies)}
         out: dict[str, Any] = {}
         problems = []
-        for i, s in enumerate(self.enabled_strategies(only)):
+        for s in self.enabled_strategies(only):
+            i = position[id(s)]
             cls = registry.get(s.name)
             if cls is None:
-                close = difflib.get_close_matches(s.name, list(registry), n=3)
-                hint = f"; did you mean {close}?" if close else ""
-                problems.append(f"strategies[{i}].name: unknown strategy {s.name!r}{hint} "
-                                f"(registered: {sorted(registry)})")
+                problems.append(_unknown_strategy_message(i, s.name, registry))
+                continue
+            defaults = cls.default_params()
+            unknown = _unknown_params_message(i, s, defaults)
+            if unknown:
+                problems.append(unknown)
                 continue
             params = dict(s.params)
-            if "seed" in cls.default_params() and "seed" not in params:
+            if "seed" in defaults and "seed" not in params:
                 params["seed"] = self.seed
             try:
                 out[s.key] = get_strategy(s.name, **params)
@@ -781,22 +824,24 @@ class AurumConfig:
         only ADD runner settings: overriding a value set here (``allow_live_real``,
         ``dry_run``, ``broker``, ``magic``, the ``risk``/``sizer``/``costs`` sections, ...) is
         rejected by :meth:`validate`, so the typed, validated fields are what the runner gets.
+
+        The LLM desk: ``desk`` carries the policy (``live.use_desk`` -> ``enabled``,
+        ``agents.policy``) and the flat ``agents.desk`` keys under ``config`` (backward
+        compatibility); ``desk_config`` carries the FULL ``agents.desk`` mapping, nested
+        ``chief``/``specialist``/``role_models``/``prices`` included, for the runner's
+        :class:`aurum.agents.config.DeskConfig`.
         """
         self.live_sizer_kwargs()   # raises unless the research sizer is the one live implements
         base = self._live_base_mapping()
         problems = _live_option_problems(base, self.live.options)
         if problems:
             raise ConfigError(problems)
-        dropped = sorted(k for k, v in self.agents.desk.items() if isinstance(v, Mapping))
-        if dropped and self.live.use_desk:
-            logger.warning("live desk: nested desk settings %s are not passed to the live runner "
-                           "(it builds DeskConfig from flat keys); desk defaults apply", dropped)
         return _deep_merge(base, copy.deepcopy(self.live.options))
 
     def _live_base_mapping(self) -> dict[str, Any]:
         lv = self.live
         sizer = self._vol_target_kwargs()
-        desk_cfg = {k: v for k, v in self.agents.desk.items() if not isinstance(v, Mapping)}
+        desk_cfg = {k: copy.deepcopy(v) for k, v in self.agents.desk.items() if not isinstance(v, Mapping)}
         out: dict[str, Any] = {
             "artifact_dir": lv.artifact_dir, "symbol": lv.symbol or self.instrument.symbol,
             "timeframe": self.data.timeframe, "magic": lv.magic, "broker": lv.broker, "dry_run": lv.dry_run,
@@ -815,6 +860,7 @@ class AurumConfig:
                      "on_failure": self.agents.policy.on_failure,
                      "max_abs_forecast": self.agents.policy.max_abs_forecast,
                      "min_confidence": self.agents.policy.min_confidence, "config": desk_cfg},
+            "desk_config": _to_plain(self.agents.desk, redact=True, for_hash=False),
         }
         return out
 
@@ -841,11 +887,23 @@ class AurumConfig:
                              default=str, allow_nan=True)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    def validate(self) -> AurumConfig:
-        """Semantic validation (raises :class:`ConfigError` listing every problem)."""
-        problems = _semantic_problems(self)
-        if problems:
-            raise ConfigError(problems)
+    def check(self, *, strict: bool = False) -> ValidationReport:
+        """Full semantic validation WITHOUT raising: a :class:`ValidationReport`.
+
+        Builds every downstream object the config describes (see the module docstring).
+        ``strict=True`` also makes a strategy name missing from the registry a problem (it is
+        a warning otherwise, because user code may register custom strategies after loading
+        the config). Nothing is written and no network is used.
+        """
+        return _semantic_report(self, strict=strict)
+
+    def validate(self, *, strict: bool = False) -> AurumConfig:
+        """Semantic validation: raises :class:`ConfigError` listing EVERY problem (warnings
+        are logged). See :meth:`check` for ``strict``."""
+        rep = self.check(strict=strict)
+        for w in rep.warnings:
+            logger.warning("config: %s", w)
+        rep.raise_if_problems()
         return self
 
 
@@ -1015,7 +1073,10 @@ def _deep_merge(base: Mapping[str, Any], over: Mapping[str, Any]) -> dict[str, A
 
 #: live-runner sections that must come from the typed config (research/live parity), never
 #: from ``live.options``: where to set them instead.
-_LIVE_TYPED_SECTIONS: dict[str, str] = {"risk": "risk.live", "sizer": "sizing", "costs": "costs"}
+_LIVE_TYPED_SECTIONS: dict[str, str] = {"risk": "risk.live", "sizer": "sizing", "costs": "costs",
+                                        "desk_config": "agents.desk"}
+#: the same rule one level down (``live.options.desk.config`` would add DeskConfig values)
+_LIVE_TYPED_NESTED: dict[tuple[str, str], str] = {("desk", "config"): "agents.desk"}
 #: keys that look like credentials (secrets come from the environment only, SPEC §0.5)
 _SECRET_KEY_RE = re.compile(r"(^|_)(pass(word|wd)?|secret|token|api[_-]?key|credentials?|login)$|^env$", re.I)
 
@@ -1040,9 +1101,10 @@ def _live_option_problems(base: Mapping[str, Any], options: Mapping[str, Any], p
     def collide(b: Mapping[str, Any], o: Mapping[str, Any], where: str) -> None:
         for k, v in o.items():
             kp = f"{where}.{k}"
-            if where == path and k in _LIVE_TYPED_SECTIONS:
-                problems.append(f"{kp}: set these values in '{_LIVE_TYPED_SECTIONS[k]}' (the SAME settings the "
-                                "research runs use), not in live.options")
+            nested = _LIVE_TYPED_NESTED.get((where[len(path) + 1:], k)) if where != path else None
+            if (where == path and k in _LIVE_TYPED_SECTIONS) or nested:
+                problems.append(f"{kp}: set these values in '{nested or _LIVE_TYPED_SECTIONS[k]}' (the SAME "
+                                "settings the research runs use), not in live.options")
             elif k in b:
                 if isinstance(b[k], Mapping) and isinstance(v, Mapping):
                     collide(b[k], v, kp)
@@ -1118,8 +1180,12 @@ def apply_overrides(data: Mapping[str, Any], overrides: Sequence[str]) -> dict[s
 
 
 def config_from_dict(data: Mapping[str, Any] | None = None, *, env: Mapping[str, str] | None = None,
-                     validate: bool = True, source: str | None = None) -> AurumConfig:
-    """Build (and by default validate) an :class:`AurumConfig` from a raw mapping."""
+                     validate: bool = True, source: str | None = None, strict: bool = False) -> AurumConfig:
+    """Build (and by default validate) an :class:`AurumConfig` from a raw mapping.
+
+    Structural problems (unknown keys, wrong types, secrets in the mapping) are reported
+    together first; semantic validation (:meth:`AurumConfig.validate`, ``strict`` as there)
+    runs on the built tree and reports all of its problems at once."""
     data = dict(data or {})
     data.pop("extends", None)
     problems: list[str] = []
@@ -1129,14 +1195,17 @@ def config_from_dict(data: Mapping[str, Any] | None = None, *, env: Mapping[str,
     cfg.source = source
     _apply_secret_env(cfg, os.environ if env is None else env)
     if validate:
-        cfg.validate()
+        cfg.validate(strict=strict)
     return cfg
 
 
 def load_config(source: str | Path | Mapping[str, Any] | None = None, *, overrides: Sequence[str] = (),
-                env: Mapping[str, str] | None = None, validate: bool = True) -> AurumConfig:
+                env: Mapping[str, str] | None = None, validate: bool = True, strict: bool = False) -> AurumConfig:
     """Load a YAML file (or mapping; ``None`` = all defaults), apply overrides and secrets
-    from the environment, and validate. Raises :class:`ConfigError` on any problem."""
+    from the environment, and validate. Raises :class:`ConfigError` on any problem.
+
+    ``strict=True`` (used by the CLI) also rejects strategy names missing from the registry
+    (see :meth:`AurumConfig.check`); ``validate=False`` only checks keys and types."""
     if source is None:
         raw: dict[str, Any] = {}
         src = None
@@ -1149,7 +1218,7 @@ def load_config(source: str | Path | Mapping[str, Any] | None = None, *, overrid
         src = str(path)
     if overrides:
         raw = apply_overrides(raw, overrides)
-    return config_from_dict(raw, env=env, validate=validate, source=src)
+    return config_from_dict(raw, env=env, validate=validate, source=src, strict=strict)
 
 
 def _apply_secret_env(cfg: AurumConfig, env: Mapping[str, str]) -> None:
@@ -1186,7 +1255,27 @@ def _check_ts(problems: list[str], path: str, value: str | None) -> Any:
     return t.tz_localize("UTC") if t.tz is None else t.tz_convert("UTC")
 
 
-def _semantic_problems(cfg: AurumConfig) -> list[str]:
+def _semantic_problems(cfg: AurumConfig, *, strict: bool = False) -> list[str]:
+    """Every semantic problem of ``cfg`` (see :meth:`AurumConfig.check`)."""
+    return _semantic_report(cfg, strict=strict).problems
+
+
+def _semantic_report(cfg: AurumConfig, *, strict: bool = False) -> ValidationReport:
+    rep = ValidationReport()
+    rep.problems.extend(_core_problems(cfg))
+    rep.checked += ["data", "costs (CostModel)", "combiner (ForecastCombiner)", "sizing", "risk.research",
+                    "risk.live", "backtest", "walkforward", "agents.policy (DecisionPolicy)",
+                    "agents.desk (DeskConfig)"]
+    rep.problems.extend(_instrument_problems(cfg.instrument))
+    rep.checked.append("instrument (Instrument + ranges)")
+    _check_features(cfg.features, rep)
+    _check_strategies(cfg, rep, strict=strict)
+    _check_live(cfg, rep, strict=strict)
+    _check_rl(cfg, rep)
+    return rep
+
+
+def _core_problems(cfg: AurumConfig) -> list[str]:
     p: list[str] = []
     d = cfg.data
     _try(p, "data.timeframe", lambda: get_timeframe(d.timeframe))
@@ -1203,8 +1292,6 @@ def _semantic_problems(cfg: AurumConfig) -> list[str]:
 
     _try(p, "instrument", cfg.instrument.build)
     _try(p, "costs", cfg.costs.build)
-    if cfg.instrument.lot_step <= 0 or cfg.instrument.contract_size <= 0:
-        p.append("instrument: lot_step and contract_size must be positive")
 
     f = cfg.features
     if not (isinstance(f.enabled, bool) or f.enabled == "auto"):
@@ -1305,6 +1392,9 @@ def _semantic_problems(cfg: AurumConfig) -> list[str]:
         p.append("agents.lookback_bars must be >= 2")
 
     lv = cfg.live
+    if lv.use_desk and not a.enabled:
+        p.append("live.use_desk: true requires agents.enabled: true (the LLM desk is opt-in and calls the paid "
+                 "Claude API; start from configs/desk_overlay.yaml, which enables both)")
     if lv.broker not in ("paper", "mt5"):
         p.append(f"live.broker: expected paper | mt5, got {lv.broker!r}")
     if not 0 < lv.magic < 2**31:
@@ -1335,3 +1425,256 @@ def _limits_with_help(risk: RiskConfig, mode: str) -> Any:
 
         valid = sorted(f.name for f in dataclasses.fields(RiskLimits))
         raise ValueError(f"{exc}; valid keys: {valid}") from exc
+
+
+# ----------------------------------------------------------------------------------------
+# semantic validation: the objects commands build (strategies, features, live, rl)
+# ----------------------------------------------------------------------------------------
+def _did_you_mean(name: str, choices: Sequence[str]) -> str:
+    close = difflib.get_close_matches(str(name), [str(c) for c in choices], n=1)
+    return f" (did you mean {close[0]!r}?)" if close else ""
+
+
+def _exc_text(exc: BaseException) -> str:
+    """One-line message of an exception raised while building an object from the config."""
+    if isinstance(exc, KeyError) and exc.args:
+        return str(exc.args[0])
+    if isinstance(exc, (ValueError, TypeError)):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _unknown_strategy_message(i: int, name: str, registry: Mapping[str, Any]) -> str:
+    close = difflib.get_close_matches(name, list(registry), n=3)
+    hint = f"; did you mean {close}?" if close else ""
+    return f"strategies[{i}].name: unknown strategy {name!r}{hint} (registered: {sorted(registry)})"
+
+
+def _unknown_params_message(i: int, s: StrategyConfig, defaults: Mapping[str, Any]) -> str | None:
+    """Parameter names a strategy does not declare in ``default_params`` (a typo would
+    otherwise be silently ignored by most strategies), or ``None``."""
+    unknown = sorted(str(k) for k in set(s.params) - set(defaults))
+    if not unknown:
+        return None
+    hints = []
+    for k in unknown:
+        close = difflib.get_close_matches(k, [str(d) for d in defaults], n=1)
+        if close:
+            hints.append(f"{k!r} -> {close[0]!r}")
+    hint = f" (did you mean {', '.join(hints)}?)" if hints else ""
+    return (f"strategies[{i}].params ({s.key}): unknown parameter(s) {unknown} for strategy {s.name!r}{hint}; "
+            f"valid: {sorted(defaults)}")
+
+
+def _instrument_problems(ins: InstrumentConfig) -> list[str]:
+    """Range checks :class:`aurum.core.instrument.Instrument` does not do itself."""
+    p: list[str] = []
+    if not str(ins.symbol).strip():
+        p.append("instrument.symbol must be a non-empty string")
+    for name in ("contract_size", "tick_size", "lot_step", "max_lot", "margin_rate"):
+        v = getattr(ins, name)
+        if not (math.isfinite(v) and v > 0):
+            p.append(f"instrument.{name} must be a positive number, got {v!r}")
+    if not (math.isfinite(ins.min_lot) and ins.min_lot >= 0):
+        p.append(f"instrument.min_lot must be >= 0, got {ins.min_lot!r}")
+    elif math.isfinite(ins.max_lot) and ins.min_lot > ins.max_lot:
+        p.append(f"instrument.min_lot ({ins.min_lot}) must not exceed instrument.max_lot ({ins.max_lot})")
+    if math.isfinite(ins.margin_rate) and ins.margin_rate > 1:
+        p.append(f"instrument.margin_rate is the margin as a fraction of notional, in (0, 1] "
+                 f"(0.01 = 1:100 leverage), got {ins.margin_rate!r}")
+    if not (math.isfinite(ins.commission_per_lot) and ins.commission_per_lot >= 0):
+        p.append(f"instrument.commission_per_lot must be >= 0 (USD per lot per side), got {ins.commission_per_lot!r}")
+    for name in ("swap_long_per_lot", "swap_short_per_lot"):
+        if not math.isfinite(getattr(ins, name)):
+            p.append(f"instrument.{name} must be a finite number")
+    if not 0 <= ins.triple_swap_weekday <= 4:
+        p.append(f"instrument.triple_swap_weekday must be 0..4 (Monday..Friday: the weekday whose rollover "
+                 f"is charged three nights, 2 = Wednesday), got {ins.triple_swap_weekday}")
+    if not 0 <= ins.rollover_hour_utc <= 23:
+        p.append(f"instrument.rollover_hour_utc must be 0..23, got {ins.rollover_hour_utc}")
+    return p
+
+
+def _feature_param_names(spec: Any) -> set[str] | None:
+    """Keyword parameters a feature group accepts (``None``: it takes ``**kwargs``)."""
+    params = list(inspect.signature(spec.fn).parameters.values())
+    if any(q.kind is inspect.Parameter.VAR_KEYWORD for q in params):
+        return None
+    names = {q.name for q in params[1:]
+             if q.kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)}
+    return names | {str(k) for k in (spec.params or {})}
+
+
+def _check_features(f: FeaturesConfig, rep: ValidationReport) -> None:
+    """The shared :class:`FeaturePipeline`: every unknown group / override target / override
+    parameter at once (the pipeline itself stops at the first), then the real constructor."""
+    try:
+        from aurum.features.base import list_features
+
+        registered = {s.name: s for s in list_features()}
+    except ImportError as exc:
+        rep.skipped.append(f"features: the feature registry cannot be imported ({_exc_text(exc)})")
+        return
+    names = sorted(registered)
+    p: list[str] = []
+    if f.groups is not None:
+        dup = sorted({g for g in f.groups if f.groups.count(g) > 1})
+        if dup:
+            p.append(f"features.groups: duplicate groups {dup}")
+        for g in f.groups:
+            if g not in registered:
+                p.append(f"features.groups: unknown feature group {g!r}{_did_you_mean(g, names)}; registered: {names}")
+    active = set(registered) if f.groups is None else set(f.groups)
+    for g, ov in f.overrides.items():
+        where = f"features.overrides.{g}"
+        if g not in registered:
+            p.append(f"{where}: unknown feature group{_did_you_mean(g, names)}; registered: {names}")
+            continue
+        if g not in active:
+            p.append(f"{where}: group {g!r} is not in features.groups, so the override would never be used")
+            continue
+        valid = _feature_param_names(registered[g])
+        if valid is None:
+            continue
+        for k in ov:
+            if k not in valid:
+                p.append(f"{where}.{k}: unknown parameter of feature group {g!r}{_did_you_mean(k, sorted(valid))}; "
+                         f"valid: {sorted(valid)}")
+    if f.warmup is not None and f.warmup < 0:
+        p.append(f"features.warmup must be >= 0 (bars) or null, got {f.warmup}")
+    scaler_ok = f.scaler in ("robust", "standard", "none") and (f.clip is None or f.clip > 0)
+    if not p and scaler_ok:   # scaler/clip problems are reported by the core checks already
+        _try(p, "features", f.build)
+    rep.problems.extend(p)
+    rep.checked.append(f"features (FeaturePipeline, {len(active)} groups)")
+
+
+def _check_strategies(cfg: AurumConfig, rep: ValidationReport, *, strict: bool) -> None:
+    """Every ``strategies[]`` entry (enabled or not) through the registry: unknown parameter
+    names and constructor errors are problems; an unknown NAME is a problem when ``strict``
+    (a warning otherwise); a missing file (e.g. an RL artifact not trained yet) is a warning."""
+    if not cfg.strategies:
+        return
+    try:
+        from aurum.strategies.base import list_strategies
+
+        registry = list_strategies()
+    except ImportError as exc:
+        rep.skipped.append(f"strategies: the strategy registry cannot be imported ({_exc_text(exc)})")
+        return
+    built = 0
+    for i, s in enumerate(cfg.strategies):
+        if not s.name:
+            continue                              # reported by the core checks
+        cls = registry.get(s.name)
+        if cls is None:
+            (rep.problems if strict else rep.warnings).append(_unknown_strategy_message(i, s.name, registry))
+            continue
+        try:
+            defaults = dict(cls.default_params())
+        except Exception as exc:  # noqa: BLE001 - a broken strategy class is a config-time finding
+            rep.problems.append(f"strategies[{i}] ({s.key}): {s.name}.default_params() failed: {_exc_text(exc)}")
+            continue
+        msg = _unknown_params_message(i, s, defaults)
+        if msg:
+            rep.problems.append(msg)
+            continue
+        params = dict(s.params)
+        if "seed" in defaults and "seed" not in params:
+            params["seed"] = cfg.seed
+        try:
+            cls(**params)
+        except OSError as exc:
+            rep.warnings.append(f"strategies[{i}] ({s.key}): {_exc_text(exc)} (commands that build this strategy "
+                                "fail until the file exists)")
+        except Exception as exc:  # noqa: BLE001 - any constructor error is a parameter problem
+            rep.problems.append(f"strategies[{i}] ({s.key}): {_exc_text(exc)}")
+        else:
+            built += 1
+    rep.checked.append(f"strategies ({built} of {len(cfg.strategies)} built from the registry)")
+
+
+#: core problems that the live runner's own LiveConfig checks would only repeat
+_LIVE_OVERLAP = ("data.timeframe", "live.", "backtest.", "agents.desk")
+
+
+def _check_live(cfg: AurumConfig, rep: ValidationReport, *, strict: bool) -> None:
+    """Dry-build :class:`aurum.live.runner.LiveConfig` from the mapping ``aurum live run``
+    would hand it. Unknown ``live.options`` keys are always problems; a value the runner's
+    own ``LiveConfig`` refuses is a problem when ``strict`` (CLI, ``aurum config validate``)
+    and a warning otherwise: the runner refuses it again when it starts, so a lenient library
+    load never weakens that guard, it only reports it later."""
+    core = list(rep.problems)
+    try:
+        runner = importlib.import_module("aurum.live.runner")
+    except ImportError as exc:
+        rep.skipped.append(f"live runner settings: aurum.live.runner cannot be imported ({_exc_text(exc)})")
+        return
+    live_cls = getattr(runner, "LiveConfig", None)
+    if (live_cls is None or not dataclasses.is_dataclass(live_cls)
+            or not callable(getattr(live_cls, "from_mapping", None))):
+        rep.skipped.append("live runner settings: aurum.live.runner exposes no LiveConfig.from_mapping")
+        return
+    opts = cfg.live.options if isinstance(cfg.live.options, Mapping) else {}
+    base = cfg._live_base_mapping()
+    known = {f.name for f in dataclasses.fields(live_cls) if f.init}
+    addable = sorted(k for k in known if k not in _LIVE_TYPED_SECTIONS
+                     and (k not in base or isinstance(base[k], Mapping)))
+    for k in opts:
+        if k not in known:
+            rep.problems.append(f"live.options.{k}: unknown live-runner setting{_did_you_mean(str(k), addable)}; "
+                                f"valid keys: {addable}")
+    if not any(pr.startswith(_LIVE_OVERLAP) for pr in core):
+        extra = {k: v for k, v in opts.items() if k in known and k not in _LIVE_TYPED_SECTIONS}
+        try:
+            live_cls.from_mapping(_deep_merge(base, copy.deepcopy(extra)))
+        except (TypeError, ValueError) as exc:
+            msg = f"live (runner settings): {exc}"
+            (rep.problems if strict else rep.warnings).append(
+                msg if strict else f"{msg} (aurum.live.runner refuses this configuration when it starts)")
+    rep.checked.append("live runner settings (aurum.live.runner.LiveConfig)")
+
+
+def _check_rl(cfg: AurumConfig, rep: ValidationReport) -> None:
+    """``rl.params`` (and the env mapping from costs/sizing/risk.research) through
+    ``aurum.rl.train.rl_config_from_aurum``; skipped when the RL stack cannot be imported."""
+    try:
+        rl_train = importlib.import_module("aurum.rl.train")
+    except ImportError as exc:
+        rep.skipped.append(f"rl.params: the RL stack cannot be imported ({_exc_text(exc)}); "
+                           "install aurum[rl] to check it")
+        return
+    from_aurum = getattr(rl_train, "rl_config_from_aurum", None)
+    train_cfg = getattr(rl_train, "RLTrainConfig", None)
+    from_dict = getattr(train_cfg, "from_dict", None) if train_cfg is not None else None
+    env_over = cfg.rl.params.get("env")
+    own_sizer = isinstance(env_over, Mapping) and "sizer" in env_over
+    if callable(from_aurum) and (cfg.sizing.method == "vol_target" or own_sizer):
+        build, how = (lambda: from_aurum(cfg)), "rl.params + env (rl_config_from_aurum)"
+    elif callable(from_dict):
+        # The RL environment sizes with VolTargetSizer: with another research sizer (and no
+        # rl.params.env.sizer) `aurum rl train` refuses the env mapping, which must not make
+        # the config unloadable for research; only rl.params themselves are checked here.
+        how = "rl.params (RLTrainConfig)"
+        if callable(from_aurum):
+            how += (f"; env mapping not checked: sizing.method={cfg.sizing.method!r} needs "
+                    "rl.params.env.sizer for `aurum rl train`")
+        build = lambda: from_dict({"seed": cfg.seed, **cfg.rl.params})  # noqa: E731
+    else:
+        rep.skipped.append("rl.params: aurum.rl.train exposes neither rl_config_from_aurum nor RLTrainConfig")
+        return
+    rl_log = logging.getLogger(getattr(rl_train, "__name__", "aurum.rl.train"))
+    level = rl_log.level
+    rl_log.setLevel(logging.ERROR)   # its build-time WARNINGs belong to `aurum rl train`, not every load
+    try:
+        build()
+    except ImportError as exc:
+        rep.skipped.append(f"rl.params: the RL stack cannot be imported ({_exc_text(exc)})")
+        return
+    except Exception as exc:  # noqa: BLE001 - any build error is a config problem
+        msgs = exc.problems if isinstance(exc, ConfigError) else [_exc_text(exc)]
+        rep.problems.extend(m if m.startswith("rl") else f"rl.params: {m}" for m in msgs)
+        return
+    finally:
+        rl_log.setLevel(level)
+    rep.checked.append(how)

@@ -256,17 +256,31 @@ def test_live_run_unavailable_and_delegation(capsys, env, monkeypatch):
     monkeypatch.setitem(sys.modules, "aurum.live.runner", None)   # simulate an absent module
     code, out, err = run(capsys, "live", "run", "--config", cfg)
     assert code == EXIT_UNAVAILABLE and "aurum.live.runner" in err and "dry_run=True" in out
+    # a runner module without the known entry point (main + LiveConfig.from_mapping) is refused
+    # (the old run_from_config hook, which bypassed the runner's own config validation, is gone)
+    legacy = types.ModuleType("aurum.live.runner")
+    legacy.run_from_config = lambda c, *, i_understand_real_money: 0
+    monkeypatch.setitem(sys.modules, "aurum.live.runner", legacy)
+    code, _, err = run(capsys, "live", "run", "--config", cfg)
+    assert code == EXIT_UNAVAILABLE and "entry point" in err
     calls = {}
     fake = types.ModuleType("aurum.live.runner")
 
-    def run_from_config(c, *, i_understand_real_money):
-        calls["cfg"], calls["flag"] = c, i_understand_real_money
+    class FakeLiveConfig:
+        @classmethod
+        def from_mapping(cls, mapping):
+            calls["mapping"] = mapping
+            return cls()
+
+    def main(argv):
+        calls["argv"] = list(argv)
         return 0
 
-    fake.run_from_config = run_from_config
+    fake.LiveConfig, fake.main = FakeLiveConfig, main
     monkeypatch.setitem(sys.modules, "aurum.live.runner", fake)
     code, out, _ = run(capsys, "live", "run", "--config", cfg, "--i-understand-real-money")
-    assert code == EXIT_OK and calls["flag"] is True and calls["cfg"].live.dry_run is True
+    assert code == EXIT_OK and "--i-understand-real-money" in calls["argv"]
+    assert calls["mapping"]["dry_run"] is True
     assert "has no effect" in out  # allow_live_real is false in live_paper.yaml
 
 
@@ -392,7 +406,7 @@ def test_live_options_cannot_override_safety_fields(capsys, env, monkeypatch):
     # and `live run` refuses before touching the runner
     called = {}
     fake = types.ModuleType("aurum.live.runner")
-    fake.run_from_config = lambda c, *, i_understand_real_money: called.setdefault("ran", True)
+    fake.main = lambda argv: called.setdefault("ran", True)
     monkeypatch.setitem(sys.modules, "aurum.live.runner", fake)
     code, _, err = run(capsys, "live", "run", "--config", cfg, "--set", "live.options={allow_live_real: true}",
                        "--i-understand-real-money")
@@ -405,7 +419,7 @@ def test_live_refuses_a_sizer_it_cannot_reproduce(capsys, env, monkeypatch):
     cfg = str(REPO / "configs" / "live_paper.yaml")
     called = {}
     fake = types.ModuleType("aurum.live.runner")
-    fake.run_from_config = lambda c, *, i_understand_real_money: called.setdefault("ran", True)
+    fake.main = lambda argv: called.setdefault("ran", True)
     fake.save_artifact = lambda *a, **k: called.setdefault("saved", True)
     monkeypatch.setitem(sys.modules, "aurum.live.runner", fake)
     code, _, err = run(capsys, "live", "run", "--config", cfg, "--set", "sizing.method=fixed_fractional")

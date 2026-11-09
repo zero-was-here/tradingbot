@@ -457,3 +457,107 @@ aurum.cli: aurum train-final --config C --out DIR [--cutoff TS] [--from-run WF_D
 - Config hashes changed (costs.financing and the combiner knobs are hashed): `--from-run` refuses runs made before this change unless `--allow-config-mismatch`.
 - Anything built with the default `CostModel()` now pays rate financing (Fed funds from `md.macro` + 2.5%); tests that pin per-lot swap arithmetic use `FinancingModel.fixed()`.
 - The regime group's default warm-up is about one year of bars (5,820 H1), which ML strategies with default feature groups lose from each fold's training slice; set the strategy param `feature_overrides: {regime: {rank_years: ...}}` (or `features.overrides` for the shared pipeline) if that matters. The live runner's history (3 x max_lookback) grows accordingly (about 17.5k H1 / 70k M15 bars).
+
+## v2.1 additions (unreleased)
+
+### Public API additions
+```
+aurum.core.config:
+  ValidationReport(problems, warnings, checked, skipped; .ok, .raise_if_problems())
+  AurumConfig.check(*, strict=False) -> ValidationReport ; AurumConfig.validate(*, strict=False)
+  load_config(source, *, overrides=(), env=None, validate=True, strict=False) ; config_from_dict(..., strict=False)
+  live_runner_mapping(): + top-level "desk_config" (full agents.desk, nested chief/specialist/role_models/prices);
+    live.options.desk_config / live.options.desk.config are rejected
+  build_strategies(): unknown params raise; error indices refer to strategies[]
+aurum.__version__ (importlib.metadata -> pyproject.toml -> "0+unknown")
+aurum.cli: aurum --version ; aurum live status -c C [--json] ; aurum live reset-halt -c C [--confirm RESET] [--reason TEXT]
+  extension hook: aurum.cli_ext.register_all(subparsers) called at parser build (guarded proxy, rolled back on error)
+  desk replay into walkforward.holdout_start -> record_holdout_look(<out>/.., kind="desk_replay", config_hash="<hash>:desk[-fake]")
+  live run: LiveConfig.from_mapping + check_desk_prerequisites before aurum_live_config.yaml is written
+aurum.cli_ext: register_all(subparsers) -> list[str] ; build_parser() ; main(argv)   # python -m aurum.cli_ext
+  aurum sweep -c C --strategy NAME --grid 'p=v1,v2|a:b:step' [--grid ...] [--metric M] [--start D] [--end D] [--out DIR]
+              [--jobs N] [--executor auto|process|thread|serial] [--single-split] [--no-ledger] [--set K=V]
+  aurum stress --run DIR [--book B] [--phase research|holdout] [--paths N] [--horizon 2Y] [--seed S] [--block B]
+               [--shock=PCT ...] [--no-data] [--out DIR]
+  aurum explain --run DIR [--at TS] [--phase ...] [--attribution] [--desk-journal DIR] [--no-data] [--out DIR]
+  aurum explain --live STATE_DIR [--at TS] [--out DIR]       # read-only; default out runs/analysis/explain_live
+  aurum dashboard --run DIR [--journal DIR] [--out FILE] [--cdn] [--max-trades N] [--title T]   (via aurum.viz.cli.register)
+aurum.research.sweep:
+  run_sweep(md, cfg, strategy_name, grid, *, metric="sharpe", maximize=None, walkforward=True, start=None, end=None,
+            n_jobs=0, executor="auto", out_dir=None, write=None, ledger=None, holdout_ledgers=None,
+            respect_holdout_ledgers=True, prior_trials=0, knife_edge_ratio=0.5, n_boot=None, seed=None) -> SweepResult
+    SweepResult(table, returns, best, plateau, n_trials, prior, pbo, window, notes, timing, settings, label="exploratory"; .plot(), .save(dir), .summary())
+  plateau_score(table, grid, metric="sharpe", *, maximize=None, knife_edge_ratio=0.5, plateau_ratio=0.75) -> dict
+  plot_sweep(table, grid, metric, *, maximize, x, y, best, robust, title, subtitle) -> Figure
+  research_window(md, cfg, *, start, end, holdout_ledgers, respect_holdout_ledgers) -> (MarketData, notes)
+  parse_grid, grid_points, point_label, find_holdout_ledgers, read_sweep_ledger ; SWEEP_LEDGER, LOWER_IS_BETTER, NONPOSITIVE_METRICS
+aurum.research.montecarlo:
+  monte_carlo(returns, *, n_paths=10000, horizon="2Y", mean_block=None, seed=0, initial_equity=1.0, dd_thresholds, ruin_thresholds, quantiles)
+    -> MonteCarloResult(.distribution(), .recovery(), .summary())
+  stress_run(source, *, book="combined", phase="research", n_paths, horizon, seed, mean_block, shocks, windows, price, bars,
+             load_data=True, normalise=True, instrument=None) -> StressReport(.save(dir), .summary())
+  stationary_bootstrap_paths(n_hist, n_paths, horizon, mean_block, rng) ; simulate_paths ; path_metrics ; drawdown_exceedance ;
+  risk_of_ruin ; fan_bands ; worst_windows ; gap_shock_table ; load_book ; parse_horizon ; plot_fan ; plot_distributions
+aurum.research.attribution:
+  load_run(source, *, phase, book) -> RunData ; contributions(run) -> DataFrame
+  explain_decision(source, at=None, *, phase, book, md=None, load_data=True) -> DecisionExplanation(table, sizing, risk, notes,
+    final_forecast=None, desk=None; .desk_delta, .plot(), .to_dict())
+  pnl_attribution(source, *, phase, component="net") -> PnLAttribution(per_bar, totals, by_component, by_year; .plot())
+  desk_journal_summary(path) -> DeskSummary(cycles, totals)
+  live_decisions(state_dir | decisions.jsonl | records) -> DataFrame (one row per decision, c:<strategy> columns)
+  explain_live_decision(source, at=None) -> DecisionExplanation (phase "live", with the LLM-desk step)
+  plot_waterfall(ex) ; plot_attribution(att)
+aurum.research.walkforward:
+  record_holdout_look(output_dir, entry, *, cfg=None, md=None) -> Path | None ; data_source_kind(cfg, md) ; DATA_SOURCE_KINDS
+  prior_holdout_looks(..., data_source=None) ; run_single_backtest(..., holdout_ledger=None|path|False)
+  forecast_contributions(forecasts, weights, *, fdm=None, residual=False) ; CLIP_COLUMN = "clip_adjustment"
+  WalkForwardReport.strategy_keys / strategy_forecasts() / fold_weights() / fold_fdm() / bar_weights(include_fdm=True) / contributions(residual=False)
+  HoldoutReport.strategy_forecasts() / contributions()
+  ledger entries: + data_source, data_hash, metrics.benchmark_sharpe (strategy_sharpe excludes the benchmark)
+aurum.research.report: write_tearsheet / tearsheet_html(..., n_boot=None, seed=None) (explicit > extra["config"] > 1000/0)
+aurum.research (lazy): + run_sweep, plateau_score, SweepResult, monte_carlo, stress_run, MonteCarloResult, StressReport,
+  explain_decision, explain_live_decision, live_decisions, pnl_attribution, desk_journal_summary, record_holdout_look,
+  prior_holdout_looks, forecast_contributions
+aurum.strategies.allocation.ManagedGold  ("managed_gold"; base_weight, tilt_weight, horizons, trend_halflife,
+  vol_fast_halflife, vol_slow_halflife, vol_enter, vol_exit, floor, allow_short, vol_halflife, vol_min_periods; .components(md))
+aurum.strategies.regime.RegimeSwitch     ("regime_switch", trainable; base, base_params, returns=auto|daily|bar,
+  daily_anchor_hour_utc=22, n_states=2, p_flat=0.5, p_full=0.9, min_train_obs=60, seed, n_init, warmup;
+  .filtered_probabilities(md), .regime_probabilities(md), .summary()) ; regime_scale(p_ok, p_flat, p_full)
+aurum.strategies.ml / rl: unknown params raise (check_params)
+aurum.strategies.rl.RLPolicyStrategy: + retrain (None -> False with artifact_dir), artifact_sha256; .fit_cutoff_, .artifact_data_ranges_
+aurum.rl.train: rl_config_from_aurum(cfg) -> RLTrainConfig ; artifact_data_ranges(files|dir) ; RLTrainConfig.from_artifact_dict ;
+  ARTIFACT_CONFIG_METADATA ; AURUM_MAPPED_ENV_KEYS ; RLArtifact.data_ranges ; config.json + "data_ranges" (fingerprinted)
+aurum.rl.env: EnvConfig.instrument (Instrument kwargs | None) ; build_instrument()
+aurum.rl (lazy): + rl_config_from_aurum, artifact_data_ranges, ARTIFACT_CONFIG_METADATA, AURUM_MAPPED_ENV_KEYS
+aurum.data.resample.resample_bars(..., complete_from="auto"|None|ts) ; COMPLETE_FROM_AUTO   # strict head rule
+aurum.data.loaders: source_name(path_or_buffer) ; BUFFER_SOURCE_NAME ; DEFAULT_MT5_SERVER_TZ   # load_mt5_csv warns on the default tz
+aurum.models.volatility.Garch11.fit: bars_per_year_ = nominal_bars_per_year(index_bar_minutes(train index)) when not given
+aurum.risk.var.risk_report(result, *, level, price, last_price, bars, instrument, var_window, scenarios)   # report["position"]["price_source"]
+aurum.features.macro: MACRO_REQUIREMENT = "any" (macro_features.requires_macro), MACRO_DEFAULT_BETA_SERIES
+aurum.live.runner:
+  LiveConfig: + desk_config (full DeskConfig mapping), heartbeat_seconds, .desk_enabled, .build_desk_config(), .heartbeat_every_seconds
+  DESK_ON_ERROR = ("follow_quant", "flat", "hold") ; RunnerConfigError(ValueError) ; check_desk_prerequisites(config, *, desk, desk_client, env)
+  decisions.jsonl: + attribution {method, fdm, strategies{name: forecast, weight, contribution}, raw_combined, combined, clipped,
+    unallocated, exact, final_forecast, desk_delta}, + venue_tz_confirmed (MT5) ; CycleResult.attribution
+  heartbeat.json: + heartbeat_every_s, next_wake (in-sleep writes) ; broker_time may be null ; MT5_TZ_STATE_FILE = "mt5_server_tz.json"
+aurum.live.mt5.MT5Broker(..., server_tz_fallback=None, tz_state_path=None, tz_reprobe_seconds=60.0) ; .tz_confirmed ; .tz_status
+  orders refused (MARKET_CLOSED, retcode server_tz_unconfirmed) while the auto zone is unconfirmed; server_tz_corrected on a different offset
+aurum.live.monitor: heartbeat_max_age(heartbeat_every_s, *, periods=3, grace_seconds=120) ;
+  check_heartbeat(path, *, max_age_seconds=None, now=None, periods=3.0, grace_seconds=120.0)
+aurum.live (lazy runner names): + RunnerConfigError, check_desk_prerequisites, heartbeat_max_age
+aurum.viz.style: palette(mode), get_palette, use_style(mode), save_figure(fig_fn, path_stem, modes=("light","dark"), dpi=150, *, formats=("png",)),
+  figure, style_axes, add_legend, label_line_end, zero_line, shade_span, percent_axis, categorical(n<=8), series_color, sequential,
+  diverging, sequential_cmap, diverging_cmap, plotly_template(mode), rc_params
+aurum.viz.dashboard: build_dashboard(run_dir, out_html=None, *, journal_dir=None, include_plotlyjs=True|"cdn"|False, title=None,
+  max_trades=500, rolling_days=126) -> Path ; load_run ; load_desk_journal
+aurum.viz.cli: register(subparsers), add_arguments(p), cmd_dashboard(args), main(argv)   # python -m aurum.viz.cli
+configs: d1_trend.yaml (D1 NY-close bars, ends 2024-12-31, no holdout), managed_gold.yaml (extends d1_trend)
+pyproject: extra viz = ["plotly>=5.20"] (in "all")
+```
+
+### Integration notes
+- Every CLI command validates the config with `strict=True` before loading data; unknown strategy names are an error there and a warning in a plain `load_config()`.
+- `rl_ppo` with `artifact_dir` now LOADS the artifact in `fit` (`retrain` resolves to False) and refuses, at fit time, an artifact whose recorded training/validation period ends after the fit window: a pre-trained policy can only be walk-forwarded on folds whose training ends at or after its validation end.
+- `resample_bars` drops a leading partial bucket (strict head rule); the Dukascopy build is unchanged (sha256 identical). The `mtf` warm-up therefore ends one HTF bar later on histories that start mid-bucket.
+- The `run_from_config` hook of `aurum live run` was removed: the CLI drives `aurum.live.runner` only through `LiveConfig.from_mapping` + `main(argv)`.
+- The runner's per-decision INFO line is shown by `aurum live run` at the default verbosity (only the `aurum.live.runner` logger is raised to INFO); `python -m aurum.live.runner` installs a handler only when the root logger has none.

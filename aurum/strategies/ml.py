@@ -119,6 +119,7 @@ from aurum.labels.triple_barrier import (
     uniqueness_weights,
 )
 from aurum.strategies.base import Strategy, get_strategy, register_strategy
+from aurum.strategies.trend import check_params
 
 logger = logging.getLogger(__name__)
 
@@ -532,7 +533,8 @@ class _MLStrategyBase(Strategy):
     """Feature handling, label weights, classifier fitting, skill gate and reporting shared
     by the ML strategies. Subclasses implement ``_fit`` (labels -> classifier -> forecast
     scalar; wrapped by the transactional :meth:`fit`) and ``generate`` (frozen features ->
-    probability -> forecast)."""
+    probability -> forecast). Unknown parameter names raise ``ValueError`` at construction
+    (:func:`aurum.strategies.trend.check_params`), like every rule-based strategy."""
 
     trainable = True
     #: accepted ``event_filter`` values (subclasses may add their own)
@@ -582,6 +584,9 @@ class _MLStrategyBase(Strategy):
 
     def __init__(self, **params: Any) -> None:
         super().__init__(**params)
+        # A misspelt option (``max_holding_bar=12``, ``skill_gate=None``) would otherwise be
+        # silently ignored and the strategy would run on its defaults.
+        check_params(self)
         self._pipe: FeaturePipeline | None = None
         self._external_features: bool = False
         self._clf: CalibratedGBM | None = None

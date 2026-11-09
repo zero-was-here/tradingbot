@@ -52,13 +52,60 @@ Safety
   to 0 lots (which would liquidate).
 * Errors in features/strategies: ``on_error="hold"`` (default) keeps the position and alerts;
   ``"flatten"`` closes it through risk and the OMS.
-* Graceful shutdown on SIGINT/SIGTERM; a heartbeat file is rewritten every loop.
+* Graceful shutdown on SIGINT/SIGTERM.
+* Heartbeat (``heartbeat.json``): rewritten after every loop iteration AND, on a wall clock,
+  every ``heartbeat_seconds`` (default ``retry_poll_seconds``, i.e. ``live.poll_seconds``,
+  30 s) while the runner sleeps until the next bar close, with ``status`` (``running``, or
+  ``degraded`` during a venue-error back-off), ``next_wake`` and ``heartbeat_every_s``. A
+  watchdog can therefore alert after a few poll periods (e.g. ``max_age_seconds = 3 *
+  heartbeat_every_s + 60``) instead of more than one bar — but it must also allow for the
+  longest decision cycle (feature computation, an LLM desk cycle up to its
+  ``max_cycle_seconds``), during which no heartbeat is written. Simulated-clock replays do not
+  write in-sleep heartbeats.
+* LLM desk prerequisites: with ``desk.enabled`` (``live.use_desk``) and no injected desk or
+  client, :func:`check_desk_prerequisites` requires an importable ``anthropic`` package and a
+  non-empty ``ANTHROPIC_API_KEY`` and raises :class:`RunnerConfigError` otherwise — in
+  :meth:`LiveRunner.start` before any broker call, and in :func:`main` before connecting.
+  ``desk.on_error`` must be one of :data:`DESK_ON_ERROR`; ``desk_config`` (the full
+  DeskConfig mapping) is validated when the config is loaded.
+* Logging: :func:`main` only installs a log handler when the root logger has none (it never
+  overrides the configuration of ``aurum live run`` or of a service wrapper). Each decision
+  logs ONE concise INFO line (``decision <time> <symbol> [<mode>]: combined .. desk <action>
+  final .. target <lots> approved <lots> held <lots> orders <summary> status=..``); everything
+  else is in the decision log.
 * Every decision is appended to ``decisions.jsonl`` (forecasts per strategy, combined, desk
-  decision, sizing, risk, orders, fills, equity).
+  decision, sizing, risk, orders, fills, equity, and the attribution below).
 * The final forecast of the last decision is persisted (``runner_state.json``) and passed to
   the LLM desk as ``previous_forecast``, so ``DecisionPolicy(on_failure="hold")`` / a ``hold``
   decision keep the standing forecast — also after a restart or a cycle in which the desk
   was not consulted (a fresh desk would otherwise treat "hold" as flat).
+
+Decision attribution
+--------------------
+Every ``type == "decision"`` record carries ``attribution`` (``null`` when the signal chain
+failed or the bar was skipped for data reasons) answering "why did we trade"::
+
+    attribution = {
+      "method":       str,          # combiner method ("sharpe_shrink", "equal", ...),
+                                    # "equal_mean" (no combiner: mean of the forecasts) or
+                                    # the combiner's class name when it exposes no weights
+      "fdm":          float | None, # forecast diversification multiplier applied
+      "strategies":   {name: {"forecast": f_i,          # clipped to [-1, 1]; 0 if it failed
+                              "weight": w_i,            # combiner weight (0 if unfitted)
+                              "contribution": w_i * f_i * fdm}},
+      "raw_combined": float | None, # sum of contributions, BEFORE the [-1, 1] clip
+      "combined":     float,        # = clip(raw_combined, -1, 1) = record["combined"]
+      "clipped":      bool,         # |raw_combined| > 1
+      "unallocated":  float | None, # max(0, 1 - sum w_i): risk the combiner left unused
+      "exact":        bool,         # the contributions reproduce "combined" (1e-9)
+      "final_forecast": float,      # after the LLM desk (= combined without a desk)
+      "desk_delta":   float,        # final_forecast - combined
+    }
+
+For a combiner without ``weights_``/``fdm_`` the weights and contributions are ``None`` and
+``exact`` is False. The record also has ``venue_tz_confirmed`` when the venue reports it
+(MT5): False while the ``server_tz: auto`` offset is a persisted/fallback guess, in which case
+the adapter defers every order until a fresh tick confirms the offset.
 
 Trading artifact
 ----------------
@@ -80,9 +127,11 @@ verifies every file's sha256 against the manifest BEFORE unpickling (integrity) 
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import hashlib
 import hmac
+import importlib
 import importlib.metadata
 import json
 import logging
@@ -144,14 +193,17 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ARTIFACT_FORMAT",
     "ARTIFACT_VERSION",
+    "DESK_ON_ERROR",
     "ArtifactError",
     "CycleResult",
     "LiveConfig",
     "LiveDeskDataProvider",
     "LiveRunner",
     "RealMoneyGuardError",
+    "RunnerConfigError",
     "RunnerLockedError",
     "TradingArtifact",
+    "check_desk_prerequisites",
     "check_real_money_guard",
     "load_artifact",
     "main",
@@ -442,7 +494,7 @@ def load_artifact(path: str | Path, *, verify: bool = True, require_hmac: bool =
 # =============================================================================================
 # configuration
 # =============================================================================================
-_SECTIONS = ("risk", "sizer", "costs", "desk", "monitor", "paper", "mt5", "oms")
+_SECTIONS = ("risk", "sizer", "costs", "desk", "desk_config", "monitor", "paper", "mt5", "oms")
 #: safety switches that must be real booleans: ``bool("false")`` is True and ``bool(None)`` is
 #: False, so a quoted YAML value or an empty ``dry_run:`` would silently flip them
 _STRICT_BOOLS = ("dry_run", "allow_live_real", "flatten_on_shutdown")
@@ -450,6 +502,39 @@ _STRICT_BOOLS = ("dry_run", "allow_live_real", "flatten_on_shutdown")
 #: that only the venue may decide (``hedging``: forcing it on a netting account would net our
 #: orders against other EAs' positions)
 _OMS_RESERVED = ("dry_run", "magic", "symbol", "state_path", "sleep", "broker", "instrument", "hedging")
+#: what the runner does when the LLM desk RAISES (``desk.on_error``); a typo must not silently
+#: become a third behaviour
+DESK_ON_ERROR = ("follow_quant", "flat", "hold")
+
+
+class RunnerConfigError(ValueError):
+    """The runner cannot start with this configuration/environment (e.g. the LLM desk is
+    enabled but the ``anthropic`` package or ``ANTHROPIC_API_KEY`` is missing)."""
+
+
+def _desk_config_kwargs(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """``DeskConfig`` keyword arguments from a plain (YAML) mapping.
+
+    Nested mappings become their value types, exactly like
+    :meth:`aurum.core.config.AgentsConfig.desk_config`: ``chief``/``specialist`` and each
+    ``role_models`` value -> ``AgentModelConfig``, each ``prices`` value -> ``ModelPrice``
+    (merged over the default price table), ``adhoc_tool_whitelist`` list -> tuple."""
+    from aurum.agents.config import DEFAULT_PRICES, AgentModelConfig, ModelPrice
+
+    kw = copy.deepcopy(dict(raw))
+    for role in ("chief", "specialist"):
+        if isinstance(kw.get(role), Mapping):
+            kw[role] = AgentModelConfig(**kw[role])
+    if isinstance(kw.get("role_models"), Mapping):
+        kw["role_models"] = {str(k): AgentModelConfig(**v) if isinstance(v, Mapping) else v
+                             for k, v in kw["role_models"].items()}
+    if isinstance(kw.get("prices"), Mapping):
+        prices = dict(DEFAULT_PRICES)
+        prices.update({str(k): ModelPrice(**v) if isinstance(v, Mapping) else v for k, v in kw["prices"].items()})
+        kw["prices"] = prices
+    if isinstance(kw.get("adhoc_tool_whitelist"), list):
+        kw["adhoc_tool_whitelist"] = tuple(kw["adhoc_tool_whitelist"])
+    return kw
 
 
 def _is_true(x: Any) -> bool:
@@ -472,14 +557,22 @@ class LiveConfig:
 
     Sub-sections (plain dicts): ``risk`` (RiskLimits kwargs — LIVE limits), ``sizer``
     (VolTargetSizer kwargs, override the artifact's), ``costs`` (CostModel kwargs used by the
-    paper broker and the slippage monitor), ``desk`` (``enabled``, ``mode``, ``on_failure``,
-    ``on_error``, ``max_abs_forecast``, ``min_confidence``, ``config`` = DeskConfig kwargs),
+    paper broker and the slippage monitor), ``desk`` (``enabled`` (a real boolean),
+    ``mode``, ``on_failure``, ``on_error`` (one of :data:`DESK_ON_ERROR`, checked strictly),
+    ``max_abs_forecast``, ``min_confidence``, ``config`` = flat DeskConfig kwargs, kept for
+    backward compatibility), ``desk_config`` (the FULL
+    :class:`~aurum.agents.config.DeskConfig` as a mapping, nested ``chief``/``specialist``/
+    ``role_models``/``prices`` included — see :meth:`build_desk_config`),
     ``monitor`` (``webhook``, ``webhook_style``, ``drift_every``, ``drift_window``,
     ``psi_warn``, ``psi_alert``, ``z_warn``, ``z_alert``, ``alert_cooldown_seconds``),
     ``paper`` (``data``: ``"replay"`` (default: ``bars_path`` replayed on a simulated clock
     from ``start`` or after ``warmup_bars``, until ``end``) or ``"mt5"`` (paper fills on live MT5
     data, wall clock); ``initial_equity``, ``hedging``), ``mt5``
-    (MT5Broker kwargs: ``server_tz``, ``deviation_points``...), ``oms`` (OrderManager kwargs).
+    (MT5Broker kwargs: ``server_tz``, ``server_tz_fallback``, ``tz_state_path``,
+    ``deviation_points``...), ``oms`` (OrderManager kwargs).
+
+    ``heartbeat_seconds`` (default ``None`` = ``retry_poll_seconds``) is how often the
+    heartbeat file is rewritten while the runner sleeps between bars (wall-clock runs).
     """
 
     artifact_dir: str | None = None
@@ -497,6 +590,7 @@ class LiveConfig:
     max_bar_age_seconds: float | None = None
     retry_poll_seconds: float = 30.0
     retry_poll_max_seconds: float = 300.0
+    heartbeat_seconds: float | None = None
     max_defer_seconds: float | None = None
     stop_atr_mult: float | None = None
     take_profit_atr_mult: float | None = None
@@ -514,6 +608,7 @@ class LiveConfig:
     sizer: dict[str, Any] = field(default_factory=dict)
     costs: dict[str, Any] = field(default_factory=dict)
     desk: dict[str, Any] = field(default_factory=dict)
+    desk_config: dict[str, Any] = field(default_factory=dict)
     monitor: dict[str, Any] = field(default_factory=dict)
     paper: dict[str, Any] = field(default_factory=dict)
     mt5: dict[str, Any] = field(default_factory=dict)
@@ -525,6 +620,7 @@ class LiveConfig:
         for sec in _SECTIONS:
             if not isinstance(getattr(self, sec), Mapping):
                 raise ValueError(f"{sec} must be a mapping, got {type(getattr(self, sec)).__name__}")
+        self._validate_desk()
         reserved = sorted(set(self.oms) & set(_OMS_RESERVED))
         if reserved:
             raise ValueError(f"oms section may not set {reserved}: dry_run/magic/symbol come from the live "
@@ -550,10 +646,61 @@ class LiveConfig:
             raise ValueError("magic must be a positive 32-bit integer")
         if int(self.stop_cooldown_bars) < 0:
             raise ValueError("stop_cooldown_bars must be >= 0")
+        if not _finite(self.retry_poll_seconds) > 0:
+            raise ValueError("retry_poll_seconds must be positive")
+        if self.heartbeat_seconds is not None and not _finite(self.heartbeat_seconds) > 0:
+            raise ValueError("heartbeat_seconds must be positive or None (None = retry_poll_seconds)")
+
+    def _validate_desk(self) -> None:
+        dc = self.desk
+        if "enabled" in dc and dc["enabled"] is not None:
+            _strict_bool("desk.enabled", dc["enabled"])
+        on_error = dc.get("on_error")
+        if on_error is not None and (not isinstance(on_error, str) or on_error not in DESK_ON_ERROR):
+            raise ValueError(f"desk.on_error must be one of {list(DESK_ON_ERROR)}, got {on_error!r}")
+        legacy = dc.get("config")
+        if legacy is not None and not isinstance(legacy, Mapping):
+            raise ValueError(f"desk.config must be a mapping, got {type(legacy).__name__}")
+        if legacy and self.desk_config:
+            try:  # compare NORMALISED values: a list vs tuple whitelist is not a conflict
+                old = _desk_config_kwargs(legacy)
+                new = _desk_config_kwargs(self.desk_config)
+            except TypeError as exc:  # e.g. chief: {bogus: 1}
+                raise ValueError(f"invalid desk_config: {exc}") from exc
+            clash = sorted(k for k in set(old) & set(new) if old[k] != new[k])
+            if clash:
+                raise ValueError(f"DeskConfig keys {clash} are set to different values in desk.config and "
+                                 "desk_config; give each setting once (desk_config is the full DeskConfig)")
+        if legacy or self.desk_config:
+            self.build_desk_config()  # fail at load time, not at the first desk cycle
+
+    @property
+    def desk_enabled(self) -> bool:
+        """``desk.enabled`` (strict: only a real ``True`` enables the LLM desk)."""
+        return _is_true(self.desk.get("enabled", False))
+
+    def build_desk_config(self) -> Any:
+        """The :class:`~aurum.agents.config.DeskConfig` for the live desk.
+
+        ``desk_config`` (the full DeskConfig mapping, nested values included) is merged over
+        the legacy flat ``desk.config`` keys; a key given in both must agree. Unknown keys or
+        invalid values raise :class:`ValueError`."""
+        from aurum.agents.config import DeskConfig
+
+        merged = {**dict(self.desk.get("config") or {}), **dict(self.desk_config)}
+        try:
+            return DeskConfig(**_desk_config_kwargs(merged))
+        except TypeError as exc:  # unknown keyword -> a config error, not a programming error
+            raise ValueError(f"invalid desk_config: {exc}") from exc
 
     @property
     def tf_seconds(self) -> float:
         return get_timeframe(self.timeframe).delta.total_seconds()
+
+    @property
+    def heartbeat_every_seconds(self) -> float:
+        """Heartbeat period while sleeping between bars (``heartbeat_seconds`` or the poll)."""
+        return float(self.heartbeat_seconds if self.heartbeat_seconds is not None else self.retry_poll_seconds)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> LiveConfig:
@@ -612,6 +759,33 @@ def check_real_money_guard(is_demo: bool, *, allow_live_real: bool, i_understand
         raise RealMoneyGuardError("broker account is NOT a demo account; refusing to run. Real-money trading "
                                   "requires " + " AND ".join(missing))
     return True
+
+
+def check_desk_prerequisites(config: LiveConfig, *, desk: Any | None = None, desk_client: Any | None = None,
+                             env: Mapping[str, str] | None = None) -> None:
+    """Fail fast when the LLM desk is enabled but cannot possibly run.
+
+    Applies when ``desk.enabled`` (``live.use_desk``) is set and the runner would build the
+    Anthropic client itself (no ``desk`` object and no ``desk_client`` injected): the
+    ``anthropic`` package must import and ``ANTHROPIC_API_KEY`` must be non-empty. Otherwise
+    :class:`RunnerConfigError` with an actionable message (the key's value is never shown).
+    :meth:`LiveRunner.start` calls this before it touches the broker, and :func:`main`
+    before it even connects to one; without the check every desk cycle would fail at the
+    first bar and silently fall back to ``on_failure``."""
+    if not config.desk_enabled or desk is not None or desk_client is not None:
+        return
+    try:
+        importlib.import_module("anthropic")
+    except Exception as exc:  # noqa: BLE001 - ImportError or a broken install: same verdict
+        raise RunnerConfigError(
+            "the LLM desk is enabled (live.use_desk / desk.enabled) but the 'anthropic' package cannot be "
+            f"imported ({type(exc).__name__}: {exc}); install it with pip install 'aurum[agents]' or disable the "
+            "desk") from exc
+    environ = os.environ if env is None else env
+    if not str(environ.get("ANTHROPIC_API_KEY") or "").strip():
+        raise RunnerConfigError(
+            "the LLM desk is enabled (live.use_desk / desk.enabled) but ANTHROPIC_API_KEY is not set; export "
+            "it in the runner's environment or disable the desk")
 
 
 class RunnerLockedError(RuntimeError):
@@ -758,6 +932,7 @@ class CycleResult:
     report: ExecutionReport | None = None
     errors: list[str] = field(default_factory=list)
     record: dict[str, Any] = field(default_factory=dict)
+    attribution: dict[str, Any] | None = None
 
 
 @dataclass
@@ -787,6 +962,35 @@ def _finite(x: Any, default: float = math.nan) -> float:
     except (TypeError, ValueError):
         return default
     return v if math.isfinite(v) else default
+
+
+def _fmt(x: Any, spec: str = "+.3f") -> str:
+    """Number for a log line; ``n/a`` for None/NaN (never raises)."""
+    v = _finite(x)
+    return format(v, spec) if math.isfinite(v) else "n/a"
+
+
+def _orders_summary(report: ExecutionReport | None, *, max_legs: int = 3) -> str:
+    """Compact text of what the OMS did with a decision, for the per-decision INFO line:
+    ``none`` (nothing reconciled), the report status when no leg was needed or sent
+    (``noop``/``duplicate``/``conflict``...), ``planned BUY 0.50`` in dry-run, or the sent legs
+    with their outcome (``close SELL 1.00 filled, open BUY 0.40 market_closed``)."""
+    if report is None:
+        return "none"
+
+    def side(s: Any) -> str:
+        return "BUY" if int(s) > 0 else "SELL"
+
+    if report.legs:
+        parts = [f"{lr.leg.kind} {side(lr.leg.side)} {lr.leg.lots:.2f} {lr.status}" for lr in report.legs]
+    elif report.planned:
+        parts = [f"{'planned ' if report.dry_run else ''}{leg.kind} {side(leg.side)} {leg.lots:.2f}"
+                 for leg in report.planned]
+    else:
+        return report.status
+    more = len(parts) - max_legs
+    text = ", ".join(parts[:max_legs]) + (f", +{more} more" if more > 0 else "")
+    return text if report.legs or report.dry_run else f"{report.status}: {text}"
 
 
 class LiveRunner:
@@ -896,6 +1100,8 @@ class LiveRunner:
         if self._started:
             return
         cfg = self.config
+        # Configuration/environment problems surface before anything touches the venue.
+        check_desk_prerequisites(cfg, desk=self._desk, desk_client=self._desk_client)
         # Lock FIRST: even reading the account can write state (the paper broker settles and
         # saves its book), and a second process must not touch this state directory at all.
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -968,11 +1174,20 @@ class LiveRunner:
         self._build_desk()
         self._load_runner_state()
         self._started = True
+        venue_tz = getattr(self.broker, "tz_status", None)
+        venue_tz = dict(venue_tz) if isinstance(venue_tz, Mapping) else None
         self._log({"type": "start", "time": self.broker.server_time(), "mode": self.mode,
                    "dry_run": cfg.dry_run, "artifact": str(art.path) if art.path else None,
                    "artifact_created": art.manifest.get("created_at"), "strategies": sorted(art.strategies),
                    "n_history": self.n_history, "min_bars": self.min_bars, "account": account.to_dict(),
-                   "risk_halted": self.risk.halted})
+                   "risk_halted": self.risk.halted, "heartbeat_every_s": cfg.heartbeat_every_seconds,
+                   **({"venue_tz": venue_tz} if venue_tz is not None else {})})
+        if venue_tz is not None and venue_tz.get("confirmed") is False:
+            msg = (f"venue server time zone {venue_tz.get('server_tz')!r} comes from {venue_tz.get('source')} (no "
+                   "fresh tick yet): " + ("dry-run decisions proceed" if cfg.dry_run else
+                                         "orders are deferred until a fresh tick confirms it"))
+            logger.warning(msg)
+            self.monitor.alerts.alert("warning", "server_tz_unconfirmed", msg, time=self.clock.now())
         logger.info("LiveRunner started [%s] %s %s magic=%d history=%d bars (warm-up %d)", self.mode,
                     cfg.symbol, self.tf.name, cfg.magic, self.n_history, self.min_bars)
 
@@ -1001,7 +1216,7 @@ class LiveRunner:
 
     def _build_desk(self) -> None:
         dc = self.config.desk
-        if self._desk is None and not dc.get("enabled", False):
+        if self._desk is None and not self.config.desk_enabled:
             self.desk = None
             self.desk_provider = None
             return
@@ -1010,14 +1225,14 @@ class LiveRunner:
             prov = getattr(self.desk, "provider", None)
             self.desk_provider = prov if isinstance(prov, LiveDeskDataProvider) else None
             return
-        from aurum.agents import DecisionPolicy, DeskConfig, TradingDesk
+        from aurum.agents import DecisionPolicy, TradingDesk
 
         self.desk_provider = LiveDeskDataProvider()
         policy = DecisionPolicy(mode=dc.get("mode", "overlay"), on_failure=dc.get("on_failure", "follow_quant"),
                                 max_abs_forecast=float(dc.get("max_abs_forecast", 1.0)),
                                 min_confidence=float(dc.get("min_confidence", 0.0)))
         self.desk = TradingDesk(self.desk_provider, client=self._desk_client,
-                                config=DeskConfig(**dict(dc.get("config", {}))), policy=policy,
+                                config=self.config.build_desk_config(), policy=policy,
                                 journal_dir=self.state_dir / "desk_journal")
 
     def _load_runner_state(self) -> None:
@@ -1217,7 +1432,7 @@ class LiveRunner:
                             logger.error("reconnect failed: %s", rexc)
                     backoff = min(self.config.retry_poll_seconds * 2 ** min(failures - 1, 6),
                                   self.config.retry_poll_max_seconds)
-                    self._sleep_until(self.clock.now() + pd.Timedelta(seconds=backoff))
+                    self._sleep_until(self.clock.now() + pd.Timedelta(seconds=backoff), status="degraded")
                     continue
                 if res is not None:
                     results.append(res)
@@ -1228,7 +1443,7 @@ class LiveRunner:
                 wake = self._next_wake(self.broker.server_time())
                 if until is not None:
                     wake = min(wake, until)
-                self._sleep_until(wake)
+                self._sleep_until(wake, status="running")
         except BaseException as exc:
             status = f"error: {type(exc).__name__}"
             logger.exception("runner loop terminated by an exception")
@@ -1253,13 +1468,29 @@ class LiveRunner:
         logger.warning("signal %d received: finishing the current cycle and shutting down", signum)
         self._stop.set()
 
-    def _sleep_until(self, t: pd.Timestamp) -> None:
+    def _sleep_until(self, t: pd.Timestamp, *, status: str = "running") -> None:
+        """Wait until clock time ``t`` (or a stop request).
+
+        On a wall clock the wait is sliced into <= 1 s naps (prompt shutdown) and the heartbeat
+        is rewritten every ``config.heartbeat_every_seconds`` (default ``retry_poll_seconds``)
+        with ``status`` and ``next_wake``, so an external watchdog can use a threshold of a few
+        poll periods instead of more than one bar. A simulated clock (replays) jumps straight
+        to ``t``: its heartbeats would not mean anything to a wall-clock watchdog."""
+        every = max(self.config.heartbeat_every_seconds, 0.0)
+        last_hb = self.clock.now()
         while not self._stop.is_set():
             now = self.clock.now()
             if now >= t:
                 return
             remaining = (t - now).total_seconds()
-            self.clock.sleep(remaining if self.clock.simulated else min(remaining, 1.0))
+            if self.clock.simulated:
+                self.clock.sleep(remaining)
+                continue
+            self.clock.sleep(min(remaining, 1.0))
+            now = self.clock.now()
+            if (now - last_hb).total_seconds() >= every and not self._stop.is_set():
+                last_hb = now
+                self._heartbeat(status, force=True, next_wake=t)
 
     def _next_wake(self, now: pd.Timestamp) -> pd.Timestamp:
         delay = pd.Timedelta(seconds=self.config.bar_close_delay_seconds)
@@ -1306,20 +1537,32 @@ class LiveRunner:
         self._lock_fh = None
         logger.info("LiveRunner stopped (%s) after %d decisions", status, self.n_decisions)
 
-    def _heartbeat(self, status: str, *, force: bool = False) -> None:
+    def _heartbeat(self, status: str, *, force: bool = False, next_wake: pd.Timestamp | None = None) -> None:
         """Rewrite the heartbeat file (throttled to one write per ``heartbeat_interval_s`` of
-        WALL time unless the status changes — a watchdog measures real time)."""
+        WALL time unless the status changes — a watchdog measures real time).
+
+        Fields: ``time`` (wall clock UTC), ``pid``, ``status``, ``mode``, ``broker_time``,
+        ``last_bar``, ``n_decisions``, ``pending``, ``halted``, ``heartbeat_every_s`` and, while
+        sleeping between bars, ``next_wake``. Never raises: a heartbeat problem (venue clock
+        unavailable, disk full) is logged, it must not take the trading loop down."""
         mono = time.monotonic()
         if (not force and self._hb_last is not None and self._hb_last[1] == status
                 and mono - self._hb_last[0] < self.heartbeat_interval_s):
             return
         self._hb_last = (mono, status)
         try:
-            write_heartbeat(self.heartbeat_path, status=status, mode=self.mode, broker_time=self.broker.server_time(),
+            broker_time = self.broker.server_time()
+        except Exception as exc:  # noqa: BLE001 - venue trouble is reported by the main loop
+            logger.debug("broker time unavailable for the heartbeat: %s", exc)
+            broker_time = None
+        try:
+            write_heartbeat(self.heartbeat_path, status=status, mode=self.mode, broker_time=broker_time,
                             last_bar=self._last_bar, n_decisions=self.n_decisions,
                             pending=self._pending.decision_time if self._pending else None,
-                            halted=self.risk.halted if hasattr(self, "risk") else None)
-        except OSError as exc:  # pragma: no cover
+                            halted=self.risk.halted if hasattr(self, "risk") else None,
+                            heartbeat_every_s=self.config.heartbeat_every_seconds,
+                            **({"next_wake": next_wake} if next_wake is not None else {}))
+        except (OSError, TypeError, ValueError) as exc:  # pragma: no cover - disk/serialisation trouble
             logger.error("heartbeat write failed: %s", exc)
 
     def _log(self, record: Mapping[str, Any]) -> None:
@@ -1386,7 +1629,12 @@ class LiveRunner:
         res = CycleResult(time=t_dec, bar_time=bar_time, status="pending")
         rec: dict[str, Any] = {"type": "decision", "time": t_dec, "bar_time": bar_time, "now": now,
                                "mode": self.mode, "dry_run": cfg.dry_run, "price": close, "bar_spread": bar_spread,
-                               "data_age_s": age, "n_bars": len(bars)}
+                               "data_age_s": age, "n_bars": len(bars), "attribution": None}
+        tz_ok = getattr(self.broker, "tz_confirmed", None)
+        if isinstance(tz_ok, (bool, np.bool_)):
+            # MT5 'auto' time zone running on a persisted/fallback offset: orders are refused
+            # (deferred) by the adapter until a fresh tick confirms it; dry-run decides anyway
+            rec["venue_tz_confirmed"] = bool(tz_ok)
         if self._pending is not None:
             rec["superseded_pending"] = self._pending.decision_time
             self._pending = None
@@ -1442,6 +1690,12 @@ class LiveRunner:
         res.forecasts = forecasts
         res.combined = combined
         rec.update(forecasts=forecasts, combined=combined)
+        if signal_error is None:
+            try:
+                res.attribution = self._attribution(forecasts, combined)
+            except Exception:  # noqa: BLE001 - explanatory only: never block a decision on it
+                logger.exception("decision attribution failed at %s", t_dec)
+            rec["attribution"] = res.attribution
 
         # ---- account & risk bookkeeping --------------------------------------------------
         account = self.broker.account()
@@ -1474,6 +1728,9 @@ class LiveRunner:
         res.final_forecast = final
         rec["final_forecast"] = final
         rec["previous_forecast"] = self._prev_final
+        if res.attribution is not None:
+            res.attribution["final_forecast"] = float(final)
+            res.attribution["desk_delta"] = float(final) - float(combined)
         # the standing forecast for the next cycle's desk ("hold"): what was actually sized;
         # a signal error with on_error="hold" keeps the old one, "flatten" makes it flat
         if signal_error is None:
@@ -1583,14 +1840,71 @@ class LiveRunner:
         self.cycles.append(res)
         if len(self.cycles) > self.keep_cycles:
             del self.cycles[: len(self.cycles) - self.keep_cycles]
-        logger.info("[%s] %s decision %s: combined %+.3f final %+.3f -> requested %+.2f approved %+.2f "
-                    "(current %+.2f) status=%s", self.mode, self.config.symbol, t_dec,
-                    res.combined if res.combined is not None else float("nan"),
-                    res.final_forecast if res.final_forecast is not None else float("nan"),
-                    res.requested_lots if res.requested_lots is not None else float("nan"),
-                    res.approved_lots if res.approved_lots is not None else float("nan"),
-                    res.current_lots if res.current_lots is not None else float("nan"), res.status)
+        logger.info("%s", self._decision_line(res))
         return res
+
+    def _decision_line(self, res: CycleResult) -> str:
+        """The ONE concise INFO line logged per decision (the full record is in the JSONL):
+        decision time, combined forecast, desk action, final forecast, target (sizer) lots,
+        risk-approved lots, held lots before, orders, status."""
+        if res.desk is None:
+            desk = "off"
+        else:
+            desk = str(res.desk.get("action") or res.desk.get("status") or "?")
+        return (f"decision {res.time.isoformat()} {self.config.symbol} [{self.mode}]: "
+                f"combined {_fmt(res.combined)} desk {desk} final {_fmt(res.final_forecast)} "
+                f"target {_fmt(res.requested_lots, '+.2f')} approved {_fmt(res.approved_lots, '+.2f')} "
+                f"held {_fmt(res.current_lots, '+.2f')} orders {_orders_summary(res.report)} status={res.status}")
+
+    def _attribution(self, forecasts: Mapping[str, float], combined: float) -> dict[str, Any]:
+        """Why the combined forecast is what it is: per strategy ``w_i * f_i * FDM``.
+
+        Reads the fitted combiner's ``weights_`` and ``fdm_`` (a
+        :class:`~aurum.portfolio.combiner.ForecastCombiner`); without a combiner the runner
+        uses the equal-weight mean (``w_i = 1/N``, ``FDM = 1``). A combiner that exposes
+        neither gets ``weight``/``contribution`` = None and ``exact`` = False. Field names are
+        documented in the module docstring ("Decision attribution")."""
+        comb = self.artifact.combiner
+        names = [str(k) for k in forecasts]
+        weights: dict[str, float] | None = None
+        fdm: float | None = None
+        if comb is None:
+            method = "equal_mean"
+            weights = {k: 1.0 / len(names) for k in names} if names else {}
+            fdm = 1.0
+        else:
+            method = str(getattr(comb, "method", None) or type(comb).__name__)
+            w = getattr(comb, "weights_", None)
+            f = _finite(getattr(comb, "fdm_", None))
+            if w is not None and math.isfinite(f):
+                try:
+                    fitted = {str(k): _finite(v, 0.0) for k, v in dict(w).items()}
+                except (TypeError, ValueError):  # weights not keyed by strategy: treat as opaque
+                    fitted = None
+                if fitted is not None:
+                    weights = {k: fitted.get(k, 0.0) for k in names}  # unfitted columns are ignored by combine()
+                    fdm = f
+        strategies: dict[str, dict[str, float | None]] = {}
+        raw: float | None = None
+        if weights is not None and fdm is not None:
+            raw = 0.0
+            for k in names:
+                fc = float(forecasts[k])
+                contrib = weights[k] * fc * fdm
+                strategies[k] = {"forecast": fc, "weight": weights[k], "contribution": contrib}
+                raw += contrib
+        else:
+            strategies = {k: {"forecast": float(forecasts[k]), "weight": None, "contribution": None} for k in names}
+        return {
+            "method": method,
+            "fdm": fdm,
+            "strategies": strategies,
+            "raw_combined": raw,
+            "combined": float(combined),
+            "clipped": raw is not None and abs(raw) > 1.0,
+            "unallocated": max(0.0, 1.0 - sum(weights.values())) if weights is not None else None,
+            "exact": raw is not None and abs(float(np.clip(raw, -1.0, 1.0)) - float(combined)) <= 1e-9,
+        }
 
     def _flatten_if_halted(self, res: CycleResult, rec: dict[str, Any], bars: pd.DataFrame,
                            t_dec: pd.Timestamp, now: pd.Timestamp) -> None:
@@ -1857,11 +2171,23 @@ def _paper_rates(cfg: LiveConfig, costs: CostModel) -> dict[str, pd.DataFrame] |
         return None
 
 
+#: file in ``state_dir`` where the MT5 adapter persists the last server time zone it detected
+#: from a fresh tick (fallback for ``server_tz: auto`` starts while the market is closed)
+MT5_TZ_STATE_FILE = "mt5_server_tz.json"
+
+
+def _mt5_kwargs(cfg: LiveConfig) -> dict[str, Any]:
+    """``MT5Broker`` kwargs: the ``mt5`` section plus a default ``tz_state_path`` in ``state_dir``."""
+    kw = dict(cfg.mt5)
+    kw.setdefault("tz_state_path", str(Path(cfg.state_dir) / MT5_TZ_STATE_FILE))
+    return kw
+
+
 def _build_broker(cfg: LiveConfig, instrument: Instrument) -> tuple[Broker, Clock, pd.Timestamp | None]:
     if cfg.broker == "mt5":
         from aurum.live.mt5 import MT5Broker
 
-        broker = MT5Broker(cfg.symbol, instrument=instrument, **cfg.mt5)
+        broker = MT5Broker(cfg.symbol, instrument=instrument, **_mt5_kwargs(cfg))
         return broker, broker.clock, None
     from aurum.data.store import load_bars
     from aurum.live.paper import BrokerDataFeed, PaperBroker, ReplayFeed
@@ -1872,7 +2198,7 @@ def _build_broker(cfg: LiveConfig, instrument: Instrument) -> tuple[Broker, Cloc
     if p.get("data") == "mt5":  # paper execution on live MT5 quotes/bars (real time)
         from aurum.live.mt5 import MT5Broker
 
-        data = MT5Broker(cfg.symbol, instrument=instrument, **cfg.mt5)
+        data = MT5Broker(cfg.symbol, instrument=instrument, **_mt5_kwargs(cfg))
         wall = SystemClock()
         broker = PaperBroker(BrokerDataFeed(data, cfg.symbol, cfg.timeframe), instrument, costs,
                              float(p.get("initial_equity", 100_000.0)), clock=wall, symbol=cfg.symbol,
@@ -1896,6 +2222,25 @@ def _build_broker(cfg: LiveConfig, instrument: Instrument) -> tuple[Broker, Cloc
     return broker, clock, feed.end + pd.Timedelta(seconds=cfg.bar_close_delay_seconds + 1)
 
 
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+def _configure_logging(level_name: str) -> bool:
+    """Configure logging for the standalone runner WITHOUT clobbering a host's setup.
+
+    Only when the root logger has no handlers (plain ``python -m aurum.live.runner``) is a
+    stream handler installed at ``level_name``; inside ``aurum live run``, a service wrapper or
+    a test harness the existing root configuration (handlers, level, format) is left exactly
+    as it is. Returns True when this call configured logging."""
+    root = logging.getLogger()
+    if root.handlers:
+        logger.debug("root logging already configured: leaving it unchanged (--log-level %s ignored)", level_name)
+        return False
+    level = logging.getLevelName(str(level_name).upper())
+    logging.basicConfig(level=level if isinstance(level, int) else logging.INFO, format=_LOG_FORMAT)
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     """``python -m aurum.live.runner --config live.yaml [--no-dry-run] [--i-understand-real-money]``."""
     ap = argparse.ArgumentParser(prog="aurum-live", description="Aurum live/paper trading runner (SPEC §11)")
@@ -1907,11 +2252,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--until", default=None, help="stop at this UTC time (ISO)")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO),
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _configure_logging(args.log_level)
     cfg = LiveConfig.from_yaml(args.config)
     if args.no_dry_run:
         cfg.dry_run = False
+    try:
+        check_desk_prerequisites(cfg)  # before connecting to any venue
+    except RunnerConfigError as exc:
+        print(f"CONFIG ERROR: {exc}", file=sys.stderr)
+        return 2
     broker, clock, replay_end = _build_broker(cfg, XAUUSD)
     # the venue's lot grid / max volume (MT5 refreshes them from symbol_info; never looser than
     # XAUUSD's) so risk caps and order splitting use the limits the venue will enforce
@@ -1924,6 +2273,9 @@ def main(argv: list[str] | None = None) -> int:
         runner.start()
     except RealMoneyGuardError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
+        return 2
+    except RunnerConfigError as exc:
+        print(f"CONFIG ERROR: {exc}", file=sys.stderr)
         return 2
     if runner.real_money:
         print(real_money_banner(broker.account(), dry_run=cfg.dry_run), file=sys.stderr)

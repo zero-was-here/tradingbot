@@ -4,7 +4,10 @@
   manager and :class:`~aurum.execution.simulator.ExecutionSimulator` as the backtest engine;
   :func:`rollout` for deterministic, position-aware policy evaluation.
 * :mod:`aurum.rl.train` — :func:`train_ppo` (stable-baselines3 PPO, validation-selected
-  checkpoints, artifact directories), :func:`load_artifact`, :func:`rollout_artifact`.
+  checkpoints, artifact directories), :func:`load_artifact`, :func:`rollout_artifact`,
+  :func:`rl_config_from_aurum` (the env's costs / sizing / risk / instrument from the
+  top-level config) and :func:`artifact_data_ranges` (the train/validation periods an
+  artifact records, used by the ``rl_ppo`` look-ahead guard).
 
 Attributes are resolved lazily, so ``import aurum.rl`` imports neither gymnasium nor torch;
 the optional ``rl`` extra (``pip install aurum[rl]``) is only needed when they are used.
@@ -23,10 +26,10 @@ import pandas as pd
 
 _ENV_NAMES = ("DEFAULT_ACTION_LEVELS", "STATE_NAMES", "EnvConfig", "GoldTradingEnv",
               "RolloutResult", "rollout")
-_TRAIN_NAMES = ("DEFAULT_FEATURE_GROUPS", "POLICY_FILES", "RLArtifact", "RLTrainConfig", "RLTrainResult",
-                "backtest_forecast", "check_bar_size", "evaluate_policy", "load_artifact",
-                "load_artifact_bytes", "prepare_data", "read_artifact_bytes", "rollout_artifact",
-                "train_ppo")
+_TRAIN_NAMES = ("ARTIFACT_CONFIG_METADATA", "AURUM_MAPPED_ENV_KEYS", "DEFAULT_FEATURE_GROUPS", "POLICY_FILES",
+                "RLArtifact", "RLTrainConfig", "RLTrainResult", "artifact_data_ranges", "backtest_forecast",
+                "check_bar_size", "evaluate_policy", "load_artifact", "load_artifact_bytes", "prepare_data",
+                "read_artifact_bytes", "rl_config_from_aurum", "rollout_artifact", "train_ppo")
 
 #: Supported calendar anchors for simulated episodes (``rl_ppo``) and a CONSERVATIVE bound,
 #: in calendar days, on the gap between two consecutive anchor bars (weekends/holidays

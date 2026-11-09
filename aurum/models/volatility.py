@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 from scipy import optimize, signal
 
-from aurum.core.timeframes import index_bar_minutes, infer_bars_per_year, nominal_bars_per_year
+from aurum.core.timeframes import index_bar_minutes, nominal_bars_per_year
 
 logger = logging.getLogger(__name__)
 
@@ -243,8 +243,11 @@ class Garch11:
     Forecasting (causal)
         ``forecast(returns)`` returns at row ``t`` the forecast of volatility over the next
         ``horizon`` bars made with returns up to and including ``t``, annualised with
-        ``bars_per_year`` (inferred from a DatetimeIndex if not given). ``floor`` / ``cap``
-        are annualised fractions and are applied to annualised forecasts only.
+        ``bars_per_year`` when given, else with the nominal timeframe constant
+        ``nominal_bars_per_year(index_bar_minutes(train_index))`` (``252 * 23h / bar``, 5,796
+        for H1) - the same convention as :func:`ewma_volatility`, so the two can be blended
+        or swapped in the sizer without a level shift. ``floor`` / ``cap`` are annualised
+        fractions and are applied to annualised forecasts only.
     """
 
     def __init__(
@@ -334,7 +337,10 @@ class Garch11:
         self.n_obs_ = n
         self.converged_ = bool(best.success)
         if isinstance(index, pd.DatetimeIndex) and self.bars_per_year is None and len(index) >= 2:
-            self.bars_per_year_ = float(infer_bars_per_year(index))
+            # The NOMINAL timeframe constant (5,796 for H1), exactly like ewma_volatility -
+            # never the realised bar density of the sample, which depends on holidays/gaps in
+            # the training window and would make GARCH and EWMA vols disagree in level.
+            self.bars_per_year_ = float(nominal_bars_per_year(index_bar_minutes(index)))
         else:
             self.bars_per_year_ = self.bars_per_year
         if not self.converged_:

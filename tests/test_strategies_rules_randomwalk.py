@@ -30,7 +30,7 @@ N_RW = 12_000
 TRAIN_FRAC = 0.6
 RULES = ("tsmom", "ema_cross", "donchian", "kalman_trend", "zscore_fade", "rsi2",
          "bollinger_revert", "vol_squeeze", "orb", "macro_factor", "risk_off",
-         "intraday_seasonality")
+         "intraday_seasonality", "managed_gold", "regime_switch")
 #: extra null cases: seasonality with its pre-test and cost gate disabled (so a non-trivial
 #: table is traded: with costs the fitted positions on noise are flat) and risk_off with low
 #: thresholds (the default rarely fires on synthetic VIX).

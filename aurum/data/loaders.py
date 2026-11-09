@@ -21,12 +21,23 @@ Local times that are ambiguous or non-existent because of a DST switch (only pos
 Sunday early-morning New York time, when metals markets are closed) are resolved to the
 DST interpretation / shifted forward respectively; resulting duplicates are dropped with
 a warning.
+
+:func:`load_mt5_csv` keeps its historical default ``server_tz="Etc/GMT-2"`` (fixed UTC+2)
+for backward compatibility, but logs a WARNING whenever a caller relies on it: for the
+common New-York-close brokers it is an hour off during US summer time; pass
+``server_tz="NY+7"`` for those (or the broker's actual zone).
+
+Every loader records ``bars.attrs["source"]`` as ``"<kind>:<file name>"``; for an anonymous
+in-memory buffer (``io.StringIO`` / ``io.BytesIO`` without a ``name``) the file name is the
+fixed token ``"<buffer>"`` - never the object's repr, which embeds a memory address and
+would make the attribute (and anything that records it) non-deterministic.
 """
 
 from __future__ import annotations
 
 import io
 import logging
+import os
 import re
 from collections.abc import Iterable
 from pathlib import Path
@@ -41,6 +52,19 @@ from aurum.data.schema import PRICE_COLS, SchemaError, make_bars
 logger = logging.getLogger(__name__)
 
 NY_TZ = "America/New_York"
+#: Name used in ``attrs["source"]`` for anonymous in-memory buffers.
+BUFFER_SOURCE_NAME = "<buffer>"
+#: Historical default ``server_tz`` of :func:`load_mt5_csv` (fixed UTC+2, no DST).
+DEFAULT_MT5_SERVER_TZ = "Etc/GMT-2"
+
+
+class _DefaultServerTZ(str):
+    """Marks the untouched ``server_tz`` default (compares equal to ``"Etc/GMT-2"``)."""
+
+    __slots__ = ()
+
+
+_SERVER_TZ_DEFAULT = _DefaultServerTZ(DEFAULT_MT5_SERVER_TZ)
 _OFFSET_RE = re.compile(r"^(?:UTC|GMT)?\s*([+-])(\d{1,2})(?::?(\d{2}))?$", re.IGNORECASE)
 
 
@@ -154,6 +178,17 @@ _MT5_ALIASES = {
 _MT5_POSITIONAL = ["date", "time", "open", "high", "low", "close", "tickvol", "vol", "spread"]
 
 
+def source_name(path_or_buffer: Any) -> str:
+    """Deterministic file name for ``attrs["source"]`` and messages: the base name of a path
+    or of a named file object, :data:`BUFFER_SOURCE_NAME` for an anonymous buffer."""
+    if isinstance(path_or_buffer, (str, os.PathLike)):
+        return Path(path_or_buffer).name
+    name = getattr(path_or_buffer, "name", None)
+    if isinstance(name, (str, os.PathLike)) and str(name):
+        return Path(name).name
+    return BUFFER_SOURCE_NAME
+
+
 def _read_text(path_or_buffer: str | Path | io.IOBase) -> str:
     if hasattr(path_or_buffer, "read"):
         data = path_or_buffer.read()
@@ -171,7 +206,7 @@ def load_mt5_csv(
     path: str | Path | io.IOBase,
     timeframe: str | Timeframe,
     *,
-    server_tz: str = "Etc/GMT-2",
+    server_tz: str = _SERVER_TZ_DEFAULT,
     point_size: float = 0.01,
     default_spread: float | None = None,
 ) -> pd.DataFrame:
@@ -189,10 +224,19 @@ def load_mt5_csv(
       model floor (``CostModel.min_spread``). Without a ``<SPREAD>`` column,
       ``default_spread`` (price units) is required.
     * timestamps are converted from ``server_tz`` to UTC (see module doc; ``"NY+7"`` for
-      New-York-close brokers).
+      New-York-close brokers). The default ``"Etc/GMT-2"`` (fixed UTC+2) is kept for
+      backward compatibility, and relying on it logs a WARNING: on a New-York-close server
+      (UTC+2 winter / UTC+3 US summer) it shifts every summer bar by one hour.
+    * ``attrs["source"]`` = ``"mt5:<file name>"`` (``"mt5:<buffer>"`` for an anonymous buffer).
     """
+    if server_tz is _SERVER_TZ_DEFAULT:
+        logger.warning(
+            "load_mt5_csv: server_tz not given, assuming the fixed UTC+2 default %r. Most metals "
+            "brokers run New-York-close servers (UTC+2 winter / UTC+3 US summer): pass "
+            "server_tz='NY+7' for those, or the broker's zone, to avoid a 1-hour shift for "
+            "~8 months a year", DEFAULT_MT5_SERVER_TZ)
     text = _read_text(path)
-    src = str(getattr(path, "name", path))
+    src = source_name(path)
     first = next((ln for ln in text.splitlines() if ln.strip()), "")
     sep = "\t" if "\t" in first else (";" if first.count(";") > first.count(",") else ",")
     has_header = bool(re.search(r"[A-Za-z]", first.split(sep)[0].replace(".", "").replace("-", "")))
@@ -239,7 +283,7 @@ def load_mt5_csv(
             spread = spread.fillna(float(default_spread))
         out["spread"] = spread.clip(lower=0.0)
     out.index.name = "time"
-    return _finalize_bars(out, timeframe, default_spread, f"mt5:{Path(src).name}")
+    return _finalize_bars(out, timeframe, default_spread, f"mt5:{src}")
 
 
 # ------------------------------------------------------------------------------------
@@ -270,8 +314,7 @@ def load_csv(
     out.index.name = "time"
     keep = [c for c in out.columns if c in PRICE_COLS + ["volume", "spread"]]
     out = out[keep]
-    name = Path(str(getattr(path, "name", path))).name
-    return _finalize_bars(out, timeframe, default_spread, f"csv:{name}")
+    return _finalize_bars(out, timeframe, default_spread, f"csv:{source_name(path)}")
 
 
 def bars_from_ohlc(
@@ -378,4 +421,5 @@ def quality_report(
     return rep
 
 
-__all__ = ["bars_from_ohlc", "load_csv", "load_mt5_csv", "parse_timestamps", "quality_report", "to_utc_index"]
+__all__ = ["BUFFER_SOURCE_NAME", "DEFAULT_MT5_SERVER_TZ", "bars_from_ohlc", "load_csv", "load_mt5_csv",
+           "parse_timestamps", "quality_report", "source_name", "to_utc_index"]

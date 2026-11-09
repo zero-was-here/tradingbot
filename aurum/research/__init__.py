@@ -34,6 +34,22 @@ _EXPORTS: dict[str, str] = {
     "QuantBook": "aurum.research.walkforward",
     "book_statistics": "aurum.research.walkforward",
     "load_summary": "aurum.research.walkforward",
+    "record_holdout_look": "aurum.research.walkforward",
+    "prior_holdout_looks": "aurum.research.walkforward",
+    "forecast_contributions": "aurum.research.walkforward",
+    # v2.1 analytics: parameter sweeps, Monte Carlo / stress, explainability
+    "run_sweep": "aurum.research.sweep",
+    "plateau_score": "aurum.research.sweep",
+    "SweepResult": "aurum.research.sweep",
+    "monte_carlo": "aurum.research.montecarlo",
+    "stress_run": "aurum.research.montecarlo",
+    "MonteCarloResult": "aurum.research.montecarlo",
+    "StressReport": "aurum.research.montecarlo",
+    "explain_decision": "aurum.research.attribution",
+    "explain_live_decision": "aurum.research.attribution",
+    "live_decisions": "aurum.research.attribution",
+    "pnl_attribution": "aurum.research.attribution",
+    "desk_journal_summary": "aurum.research.attribution",
 }
 
 __all__ = sorted(_EXPORTS)

@@ -179,6 +179,14 @@ class EnvConfig:
                         ``"W"``/``"M"``/``"Q"`` calendar period (``None`` = one continuous
                         account). Anchored forecasts do not depend on where the history
                         starts, so validation, backtests and live sliding windows agree.
+    instrument        : :class:`~aurum.core.instrument.Instrument` keyword arguments (contract
+                        size, lot step, commission, fixed swaps, rollover hour ...), or
+                        ``None`` (default) for :data:`~aurum.core.instrument.XAUUSD`. Built by
+                        :meth:`build_instrument`; an ``instrument=`` object passed to
+                        :class:`GoldTradingEnv` still takes precedence.
+                        :func:`aurum.rl.train.rl_config_from_aurum` fills it (with ``sizer``,
+                        ``costs``, ``risk`` and ``initial_equity``) from the top-level config
+                        so the policy trains on the contract the research backtests use.
     """
 
     window: int = 4
@@ -198,9 +206,18 @@ class EnvConfig:
     obs_clip: float = 10.0
     trade_time_norm: int = 240
     episode_anchor: str | None = "M"
+    instrument: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.action_levels = tuple(float(x) for x in self.action_levels)
+        if self.instrument is not None:
+            if isinstance(self.instrument, Instrument):
+                self.instrument = {f.name: getattr(self.instrument, f.name)
+                                   for f in fields(Instrument) if f.name != "tags"}
+            if not isinstance(self.instrument, Mapping):
+                raise ValueError("instrument must be a mapping of Instrument fields or None")
+            self.instrument = dict(self.instrument)
+            self.build_instrument()  # validate the field names now, not at the first env build
         if self.window < 1:
             raise ValueError("window must be >= 1")
         if self.action_mode not in ("discrete", "continuous"):
@@ -224,6 +241,16 @@ class EnvConfig:
         if self.episode_anchor is not None and self.episode_anchor not in EPISODE_ANCHOR_SPAN_DAYS:
             raise ValueError(f"episode_anchor must be one of {sorted(EPISODE_ANCHOR_SPAN_DAYS)} "
                              "or None")
+
+    def build_instrument(self) -> Instrument:
+        """The contract this environment trades (``XAUUSD`` when ``instrument`` is None)."""
+        if self.instrument is None:
+            return XAUUSD
+        known = {f.name for f in fields(Instrument)}
+        unknown = sorted(set(self.instrument) - known)
+        if unknown:
+            raise ValueError(f"unknown Instrument fields in EnvConfig.instrument: {unknown}")
+        return Instrument(**self.instrument)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -296,7 +323,8 @@ class GoldTradingEnv(gym.Env):
     random_start : ``True`` (training): uniform random start over the range, fixed
                 ``episode_length``. ``False`` (evaluation): start at the first eligible bar
                 and run to ``end`` (``reset(options={"start": i})`` overrides the start).
-    sizer, costs, instrument : optional objects overriding ``config.sizer`` / ``config.costs``.
+    sizer, costs, instrument : optional objects overriding ``config.sizer`` / ``config.costs`` /
+                ``config.instrument`` (``instrument=None`` -> ``config.build_instrument()``).
     rates     : benchmark-rate source for ``"rate"`` financing (``md.macro`` — pass the same
                 one the engine gets so env and :func:`~aurum.backtest.engine.run_backtest`
                 equity paths stay identical; ``None`` -> ``financing.fallback_rate``). Rates are
@@ -318,7 +346,7 @@ class GoldTradingEnv(gym.Env):
         random_start: bool = True,
         sizer: PositionSizer | None = None,
         costs: CostModel | None = None,
-        instrument: Instrument = XAUUSD,
+        instrument: Instrument | None = None,
         rates: RateSource = None,
     ) -> None:
         super().__init__()
@@ -336,6 +364,7 @@ class GoldTradingEnv(gym.Env):
         index = pd.DatetimeIndex(bars.index)
         self.bars = bars
         self.feature_names: list[str] = [str(c) for c in features.columns]
+        instrument = instrument if instrument is not None else cfg.build_instrument()
         self.instrument = instrument
         self.events = events
         self.random_start = bool(random_start)

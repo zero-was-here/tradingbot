@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Mapping
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -354,23 +355,63 @@ def _moments(r: np.ndarray) -> dict[str, float]:
     }
 
 
+def _bars_close_asof(bars: Any, when: Any) -> float | None:
+    """Last ``close`` of ``bars`` (a bars frame or anything with ``.bars``) at or before
+    ``when`` (the last equity mark); ``None`` if unavailable."""
+    frame = getattr(bars, "bars", bars)
+    if not isinstance(frame, pd.DataFrame) or "close" not in frame.columns or frame.empty:
+        return None
+    close = pd.Series(frame["close"], dtype=float).dropna()
+    if close.empty:
+        return None
+    if isinstance(when, pd.Timestamp) and isinstance(close.index, pd.DatetimeIndex):
+        t = when
+        if close.index.tz is not None and t.tz is None:
+            t = t.tz_localize("UTC")
+        elif close.index.tz is None and t.tz is not None:
+            t = t.tz_convert("UTC").tz_localize(None)
+        close = close.loc[close.index <= t]
+        if close.empty:
+            return None
+    return float(close.iloc[-1])
+
+
 def risk_report(
     result,
     *,
     level: float = 0.95,
     price: float | None = None,
+    last_price: float | None = None,
+    bars: Any = None,
     instrument: Instrument = XAUUSD,
     var_window: int = 250,
     scenarios: Mapping[str, float] | None = None,
 ) -> dict:
     """JSON-friendly risk summary of a :class:`aurum.backtest.result.BacktestResult`.
 
-    Accepts a ``BacktestResult`` (uses ``equity`` and, if present, ``positions`` /
-    ``meta["last_price"]`` / the last fill price for the stress test) or a bare equity
-    Series. Contains daily and per-bar VaR/ES by all three methods, return moments, max
-    drawdown, a rolling out-of-sample VaR back-test with Kupiec's test, USD figures at the
-    last equity and — when a price is available — a stress test of the final position.
+    Accepts a ``BacktestResult`` (uses ``equity`` and, if present, ``position_close`` /
+    ``positions`` for the final position) or a bare equity Series. Contains daily and per-bar
+    VaR/ES by all three methods, return moments, max drawdown, a rolling out-of-sample VaR
+    back-test with Kupiec's test, USD figures at the last equity and — when a price is
+    available — a stress test of the final position.
+
+    Stress price (``report["position"]["price"]``, its origin in ``price_source``), first
+    available of:
+
+    1. ``last_price`` (or its older alias ``price``; passing both with different values
+       raises ``ValueError``) — ``"argument"``;
+    2. ``result.meta["last_price"]`` — ``"meta"``;
+    3. the last ``close`` of ``bars`` (a bars frame or ``MarketData``) at or before the last
+       equity mark — ``"bars_close"``: the mark-to-market price of the final position;
+    4. the price of the last fill — ``"last_fill"`` (noted: it can be stale by the whole
+       holding period of the final position, since the engine sets no ``meta["last_price"]``).
+
+    Pass ``bars`` (or ``last_price``) for a stress test at the current price.
     """
+    if price is not None and last_price is not None and float(price) != float(last_price):
+        raise ValueError(f"risk_report: price={price} and last_price={last_price} disagree (use last_price)")
+    if last_price is None:
+        last_price = price
     equity = result.equity if hasattr(result, "equity") else result
     equity = pd.Series(equity, dtype=float).dropna()
     report: dict = {"level": level, "notes": []}
@@ -413,21 +454,25 @@ def risk_report(
         positions = getattr(result, "positions", None)
     if positions is not None and len(positions):
         lots = float(pd.Series(positions, dtype=float).fillna(0.0).iloc[-1])
-        px = price
+        px, source = last_price, "argument"
         if px is None:
             meta = getattr(result, "meta", None) or {}
-            px = meta.get("last_price")
+            px, source = meta.get("last_price"), "meta"
+        if px is None and bars is not None:
+            px, source = _bars_close_asof(bars, equity.index[-1]), "bars_close"
         if px is None:
             fills = getattr(result, "fills", None)
             if isinstance(fills, pd.DataFrame) and len(fills) and "price" in fills.columns:
-                px = float(fills["price"].iloc[-1])
-                report["notes"].append("stress price taken from the last fill")
+                px, source = float(fills["price"].iloc[-1]), "last_fill"
+                report["notes"].append("stress price taken from the last fill (pass bars= or "
+                                       "last_price= for the current price)")
         if px is not None and math.isfinite(float(px)) and float(px) > 0:
             px = float(px)
             st = stress_test(lots, px, last_equity, scenarios=scenarios, instrument=instrument)
             report["position"] = {
                 "lots": lots,
                 "price": px,
+                "price_source": source,
                 "notional": float(instrument.notional(lots, px)),
                 "leverage": float(abs(instrument.notional(lots, px)) / last_equity) if last_equity > 0 else math.nan,
                 "stress": st.to_dict(orient="records"),

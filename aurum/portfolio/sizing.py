@@ -265,6 +265,23 @@ class FixedFractionalSizer:
     Fixed-fractional sizing (Vince, 1990; Tharp) bounds the loss per trade at roughly
     ``risk_per_trade`` of equity if the stop is honoured; gap risk (weekend, news) can exceed
     it, which is why the risk manager and ``aurum.risk.var.gap_shock`` exist.
+
+    **The stop is external.** This sizer only computes lots; it ASSUMES that a protective
+    stop sits ``stop_atr x ATR`` from the entry and never places one itself.
+    :func:`aurum.backtest.engine.run_backtest` (used by the walk-forward books; the live runner
+    mirrors it from the same config key) places stops ONLY through ``backtest.stop_atr_mult``
+    (``stop_atr_mult=``), at ``stop_atr_mult x`` the engine's own Wilder ATR(``atr_period``)
+    of the BAR timeframe, anchored at the entry fill. Two consequences:
+
+    * Without ``backtest.stop_atr_mult`` there is no stop at all: the loss per trade is NOT
+      bounded by ``risk_per_trade`` and this sizer is effectively a volatility-scaled sizer
+      with a different constant.
+    * The engine does not pass ``atr=`` to :meth:`target_lots`, so the sizer's ATR is the
+      vol proxy above - by default a DAILY price standard deviation - whereas the engine's
+      stop uses the bar ATR (e.g. H1 ATR(14)). For the assumed stop to be the real one, set
+      ``stop_atr_mult ≈ stop_atr x ATR_daily / ATR_bar`` (roughly ``stop_atr x sqrt(23)``
+      ≈ ``4.8 x stop_atr`` on H1 bars, ignoring the |range| vs sigma difference), or pass
+      ``atr=`` (bar ATR) yourself and use ``stop_atr_mult = stop_atr``.
     """
 
     def __init__(

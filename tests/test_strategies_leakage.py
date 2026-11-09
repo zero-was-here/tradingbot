@@ -48,11 +48,14 @@ OWNED_MODULES = (
     "aurum.strategies.breakout",
     "aurum.strategies.macro",
     "aurum.strategies.seasonal",
+    "aurum.strategies.allocation",
+    "aurum.strategies.regime",
 )
 OTHER_MODULES = ("aurum.strategies.ml", "aurum.strategies.rl")
 OWNED = frozenset({
     "tsmom", "ema_cross", "donchian", "kalman_trend", "zscore_fade", "rsi2", "bollinger_revert",
     "vol_squeeze", "orb", "macro_factor", "risk_off", "intraday_seasonality",
+    "managed_gold", "regime_switch",
 })
 #: forecasts that are a function of the clock (and fitted state) only: perturbing prices or
 #: macro cannot change them, so the "perturbation must change the future" check is skipped.
@@ -66,6 +69,11 @@ TEST_PARAMS: dict[str, dict[str, Any]] = {
     # the synthetic VIX path has no spike above +1.5 sd: lower the thresholds so the regime
     # machinery (EWMA baseline, hysteresis, DXY filter, as-of join) is actually exercised.
     "risk_off": {"entry_z": 0.0, "exit_z": -1.0},
+    # the default 12-month horizon (5,796 H1 bars) exceeds the 3,500-bar synthetic history
+    "managed_gold": {"horizons": (24, 96, 240), "trend_halflife": 160.0, "vol_fast_halflife": 24.0,
+                     "vol_slow_halflife": 480.0},
+    # the M15 variant trains on ~27 daily returns (fewer than the default 60)
+    "regime_switch": {"min_train_obs": 20},
     "ml_gbm": {"skill_gate_z": None, "importance": "none",
                "feature_groups": ("returns", "momentum", "volatility")},
     "meta_label": {"skill_gate_z": None, "importance": "none",

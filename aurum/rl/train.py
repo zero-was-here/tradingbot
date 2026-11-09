@@ -24,8 +24,15 @@ Pipeline
 4. The checkpoint with the best validation daily Sharpe is kept; training stops early after
    ``patience`` evaluations without improvement (or at ``max_wall_time_s``).
 5. An artifact directory is written: ``policy.zip`` (SB3), ``pipeline.json``,
-   ``config.json``, ``metrics.json`` (validation metrics, history, provenance),
-   ``data_hash.json`` (SHA-256 of the train/val bars, SPEC §0.4) and ``history.csv``.
+   ``config.json`` (the :class:`RLTrainConfig` plus ``data_ranges``: the first/last bar of
+   the train and validation slices, read back by :func:`artifact_data_ranges` - the
+   ``rl_ppo`` look-ahead guard), ``metrics.json`` (validation metrics, history,
+   provenance), ``data_hash.json`` (SHA-256 of the train/val bars, SPEC §0.4) and
+   ``history.csv``.
+
+:func:`rl_config_from_aurum` builds the :class:`RLTrainConfig` of ``aurum rl train`` from an
+``AurumConfig`` (env costs/financing, sizing, research risk limits, instrument and equity
+from the top-level config, then ``rl.params``).
 
 Caveat — selection bias. Choosing the best of ``K`` validation evaluations inflates the
 validation Sharpe (Bailey & Lopez de Prado, 2014, "The Deflated Sharpe Ratio"). The
@@ -82,6 +89,7 @@ from aurum.rl.env import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "ARTIFACT_CONFIG_METADATA",
     "ARTIFACT_FILES",
     "DEFAULT_FEATURE_GROUPS",
     "POLICY_FILES",
@@ -90,6 +98,7 @@ __all__ = [
     "RLArtifact",
     "RLTrainConfig",
     "RLTrainResult",
+    "artifact_data_ranges",
     "backtest_forecast",
     "check_bar_size",
     "evaluate_policy",
@@ -99,6 +108,7 @@ __all__ = [
     "prepare_data",
     "read_artifact_bytes",
     "resolve_device",
+    "rl_config_from_aurum",
     "rollout_artifact",
     "train_ppo",
 ]
@@ -109,6 +119,11 @@ DEFAULT_FEATURE_GROUPS: tuple[str, ...] = (
     "returns", "trend", "momentum", "volatility", "regime", "session", "mtf",
 )
 ARTIFACT_FILES = ("policy.zip", "pipeline.json", "config.json", "metrics.json", "data_hash.json")
+#: Provenance keys :func:`train_ppo` writes into ``config.json`` next to the
+#: :class:`RLTrainConfig` fields: ``data_ranges`` = ``{"train": [first, last], "val": [first,
+#: last], "timeframe": ...}`` (bar OPEN times, UTC). ``config.json`` is fingerprinted, so the
+#: recorded period cannot be edited without the strategy refusing the policy.
+ARTIFACT_CONFIG_METADATA = ("data_ranges",)
 _METRIC_KEYS = (
     "sharpe", "sortino", "calmar", "total_return", "cagr", "ann_vol", "max_drawdown",
     "n_trades", "trades_per_year", "win_rate", "profit_factor", "exposure",
@@ -199,6 +214,12 @@ class RLTrainConfig:
             raise ValueError(f"unknown RLTrainConfig keys: {unknown}")
         return cls(**dict(payload))
 
+    @classmethod
+    def from_artifact_dict(cls, payload: Mapping[str, Any]) -> RLTrainConfig:
+        """Parse an artifact's ``config.json``: :meth:`from_dict` after dropping the
+        provenance keys :func:`train_ppo` records there (:data:`ARTIFACT_CONFIG_METADATA`)."""
+        return cls.from_dict({k: v for k, v in payload.items() if k not in ARTIFACT_CONFIG_METADATA})
+
     def replace(self, **changes: Any) -> RLTrainConfig:
         return dataclasses.replace(self, **changes)
 
@@ -215,6 +236,92 @@ def resolve_device(device: str) -> str:
     if mps is not None and mps.is_available():
         return "mps"
     return "cpu"
+
+
+#: ``EnvConfig`` keys that :func:`rl_config_from_aurum` derives from the top-level config.
+AURUM_MAPPED_ENV_KEYS: tuple[str, ...] = ("sizer", "costs", "risk", "instrument", "initial_equity")
+_SIZER_KEYS = ("target_vol", "max_leverage", "max_lots", "rebalance_band", "kelly_cap",
+               "drawdown_derisk", "min_vol")
+
+
+def _env_from_aurum(cfg: Any, key: str) -> Any:
+    """One mapped ``EnvConfig`` entry (see :func:`rl_config_from_aurum`)."""
+    if key == "sizer":
+        s = cfg.sizing
+        if s.method != "vol_target":
+            raise ValueError(
+                f"rl: the RL environment sizes positions with VolTargetSizer, but sizing.method is "
+                f"{s.method!r}; use sizing.method: vol_target or set rl.params.env.sizer explicitly")
+        out = {k: getattr(s, k) for k in _SIZER_KEYS}
+        if out["drawdown_derisk"] is not None:
+            out["drawdown_derisk"] = [[float(x) for x in step] for step in out["drawdown_derisk"]]
+        VolTargetSizer(**out)  # validate now (a bad value must not surface mid-training)
+        return out
+    if key == "costs":
+        out = dataclasses.asdict(cfg.costs)    # includes the financing section
+        CostModel(**out)
+        return out
+    if key == "risk":
+        if not cfg.risk.enabled:
+            return None
+        from aurum.core.config import RESEARCH_RISK_DEFAULTS
+
+        out = {**RESEARCH_RISK_DEFAULTS, **dict(cfg.risk.research)}
+        RiskLimits(**{k: (tuple(v) if isinstance(v, list) else v) for k, v in out.items()})
+        return out
+    if key == "instrument":
+        return dataclasses.asdict(cfg.instrument)
+    if key == "initial_equity":
+        return float(cfg.backtest.initial_equity)
+    raise KeyError(key)  # pragma: no cover - AURUM_MAPPED_ENV_KEYS is exhaustive
+
+
+def rl_config_from_aurum(cfg: Any) -> RLTrainConfig:
+    """:class:`RLTrainConfig` for ``aurum rl train`` from a validated
+    :class:`~aurum.core.config.AurumConfig`, so the policy trains on the SAME contract,
+    costs, sizing and risk limits that the research backtests of ``rl_ppo`` use.
+
+    1. The environment (``RLTrainConfig.env``) is built from the top-level sections
+       (:data:`AURUM_MAPPED_ENV_KEYS`):
+
+       * ``env.costs``  <- ``costs`` (all fields, including ``costs.financing``);
+       * ``env.sizer``  <- ``sizing`` (``vol_target`` only: target_vol, max_leverage, max_lots,
+         rebalance_band, kelly_cap, drawdown_derisk, min_vol);
+       * ``env.risk``   <- ``risk.research`` over ``RESEARCH_RISK_DEFAULTS`` (the limits the
+         walk-forward books use); ``None`` when ``risk.enabled`` is false;
+       * ``env.instrument`` <- ``instrument`` (all contract fields);
+       * ``env.initial_equity`` <- ``backtest.initial_equity``.
+
+       Note that research limits have no max-drawdown kill (``max_drawdown: None``), so
+       training episodes then end only on ruin (``min_equity_frac``) or at their length;
+       set ``rl.params.env.risk`` to train with the kill switch.
+    2. ``rl.params`` (``RLTrainConfig`` keyword arguments) are applied on top. Keys of
+       ``rl.params.env`` REPLACE the mapped entries one key at a time (``env.costs`` replaces
+       the whole cost section, it is not merged field by field); a ``sizing.method`` other
+       than ``vol_target`` is only accepted when ``rl.params.env.sizer`` is given.
+    3. ``seed`` defaults to the top-level ``seed``.
+
+    Unknown ``rl.params`` / ``rl.params.env`` keys raise ``ValueError``. The protective stops
+    of ``backtest.stop_atr_mult`` / ``take_profit_atr_mult`` have no counterpart in the
+    environment (a WARNING says so). Importing torch is not needed.
+    """
+    params = dict(cfg.rl.params or {})
+    env_over = params.pop("env", None)
+    if env_over is None:
+        env_over = {}
+    elif isinstance(env_over, EnvConfig):
+        env_over = env_over.to_dict()
+    elif not isinstance(env_over, Mapping):
+        raise ValueError(f"rl.params.env must be a mapping, got {type(env_over).__name__}")
+    env: dict[str, Any] = {k: _env_from_aurum(cfg, k) for k in AURUM_MAPPED_ENV_KEYS
+                           if k not in env_over}
+    env.update(dict(env_over))
+    b = cfg.backtest
+    if b.stop_atr_mult is not None or b.take_profit_atr_mult is not None:
+        logger.warning("rl: backtest.stop_atr_mult / take_profit_atr_mult have no counterpart in the "
+                       "RL environment; the policy is trained without protective stops")
+    params.setdefault("seed", int(cfg.seed))
+    return RLTrainConfig.from_dict({**params, "env": EnvConfig.from_dict(env)})
 
 
 # -----------------------------------------------------------------------------------------
@@ -355,11 +462,12 @@ def backtest_forecast(md: MarketData, forecast: pd.Series, env_cfg: EnvConfig, *
     like-for-like comparison for an RL policy (baselines, held-out test periods)."""
     if vol is None:
         vol = ewma_volatility(md.bars["close"].astype(float), halflife_bars=env_cfg.vol_halflife)
-    risk = (StandardRiskManager(RiskLimits(**env_cfg.risk), events=md.events)
+    instrument = env_cfg.build_instrument()   # the env's contract (XAUUSD by default)
+    risk = (StandardRiskManager(RiskLimits(**env_cfg.risk), instrument, events=md.events)
             if env_cfg.risk is not None else None)
     with simulated_risk_logging():  # a research replay, not the real account
         return run_backtest(md, forecast, sizer=VolTargetSizer(**env_cfg.sizer), risk=risk,
-                            costs=CostModel(**env_cfg.costs),
+                            instrument=instrument, costs=CostModel(**env_cfg.costs),
                             initial_equity=env_cfg.initial_equity, vol=vol, start=start, end=end)
 
 
@@ -613,8 +721,15 @@ def train_ppo(
     val_eval = evaluate_policy(make_predictor(model), data, cfg.env)
     hist_df = pd.DataFrame(history)
     data.pipeline.save(out / "pipeline.json")
-    (out / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2), encoding="utf-8")
     bars = data.md.bars
+    # The train/validation periods go into config.json - one of the FINGERPRINTED policy
+    # files - so the period a policy has seen travels with (and is protected like) the
+    # policy itself: ``rl_ppo`` reads it to refuse forecasting bars it was trained on.
+    ranges = {"train": _range_str(bars.iloc[: data.n_train]),
+              "val": _range_str(bars.iloc[data.n_train:]),
+              "timeframe": bars.attrs.get("timeframe")}
+    (out / "config.json").write_text(json.dumps({**cfg.to_dict(), "data_ranges": ranges}, indent=2),
+                                     encoding="utf-8")
     data_hash = {
         "train_bars_sha256": frame_hash(bars.iloc[: data.n_train]),
         "val_bars_sha256": frame_hash(bars.iloc[data.n_train:]),
@@ -675,6 +790,8 @@ class RLArtifact:
     config: RLTrainConfig
     metrics: dict[str, Any]
     _predict: Callable[[np.ndarray], Any] | None = field(default=None, repr=False)
+    #: recorded train/validation periods (:func:`artifact_data_ranges`), None if unknown
+    data_ranges: dict[str, Any] | None = None
 
     def predict(self, obs: np.ndarray) -> Any:
         """Deterministic action for one observation."""
@@ -712,18 +829,71 @@ def load_artifact_bytes(files: Mapping[str, bytes], *, device: str = "cpu",
     missing = [f for f in POLICY_FILES if f not in files]
     if missing:
         raise ValueError(f"RL artifact bytes are missing {missing}")
-    cfg = RLTrainConfig.from_dict(json.loads(files["config.json"].decode("utf-8")))
+    cfg = RLTrainConfig.from_artifact_dict(json.loads(files["config.json"].decode("utf-8")))
     pipe = FeaturePipeline.from_dict(json.loads(files["pipeline.json"].decode("utf-8")))
     model = PPO.load(io.BytesIO(files["policy.zip"]), device=resolve_device(device))
     raw_metrics = files.get("metrics.json")
     metrics = json.loads(raw_metrics.decode("utf-8")) if raw_metrics else {}
     return RLArtifact(path=None if path is None else Path(path), model=model, pipeline=pipe,
-                      config=cfg, metrics=metrics)
+                      config=cfg, metrics=metrics, data_ranges=artifact_data_ranges(files))
 
 
 def load_artifact(path: str | Path, *, device: str = "cpu") -> RLArtifact:
     """Load ``policy.zip`` + ``pipeline.json`` + ``config.json`` (+ ``metrics.json``)."""
     return load_artifact_bytes(read_artifact_bytes(path), device=device, path=path)
+
+
+def _utc_ts(value: Any) -> pd.Timestamp:
+    t = pd.Timestamp(value)
+    return t.tz_localize("UTC") if t.tz is None else t.tz_convert("UTC")
+
+
+def artifact_data_ranges(files: Mapping[str, bytes] | str | Path) -> dict[str, Any] | None:
+    """The train / validation periods an artifact's policy has seen, or ``None`` if unknown.
+
+    ``files`` is :func:`read_artifact_bytes` output (or an artifact directory). The record
+    comes from ``config.json`` ``data_ranges`` (written by :func:`train_ppo`; fingerprinted
+    with the policy) and, for artifacts trained before that existed, from ``metrics.json``
+    ``data.train_range`` / ``data.val_range`` (same content, but not fingerprinted:
+    ``source`` says which). Returns ``{"train": (first, last) | None, "val": (first, last) |
+    None, "start": first bar seen, "end": last bar seen, "source": "config.json" |
+    "metrics.json"}`` with tz-aware UTC bar OPEN times. Checkpoint selection used the
+    validation slice, so the policy has "seen" everything from ``start`` to ``end``.
+    """
+    if not isinstance(files, Mapping):
+        files = read_artifact_bytes(files)
+    record: Mapping[str, Any] | None = None
+    source = "config.json"
+    try:
+        cfg = json.loads(files["config.json"].decode("utf-8"))
+        record = cfg.get("data_ranges") if isinstance(cfg, Mapping) else None
+    except (KeyError, ValueError, UnicodeDecodeError):
+        record = None
+    if not record and files.get("metrics.json"):
+        try:
+            data = json.loads(files["metrics.json"].decode("utf-8")).get("data") or {}
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            data = {}
+        record = {"train": data.get("train_range"), "val": data.get("val_range")}
+        source = "metrics.json"
+    if not record:
+        return None
+
+    def _pair(v: Any) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+        if not isinstance(v, (list, tuple)) or len(v) != 2:
+            return None
+        try:
+            a, b = _utc_ts(v[0]), _utc_ts(v[1])
+        except (TypeError, ValueError):
+            return None
+        return (a, b) if a <= b else None
+
+    train, val = _pair(record.get("train")), _pair(record.get("val"))
+    parts = [p for p in (train, val) if p is not None]
+    if not parts:
+        return None
+    return {"train": train, "val": val, "start": min(p[0] for p in parts),
+            "end": max(p[1] for p in parts), "source": source}
 
 
 def rollout_artifact(

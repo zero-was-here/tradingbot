@@ -6,6 +6,129 @@ All notable changes to this project are recorded here. The format follows
 commits and data hashes rather than to version numbers: see
 [docs/RESULTS.md](docs/RESULTS.md) and each run's `provenance.json`.
 
+## [2.1.0] - Unreleased
+
+Research analytics (parameter sweeps, Monte Carlo and stress, explainability), two new
+strategies, an interactive dashboard, stricter configuration validation, and live-runner
+hardening. Nothing in this release changes the verdict of [docs/RESULTS.md](docs/RESULTS.md):
+the new configurations were run as exploratory additional trials on data ending 2024-12-31,
+and the used-up 2025-26 holdout was not touched.
+
+### Added
+
+- **Parameter sweeps** (`aurum sweep`, `aurum.research.sweep.run_sweep`). Each grid point of
+  one strategy is a full walk-forward of a standalone single-strategy book (out of sample,
+  net of costs). The sweep reports DSR/PSR/CI of the best point with `n_trials` = valid grid
+  points + earlier overlapping sweeps in `sweep_ledger.jsonl`, PBO (CSCV) across the grid,
+  and a plateau score: the mean of the best cell's Chebyshev neighbours over the best value
+  (below 0.5 = knife-edge, 0.75 or more = robust plateau), the plateau centre and a grid-edge
+  flag. A heatmap (`sweep.png`) and tidy tables are written. The holdout is never swept: bars
+  from `walkforward.holdout_start` and every window already in a holdout ledger are cut.
+- **Monte Carlo and stress** (`aurum stress`, `aurum.research.montecarlo`). A stationary
+  block bootstrap of the book's daily returns (Politis-Romano, automatic block length) gives
+  CAGR / max-drawdown / time-to-recover distributions, P(drawdown > x), risk of ruin and fan
+  bands (10k paths x 2 years in well under a second). Deterministic stress replays the
+  book's worst k-day windows, applies gap shocks to the current and peak exposure, and
+  applies gold's worst historical k-day moves to the current position.
+- **Explainability** (`aurum explain`, `aurum.research.attribution`). A decision waterfall
+  (`c_i = w_i * f_i * FDM`, the clip, the combined forecast) with the sizing chain replayed
+  point-in-time from the run's bars and checked against the saved request; PnL attribution
+  by signed contribution shares that sums exactly to the book's PnL (price, costs, swap,
+  net, by year); a desk-journal summary. `aurum explain --live STATE_DIR` does the same for
+  a live or paper decision from the runner's `decisions.jsonl` (read-only), including the
+  LLM-desk step.
+- **Interactive dashboard** (`aurum dashboard`, `aurum.viz.dashboard.build_dashboard`, extra
+  `viz`): KPI tiles with pass/fail badges, equity vs benchmark, drawdown, rolling Sharpe,
+  per-fold Sharpe, forecast small multiples, combiner weights, cost waterfall, monthly
+  heatmap, trades, holdout and an optional desk timeline, with a light/dark toggle.
+- **Figure style** (`aurum.viz.style`): one palette in light and dark variants,
+  `use_style`, `save_figure` (writes `-light`/`-dark` PNGs) and plotting helpers for the
+  documentation figures.
+- **Strategies** (now 17): `managed_gold` (long-only strategic allocation with a trend tilt
+  and a latched de-risk switch: price below its EMA and fast/slow volatility above a
+  threshold) and `regime_switch` (a base trend forecast scaled by a 2-state Gaussian HMM's
+  causal filtered probability of the calm regime, fitted on training returns only).
+- **Configs** `d1_trend.yaml` (daily NY-close bars, monthly-horizon trend rules) and
+  `managed_gold.yaml`. Both are exploratory and hard-wired to end on 2024-12-31 with no
+  holdout.
+- **Live operations.** `aurum live status` (read-only snapshot of lock, heartbeat, kill
+  switch, OMS, paper book, last decision and alerts; `--json`) and `aurum live reset-halt`
+  (clears the kill switch only with `--confirm RESET`, refuses while a runner holds the lock,
+  takes the runner's lock, logs who/when/why to `decisions.jsonl` and `alerts.jsonl`).
+- **Decision attribution in the live log.** Every decision record carries `attribution`
+  (per-strategy forecast, weight and contribution, FDM, raw and clipped combined forecast,
+  unallocated risk, the desk's delta).
+- **`aurum --version`**, `aurum.__version__`, and an extension hook: `aurum.cli_ext` adds
+  `sweep`, `stress`, `explain` and `dashboard` to the core parser (guarded; a broken
+  extension never breaks the core commands).
+- **Holdout-ledger coverage.** `run_single_backtest(include_holdout=True)` and LLM-desk
+  replays that reach `walkforward.holdout_start` record their look (the replay under its own
+  `:desk` config hash, so it counts as a separate trial in later walk-forwards); ledger
+  entries record `data_source` (real/synthetic) and `data_hash`; synthetic smoke tests no
+  longer count against the real holdout.
+- `aurum.rl.train.rl_config_from_aurum`: the RL environment takes costs, sizing, research
+  risk, instrument and initial equity from the top-level config (used by `aurum rl train`).
+- Walk-forward attribution API: `forecast_contributions`, `WalkForwardReport.contributions()`
+  and friends.
+- Lazy exports of the new APIs from `aurum.research` and `aurum.rl`.
+
+### Changed
+
+- **Configuration validation reports every problem at once** (`AurumConfig.check` ->
+  `ValidationReport`): every `strategies[]` entry is built (unknown or misspelt params are
+  errors with a did-you-mean hint), the feature pipeline, instrument ranges, the live
+  runner's own `LiveConfig` and the RL config are checked. Every CLI command validates
+  strictly before loading data. `aurum config validate|show` print warnings, skipped checks
+  and what was checked.
+- `live.use_desk: true` requires `agents.enabled: true`; paid `desk run` / `desk replay`
+  refuse without it (`desk replay --fake` stays allowed).
+- `live_runner_mapping()` passes the full `agents.desk` (nested chief/specialist/role models
+  and prices) to the runner as `desk_config`.
+- `rl_ppo` with `artifact_dir` loads and re-verifies the artifact in `fit` instead of
+  retraining (`retrain`, `artifact_sha256` params), with a look-ahead guard: an artifact
+  trained on any bar after the fit window is refused.
+- `ml_gbm`, `meta_label` and `rl_ppo` reject unknown params.
+- `resample_bars` drops a leading partial bucket, so higher-timeframe values never depend on
+  where the history starts (the Dukascopy dataset build is byte-identical).
+- GARCH(1,1) annualises with nominal bars per year (5,796 for H1), like the EWMA estimator.
+- The runner rewrites `heartbeat.json` every `heartbeat_seconds` (default `live.poll_seconds`)
+  while it sleeps between bars; `check_heartbeat(path)` derives its threshold from the file.
+- The runner logs exactly one concise INFO line per decision, shown by `aurum live run` at
+  the default verbosity, and no longer reconfigures a host's logging.
+- `aurum live artifact` checks an existing `--out` before loading data; `backtest` without
+  `--start` is labelled IN-SAMPLE; equal-weight combiner fallbacks print a warning.
+- Tearsheets use the config's `walkforward.n_boot` and `seed` for the bootstrap.
+- `risk_report` takes the stress price from `last_price`, run metadata or the bars before
+  the last fill (`report["position"]["price_source"]`).
+- `aurum features list` shows `macro(any)` for the macro group.
+
+### Fixed / safety
+
+- The LLM desk's prerequisites (`anthropic` importable, `ANTHROPIC_API_KEY` set) are checked
+  before the runner touches the broker, and by `aurum live run` before it writes anything.
+- `desk.on_error` must be one of `follow_quant|flat|hold`, and `desk.enabled` must be a real
+  boolean (a quoted `"false"` used to enable the desk).
+- MT5 `server_tz: auto` without a fresh tick falls back to the zone last detected on the same
+  account server (or `server_tz_fallback`) UNCONFIRMED: dry-run decisions continue, every
+  order is deferred until a fresh tick confirms the offset, and a different offset is adopted
+  and that order rejected.
+- `aurum live run` no longer has a `run_from_config` side door that bypassed the runner's own
+  config validation.
+- `import aurum.live` no longer imports the runner (`python -m aurum.live.runner` printed a
+  RuntimeWarning).
+- Loader `attrs["source"]` is deterministic for in-memory buffers; `load_mt5_csv` warns when
+  the default server time zone is assumed.
+- Sweep heatmap labels pick their colour from the rendered cell (unreadable labels on
+  all-negative grids).
+
+### Research (additional trials, not pre-registered)
+
+Exploratory runs on real data ending 2024-12-31, holdout disabled, DSR with `n_trials` = 30:
+daily trend (`d1_trend`) combined Sharpe -0.29 (DSR 0.002); `managed_gold` combined 0.12
+(DSR 0.040; `managed_gold` alone 0.19 vs buy-and-hold 0.51); an `ema_cross` sweep's best
+point 16/64 Sharpe 0.24 with DSR 0.19 and a knife-edge plateau (ratio 0.49). No book comes
+close to the protocol's bar.
+
 ## [2.0.0] - 2026-09-28
 
 Aurum v2 is a ground-up rebuild of this repository as the `aurum` Python package, a

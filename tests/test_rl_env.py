@@ -449,10 +449,12 @@ def test_episode_starts_make_forecasts_independent_of_the_rollout_start(
     last = ra.info["episode_starts"][-1]
     assert rb.info["episode_starts"][-1] == last
     np.testing.assert_array_equal(ra.result.equity.to_numpy(), rb.result.equity.to_numpy())
-    # without anchors the forecast depends on where the account started
+    # without anchors the forecast depends on where the account started (compared over every
+    # bar after the later start: whether the two paths still differ after one particular
+    # anchor is incidental to the data - e.g. the mtf warm-up's length moves it)
     ca = rollout(env, _stateful_policy, start=a, compute_metrics=False)
     cb = rollout(env, _stateful_policy, start=b, compute_metrics=False)
-    assert not ca.forecast.iloc[first:].equals(cb.forecast.iloc[first:])
+    assert not ca.forecast.iloc[b + 1:].equals(cb.forecast.iloc[b + 1:])
 
 
 def test_simulated_risk_manager_does_not_log_like_the_real_account(

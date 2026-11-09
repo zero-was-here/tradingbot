@@ -23,8 +23,13 @@ What is watched and why
   that live performance is inconsistent with the research expectation (a one-sided test;
   the default -3 has a ~0.1% false-alarm rate per check under normality, conservative
   because the same z is checked daily).
-* **Heartbeat.** The runner rewrites a heartbeat file every loop; :func:`check_heartbeat`
-  is for an external watchdog (cron, systemd timer) that alerts when it goes stale.
+* **Heartbeat.** The runner rewrites a heartbeat file every loop and, on a wall clock, every
+  ``heartbeat_every_s`` seconds (default: the retry poll, 30 s) while it sleeps between bars;
+  :func:`check_heartbeat` is for an external watchdog (cron, systemd timer) that alerts when
+  it goes stale. With ``max_age_seconds=None`` the threshold is derived from the interval the
+  heartbeat itself advertises: ``periods * heartbeat_every_s + grace_seconds`` (raise
+  ``grace_seconds`` above the longest decision cycle, e.g. an LLM desk's
+  ``max_cycle_seconds``, because no heartbeat is written while a decision is computed).
 
 Alerts go to sinks: the log (always), an optional JSONL file, and an optional webhook
 (generic JSON POST accepted by Slack/Discord incoming webhooks and similar; Telegram bot
@@ -73,6 +78,7 @@ __all__ = [
     "SlippageTracker",
     "WebhookAlertSink",
     "check_heartbeat",
+    "heartbeat_max_age",
     "psi",
     "redact",
 ]
@@ -564,8 +570,28 @@ class AlertManager:
         return self.send(Alert(level, kind, message, time=time, data=data))
 
 
-def check_heartbeat(path: str | Path, *, max_age_seconds: float, now: pd.Timestamp | None = None) -> Alert | None:
-    """Watchdog helper: an alert if the heartbeat file is missing, unreadable or stale."""
+def heartbeat_max_age(heartbeat_every_s: float, *, periods: float = 3.0, grace_seconds: float = 120.0) -> float:
+    """Watchdog threshold for a runner that rewrites its heartbeat every ``heartbeat_every_s``
+    seconds while sleeping: ``periods * heartbeat_every_s + grace_seconds``. ``grace_seconds``
+    must cover the longest decision cycle (no heartbeat is written while a bar is processed)."""
+    every = float(heartbeat_every_s)
+    if not math.isfinite(every) or every <= 0:
+        raise ValueError(f"heartbeat_every_s must be positive, got {heartbeat_every_s!r}")
+    if not (float(periods) >= 1.0 and float(grace_seconds) >= 0.0):
+        raise ValueError("periods must be >= 1 and grace_seconds >= 0")
+    return float(periods) * every + float(grace_seconds)
+
+
+def check_heartbeat(path: str | Path, *, max_age_seconds: float | None = None, now: pd.Timestamp | None = None,
+                    periods: float = 3.0, grace_seconds: float = 120.0) -> Alert | None:
+    """Watchdog helper: an alert if the heartbeat file is missing, unreadable or stale.
+
+    ``max_age_seconds=None`` derives the threshold from the heartbeat's own
+    ``heartbeat_every_s`` (:func:`heartbeat_max_age`); a heartbeat without a valid value (an
+    older runner) then yields a critical alert saying so — pass ``max_age_seconds`` instead.
+    Invalid ``periods``/``grace_seconds`` raise :class:`ValueError` (a setup error)."""
+    if max_age_seconds is None:
+        heartbeat_max_age(1.0, periods=periods, grace_seconds=grace_seconds)  # setup errors raise here
     now = now if now is not None else pd.Timestamp.now(tz="UTC")
     try:
         hb = read_json(path)
@@ -580,6 +606,13 @@ def check_heartbeat(path: str | Path, *, max_age_seconds: float, now: pd.Timesta
         t = t.tz_localize("UTC") if t.tz is None else t  # a watchdog must not crash on a naive stamp
     except (KeyError, ValueError, TypeError):
         return Alert("critical", "heartbeat", "heartbeat has no valid time", time=now)
+    if max_age_seconds is None:
+        try:
+            max_age_seconds = heartbeat_max_age(hb.get("heartbeat_every_s"), periods=periods,
+                                                grace_seconds=grace_seconds)
+        except (TypeError, ValueError):  # alert, never crash the watchdog
+            return Alert("critical", "heartbeat", "heartbeat does not advertise a valid heartbeat_every_s (older "
+                         "runner?): pass max_age_seconds", time=now)
     age = (now - t).total_seconds()
     if age > max_age_seconds:
         return Alert("critical", "heartbeat", f"runner heartbeat is {age:.0f}s old (status {hb.get('status')})",
