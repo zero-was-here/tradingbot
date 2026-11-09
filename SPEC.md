@@ -36,8 +36,10 @@ removed APIs like `fillna(method=...)`, `'H'`/`'T'` offset aliases; use `'h'`, `
 - **Units**: equity/PnL/costs in USD. Positions in signed lots (1 lot = 100 oz for
   XAUUSD, `aurum.core.instrument.XAUUSD`). Volatility is an annualised fraction.
 - **Forecasts**: float in [-1, 1] decided at close of `t` (see `aurum/strategies/base.py`).
-- **Annualisation**: `aurum.core.timeframes.infer_bars_per_year(index)` for per-bar series;
-  daily series use 252. Headline Sharpe is computed on DAILY returns (UTC dates) — per-bar
+- **Annualisation**: `aurum.core.timeframes.infer_bars_per_year(index)` for per-bar series
+  in reports; causal estimators (EWMA and GARCH volatility, sizing, features) use the
+  data-independent `nominal_bars_per_year` (252·23 h / bar, 5,796 on H1); daily series
+  use 252. Headline Sharpe is computed on DAILY returns (UTC dates) — per-bar
   Sharpe is reported separately.
 - **Registries**: features via `@register_feature`, strategies via `@register_strategy`.
 - **Logging**: `logging.getLogger(__name__)`; never `print` in library code (CLI may).
@@ -54,29 +56,39 @@ aurum/
   models/      volatility.py (EWMA / GARCH / HAR) regime.py (HMM)
   labels/      triple_barrier.py
   strategies/  base.py trend.py mean_reversion.py breakout.py macro.py
-               seasonal.py ml.py rl.py
+               seasonal.py ml.py rl.py allocation.py regime.py
   portfolio/   combiner.py sizing.py
   risk/        manager.py var.py
   execution/   costs.py simulator.py
   backtest/    result.py engine.py metrics.py
   research/    splits.py stats.py report.py walkforward.py
+               sweep.py montecarlo.py attribution.py
   rl/          env.py train.py
   agents/      LLM trading desk (see §10)
   live/        broker.py paper.py mt5.py oms.py runner.py monitor.py state.py
-  cli.py
+  viz/         style.py (figure style) dashboard.py (HTML dashboard) cli.py
+  cli.py       core commands; cli_ext.py adds sweep / stress / explain (+ dashboard) (§12)
 ```
 
 ## 3. Data layer (`aurum.data`)
 
 ### 3.1 `loaders.py`
-- `load_mt5_csv(path, timeframe, *, server_tz="Etc/GMT-2", point_size=0.01) -> bars`
+- `load_mt5_csv(path, timeframe, *, server_tz=DEFAULT_MT5_SERVER_TZ, point_size=0.01,
+  default_spread=None) -> bars`
   Parses MT5 History Center exports (`<DATE> <TIME> <OPEN>...<TICKVOL> <VOL> <SPREAD>`,
-  tab or comma). `<SPREAD>` is in points → convert with `point_size` to price units.
-  `server_tz` may be an IANA name, `"Etc/GMT-2"` style, or the special value `"NY+7"`
-  meaning New-York-close-aligned servers (UTC+2 winter / UTC+3 summer, following US DST).
-  Convert to UTC. Validate with `make_bars`.
+  tab, comma or semicolon; header-less MT4 files too). `<SPREAD>` is in points → convert
+  with `point_size` to price units (without a `<SPREAD>` column `default_spread` is
+  required). `server_tz` may be an IANA name, `"Etc/GMT-2"` style, or the special value
+  `"NY+7"` meaning New-York-close-aligned servers (UTC+2 winter / UTC+3 summer, following
+  US DST). Convert to UTC. Validate with `make_bars`.
+  `DEFAULT_MT5_SERVER_TZ = "Etc/GMT-2"` (fixed UTC+2) is kept for backward compatibility;
+  **relying on it logs a WARNING** (on a New-York-close server it shifts every US-summer bar
+  by one hour: pass `"NY+7"` or the broker's zone).
 - `load_csv(path, timeframe, *, time_col="time", tz="UTC", default_spread=None) -> bars`.
 - `bars_from_ohlc(df, timeframe, default_spread)` — thin wrapper around `make_bars`.
+- `attrs["source"]` is deterministic: `"mt5:<file name>"` / `"csv:<file name>"`, with
+  `source_name(path_or_buffer)` returning the base name of a path or named file object and
+  `BUFFER_SOURCE_NAME = "<buffer>"` for an anonymous buffer.
 
 ### 3.2 `dukascopy.py`  (primary free source of real bid/ask history)
 - `download_dukascopy(symbol="XAUUSD", start, end, timeframe="M1", *, cache_dir="cache/dukascopy",
@@ -150,6 +162,21 @@ aurum/
   `available_at`, `attrs["timeframe"]` via parquet metadata).
 - `frame_hash(df) -> str` stable sha256 of values+index (used for run provenance).
 
+### 3.7 `resample.py`
+- `resample_bars(bars, to, *, daily_anchor_hour_utc=0, complete_until=None,
+  complete_from="auto") -> bars`. An HTF bar's `available_at` is its bucket end.
+  `daily_anchor_hour_utc` shifts D1/H4 bucket boundaries (22 = New York close).
+- **Tail rule**: a bucket is emitted only once complete (`complete_until` may assert that
+  historical data is final up to an instant, so a dataset ending on a Friday keeps its
+  Friday bar; it never makes a bar available earlier).
+- **Head rule** (`complete_from`): the LEADING bucket is emitted only if its first base bar
+  opens exactly at the bucket open, or the bucket opens at or after `complete_from`;
+  otherwise it holds part of its period and is dropped. `None` = strict; `"auto"`
+  (`COMPLETE_FROM_AUTO`, default) = strict unless `complete_until` is given (the Dukascopy
+  build, which cuts its own head; datasets are byte-identical).
+- Guarantee: `resample_bars(bars[k:j])` is a subset of `resample_bars(bars)` with identical
+  values for every emitted bar, so HTF features never depend on where the history starts.
+
 ## 4. Features (`aurum.features`)
 
 See `aurum/features/base.py` for the causal contract. Each module registers one or more
@@ -185,17 +212,30 @@ Scaler stats come ONLY from `raw_train`; columns constant in train are dropped; 
 columns at transform time raise.
 
 ## 5. Models (`aurum.models`)
-- `volatility.py`: `ewma_volatility(close, *, halflife_bars=48, ...)`; `Garch11`
-  (`fit(returns)`, `forecast(returns)` → causal conditional vol series annualised, params
-  stored; MLE via scipy with stationarity constraints); `har_rv_forecast(daily_rv)`;
+- `volatility.py`: `ewma_volatility(close, *, halflife_bars=48, bars_per_year=None,
+  min_periods=20, floor=0.03, cap=2.0)` (annualised, causal, clipped to `[floor, cap]`,
+  warm-up rows 0.20); `Garch11(*, mean="zero", bars_per_year=None, ...)` (`fit(returns)`,
+  `forecast(returns)` → causal conditional vol series annualised, params stored; MLE via
+  scipy with stationarity constraints). **Annualisation is nominal**: without
+  `bars_per_year`, `fit` uses `nominal_bars_per_year(index_bar_minutes(train index))` =
+  252·23·60 / bar minutes intraday (5,796 for H1), 252 for D1 — the same convention as
+  `ewma_volatility`, never the realised bar density of the sample.
+  `daily_realised_variance`, `HarRV(lags=(1, 5, 22))` / `har_rv_forecast(daily_rv)`;
   `blend_vol(*series, weights)`.
-- `regime.py`: `GaussianHMM(n_states=2, seed=0)` with `fit(x)` (Baum–Welch on TRAIN),
+- `regime.py`: `GaussianHMM(n_states=2, seed=0, *, n_iter=200, tol=1e-4, ...)` with
+  `fit(x)` (Baum–Welch on TRAIN; the smoother is used only inside `fit`),
   `filter(x) -> DataFrame` of forward-filtered state probabilities (causal: uses x[:t+1]
-  only), `predict_next(x)`; states ordered by variance (state 0 = calm).
+  only), `predict_next(x)`, `filtered_state(x)`, `score(x)`, `stationary_distribution_`,
+  `expected_durations_`, `summary()`; states ordered by variance (state 0 = calm). Used by
+  the `regime_switch` strategy (§6).
 
 ## 6. Strategies (`aurum.strategies`)
 Base class in `strategies/base.py`. Each strategy documents its economic rationale. All are
-long/short unless noted. Required families (each file may hold several classes):
+long/short unless noted. The registry holds 17 strategies (the fixed module list below).
+A strategy is built only from parameters it declares in `default_params()`: an unknown
+parameter is a configuration error (`AurumConfig.build_strategies` and the config validation
+of every `strategies[]` entry; `ml_gbm`, `meta_label` and `rl_ppo` also reject unknown params
+themselves). Required families (each file may hold several classes):
 - `trend.py`: `tsmom` (multi-horizon time-series momentum, vol-scaled sign/strength, à la
   Moskowitz–Ooi–Pedersen), `ema_cross` (fast/slow EMA with continuous forecast = scaled
   distance), `donchian` (turtle-style breakout with ATR exits, stateful), `kalman_trend`
@@ -227,6 +267,33 @@ long/short unless noted. Required families (each file may hold several classes):
   import — importing `aurum.strategies.rl` must NOT require torch). Attaching an artifact
   embeds its files' bytes + SHA-256 fingerprint in the strategy (self-contained pickles;
   `aurum.rl.train.read_artifact_bytes` / `load_artifact_bytes`); tampered bytes are refused.
+  `retrain=None` resolves to False when `artifact_dir` is given at construction (True
+  otherwise); `artifact_sha256` (>= 8 hex digits) pins the artifact. With `retrain=False`,
+  `fit` verifies the artifact (embedded bytes vs SHA-256, the directory, the pin, the bar
+  size) instead of training. **Look-ahead guard**: `fit` raises if the artifact's recorded
+  train/validation end (`config.json` `data_ranges`, fingerprinted) is after the fit window's
+  last bar, and `generate` refuses bars after `fit_cutoff_` that are not strictly after the
+  artifact's last bar — a pre-trained policy can only be walk-forwarded on folds whose
+  training ends at or after its validation end.
+- `allocation.py`: `managed_gold` (long-only by default; `allow_short` allows −1): a
+  strategic long `base_weight` tilted by Carver-scaled multi-horizon momentum,
+  `raw = base_weight + tilt_weight · clip(FDM · mean_h(0.6267 · z_h), −1, 1)` with
+  `z_h = ln(C_t/C_{t−h}) / (σ_t √h)`; a de-risk latch with hysteresis (enter when
+  `ln C < EMA(trend_halflife)` AND `vol_fast/vol_slow >= vol_enter`, exit when
+  `ln C >= EMA` OR the ratio `< vol_exit`) caps `raw` at `floor`; `f = clip(raw, 0, 1)`.
+  H1 defaults: horizons 480/1440/2880/5796, `trend_halflife` 1600, vol half-lives 120/2880,
+  `vol_enter`/`vol_exit` 1.25/1.0, `floor` 0. `components(md)` exposes every intermediate.
+- `regime.py`: `regime_switch` (trainable): a base forecast (default `tsmom`; a trainable
+  base is fitted too) scaled by a 2-state `GaussianHMM` fitted on TRAINING daily returns
+  (`100·Δln close`, daily bars via `resample_bars(D1, anchor 22 UTC)` for intraday data, bar
+  returns for D1): `scale = clip((p_ok − p_flat)/(p_full − p_flat), 0, 1)` with
+  `p_ok = 1 − P(chaotic | r_≤t)` from the forward filter, each day's value usable from that
+  day's `available_at` (`asof_join`); defaults `p_flat` 0.5, `p_full` 0.9. Abstains
+  (`f = 0`) with fewer than `min_train_obs` (60) training returns.
+  `regime_probabilities(md)`, `filtered_probabilities(md)`, `summary()`.
+  The latch and the HMM filter are path-dependent: a short live window converges to the
+  full-history value after the first latch exit / a few expected regime durations (not
+  look-ahead).
 
 ## 7. Portfolio & risk
 - `portfolio/combiner.py`: `ForecastCombiner(method="sharpe_shrink"|"equal"|"inverse_vol"|"hrp",
@@ -244,13 +311,16 @@ long/short unless noted. Required families (each file may hold several classes):
   accepts `combiner.method: fixed` (weights from `strategies[].weight`, handled by
   `aurum.core.config` / `aurum.research.walkforward`, not by `ForecastCombiner`).
 - `portfolio/sizing.py`: `VolTargetSizer(target_vol=0.10, max_leverage=2.0, max_lots=None,
-  rebalance_band=0.10, kelly_cap=None, drawdown_derisk=((0.10, 0.5), (0.15, 0.25)))`
-  implementing `aurum.core.interfaces.PositionSizer`:
-  `notional = forecast * target_vol / vol_ann * equity`, capped at `max_leverage*equity`,
-  scaled down by drawdown steps, → lots (`/ (contract_size*price)`), `round_lots`; if
+  rebalance_band=0.10, kelly_cap=None, drawdown_derisk=((0.10, 0.5), (0.15, 0.25)), *,
+  min_vol=0.02)` implementing `aurum.core.interfaces.PositionSizer`:
+  `notional = forecast * target_vol / max(vol_ann, min_vol) * equity`, capped at
+  `max_leverage*equity` (or the Kelly cap), scaled down by drawdown steps, → lots
+  (`/ (contract_size*price)`), `round_lots`; if
   `|target-current| < rebalance_band*max(|target|,|current|)` keep `current` (turnover
-  control). Also `FixedFractionalSizer(risk_per_trade=0.005, stop_atr=2.0)` for stop-based
-  sizing.
+  control). Also `FixedFractionalSizer(risk_per_trade=0.005, stop_atr=2.0, *, ...)` for
+  stop-based sizing. **Its stop is external**: the sizer assumes a stop `stop_atr x ATR`
+  away but never places one; stops come only from `backtest.stop_atr_mult` on the engine's
+  bar ATR (use `stop_atr_mult` ≈ `stop_atr · sqrt(23)` ≈ 4.8 on H1, or pass `atr=`).
 - `risk/manager.py`: `RiskLimits` dataclass (`max_lots=None`, `max_leverage=3.0`,
   `max_daily_loss=0.03`, `max_drawdown=0.20` (hard kill), `max_spread=None` (price units;
   block NEW risk when exceeded), `event_blackout_before_min=30`, `event_blackout_after_min=30`,
@@ -263,12 +333,19 @@ long/short unless noted. Required families (each file may hold several classes):
   beyond `current_lots` in the risk-increasing direction when a "no new risk" rule fires.
   Daily loss uses equity at the first bar of each UTC day (or broker rollover — configurable).
   Hard kill (max drawdown from peak, daily loss) sets `halted=True` → approved 0; `halted`
-  persists (JSON state file if `state_path`) until `reset_halt(confirm="RESET")`. With
+  persists (JSON state file if `state_path`) until `reset_halt(confirm="RESET")`, which
+  re-bases the equity peak and day start to the last observed equity (CLI:
+  `aurum live reset-halt`, §11). With
   `daily_loss_persistent=False` a daily-loss halt clears at the next day instead. Research
   runs use `RESEARCH_RISK_DEFAULTS` (`aurum.core.config`: `daily_loss_persistent=False`,
   `max_drawdown=None`; the kill switch is a live control), live runs the `risk.live` limits.
 - `risk/var.py`: historical / Gaussian / Cornish–Fisher VaR & ES, stress scenarios
-  (`gap_shock(position_lots, price, pct)`), `risk_report(result) -> dict`.
+  (`gap_shock(position_lots, price, pct)`, `stress_test`, `DEFAULT_STRESS_SCENARIOS`),
+  `risk_report(result, *, level=0.95, price=None, last_price=None, bars=None,
+  instrument=XAUUSD, var_window=250, scenarios=None) -> dict`. The stress price is the first
+  available of `last_price`/`price` > `result.meta["last_price"]` > the bars close at or
+  before the last equity mark > the last fill, recorded in
+  `report["position"]["price_source"]`.
 
 ## 8. Execution & backtest
 - `execution/costs.py`: `CostModel(spread_multiplier=1.0, min_spread=0.10, slippage_fixed=0.02,
@@ -339,10 +416,13 @@ def run_target_lots(md, target_lots: pd.Series, ...) -> BacktestResult   # for p
   `min_track_record_length(...)`, `pbo_cscv(perf_matrix, n_splits=16)` (Bailey et al.),
   `stationary_bootstrap(returns, stat_fn, n_boot=2000, mean_block=None, seed=0) -> CI dict`,
   `sharpe_ci(...)`. Pure numpy/scipy, documented with references.
-- `report.py`: `write_tearsheet(result, path, *, benchmark=None, title="", extra=None) -> Path`
+- `report.py`: `write_tearsheet(result, path, *, benchmark=None, title="", extra=None,
+  n_trials=None, dark_charts=True, n_boot=None, seed=None) -> Path`
   single self-contained HTML (inline base64 PNGs via matplotlib Agg): equity vs benchmark
   (log), underwater drawdown, rolling 6-month Sharpe, monthly return table, return
   histogram, position/exposure, cost attribution, metrics table, trade stats, notes/extra.
+  `n_boot`/`seed` resolve explicit > `extra["config"]` (`walkforward.n_boot`, `seed`) >
+  `DEFAULT_N_BOOT` 1000 / `DEFAULT_SEED` 0.
 - `walkforward.py`: orchestrates features → strategies → combiner → backtest per
   fold with refits; stitches OOS forecasts; runs ONE continuous backtest on the stitched
   OOS; returns `WalkForwardReport` with per-strategy OOS metrics, combined metrics, DSR/PBO.
@@ -354,11 +434,59 @@ def run_target_lots(md, target_lots: pd.Series, ...) -> BacktestResult   # for p
   `combiner_min_obs` OOS bars exist), with `train` on the in-sample training-window
   forecasts (biased toward trainable strategies; noted in the report). Holdout
   evaluations are appended to the holdout ledger (`<output root>/holdout_ledger.jsonl`:
-  timestamp, config/data hash, window, strategies, metrics); it is read BEFORE the holdout
-  is evaluated, and overlapping windows evaluated by OTHER config hashes raise a WARNING +
-  report note and add to the DSR `n_trials` (= `walkforward.n_trials` or #strategies +
-  distinct prior other-config looks). Holdout OOS forecasts are saved
-  (`holdout/oos_forecasts.parquet`).
+  timestamp, kind, config/data hash, `data_source` (`real`/`synthetic`,
+  `data_source_kind`), window, strategies, metrics with `strategy_sharpe` excluding the
+  benchmark and a separate `benchmark_sharpe`); it is read BEFORE the holdout is evaluated,
+  and overlapping windows evaluated by OTHER config hashes on the same kind of data raise a
+  WARNING + report note and add to the DSR `n_trials` (= `walkforward.n_trials` or
+  #strategies + distinct prior other-config looks). Holdout OOS forecasts are saved
+  (`holdout/oos_forecasts.parquet`). Ledger writers: `run_walk_forward` (holdout),
+  `run_single_backtest(include_holdout=True)` (`kind="backtest"` + `evaluated_start/end`,
+  `in_sample`, `metrics_window`), the public `record_holdout_look(output_dir, entry, *,
+  cfg=None, md=None)`, and LLM-desk replays that reach `walkforward.holdout_start`
+  (`kind="desk_replay"`, config hash suffixed `:desk` / `:desk-fake`, so the desk is a
+  separate trial). Readers: the walk-forward DSR and the sweep's holdout guard.
+- Walk-forward attribution: with `k` the fold of bar `t` and `f` clipped to [−1, 1],
+  `c_i[t] = FDM_k · w_{k,i} · f_i[t]`, `combined[t] = clip(Σ_i c_i[t], −1, 1)`;
+  `forecast_contributions(forecasts, weights, *, fdm=None, residual=False)` (`residual` adds
+  `CLIP_COLUMN = "clip_adjustment"` so rows sum to `combined`),
+  `WalkForwardReport.strategy_keys / strategy_forecasts() / fold_weights() / fold_fdm() /
+  bar_weights(include_fdm=True) / contributions(residual=False)`,
+  `HoldoutReport.strategy_forecasts() / contributions()`.
+- `sweep.py`: `run_sweep(md, cfg, strategy_name, grid, *, metric="sharpe", maximize=None,
+  walkforward=True, start=None, end=None, n_jobs=0, executor="auto", out_dir=None, write=None,
+  ledger=None, holdout_ledgers=None, respect_holdout_ledgers=True, prior_trials=0,
+  knife_edge_ratio=0.5, n_boot=None, seed=None) -> SweepResult` (`label="exploratory"`).
+  Each grid point is a standalone single-strategy book (weight 1, FDM 1) evaluated by
+  `run_walk_forward` (OOS, net of costs); points the strategy rejects are `invalid`, not
+  trials. `n_trials = valid points + distinct earlier configs in <out>/../sweep_ledger.jsonl
+  over an overlapping window + prior_trials`; the best point gets PSR/DSR/CI (and `dsr_xs`
+  with the cross-sectional variance of the grid's Sharpes); `plateau_score` (neighbours =
+  valid points at Chebyshev distance 1 in grid-index space; ratio < 0.5 knife-edge, >= 0.75
+  robust; plateau centre; `edge_params`); PBO = CSCV over the T x N matrix of daily OOS
+  returns. **The holdout is never swept**: the window is cut at `walkforward.holdout_start`,
+  at `end`, and before the earliest window in any holdout ledger in `output.dir` and its
+  immediate subdirectories; every point config has `holdout_start: null`.
+- `montecarlo.py`: `monte_carlo(returns, *, n_paths=10000, horizon="2Y", mean_block=None,
+  seed=0, ...) -> MonteCarloResult` and `stress_run(source, *, book="combined",
+  phase="research", ...) -> StressReport`. Stationary bootstrap (Politis-Romano: a block
+  starts with probability `1/b` at a uniform index, then advances by one with circular wrap;
+  `b` by Politis-White with the Patton-Politis-White correction; draw order identical to
+  `stats.stationary_bootstrap_indices`; paths drawn in chunks of `CHUNK_PATHS = 4096`, part
+  of the seeded stream). Per path: `E_t = E_0 Π(1 + r)`, CAGR `(E_H/E_0)^(252/H) − 1`,
+  max drawdown from the running peak, ruin `P(min E_t <= (1 − L) E_0)` from the START,
+  time to recover, longest underwater stretch; fan = per-day quantiles. Deterministic
+  stress: worst rolling k-day windows (1, 5, 10, 21, 63), gap shocks on the current and peak
+  exposure (`risk.var.stress_test`), gold's worst k-day moves on the current lots. Reads a
+  run directory only.
+- `attribution.py`: `load_run`, `contributions`, `explain_decision(source, at=None, *,
+  phase, book, md=None, load_data=True) -> DecisionExplanation` (waterfall + point-in-time
+  sizing replay, checked against the saved request), `pnl_attribution(source, *, phase,
+  component="net") -> PnLAttribution` (`share_i(t) = c_i(t)/Σ_j c_j(t)`,
+  `pnl_i(t+1) = share_i(t) · pnl(t+1)`, `unattributed` when the raw sum is 0: exact by
+  construction), `desk_journal_summary(path) -> DeskSummary`, `live_decisions(...)`,
+  `explain_live_decision(source, at=None)` (adds the desk step,
+  `desk_delta = final − combined`). Read-only.
 - `aurum train-final --config C --out DIR [--cutoff TS] [--from-run WF_DIR]`: production
   artifact fitted on data closed at/before the cutoff (macro truncated point-in-time); the
   combiner weights come from the stitched OUT-OF-SAMPLE forecasts (research + holdout) of a
@@ -380,7 +508,7 @@ parallel) and return memos. The Chief ends every cycle by calling `submit_decisi
   resolve to `on_failure` (`follow_quant` default, or `veto` / `hold`).
 - Models default to `claude-opus-5` (Chief effort `high`, specialists `medium`); caps per
   cycle: `max_specialists_per_cycle` (consulted + created), `max_cost_usd_per_cycle`
-  (default $3) / `max_tokens_per_cycle`, with a share reserved for the Chief. Ad-hoc agents
+  (default 3 USD) / `max_tokens_per_cycle`, with a share reserved for the Chief. Ad-hoc agents
   get only whitelisted read-only data tools and cannot create further agents.
 - All data reaches agents through a `DeskDataProvider` protocol (JSON-serialisable
   snapshots: market, quant signals, risk, macro, calendar, backtest stats, positions). A
@@ -397,7 +525,15 @@ parallel) and return memos. The Chief ends every cycle by calling `submit_decisi
   `intrabar_exit`, same financing valuation; `rates=` / `set_rates()` — the runner passes and
   refreshes `macro_dir` frames);
   `mt5.py` `MT5Broker` (lazy `import MetaTrader5`; magic-number isolation; broker-side SL;
-  retcode handling; server-time → UTC).
+  retcode handling; server-time → UTC). With `server_tz="auto"` and no fresh tick it falls
+  back to the zone persisted in `tz_state_path` (the runner's
+  `<state_dir>/mt5_server_tz.json`, last detection on the SAME account server) or else to
+  `server_tz_fallback` (auto only), UNCONFIRMED: bars/quotes use the provisional zone and
+  every order (place, close, close_all, modify) first probes for a fresh tick, returning
+  `MARKET_CLOSED` with retcode `server_tz_unconfirmed` (the OMS defers) until one confirms
+  the offset; a different offset is adopted, persisted, and that order rejected
+  (`server_tz_corrected`). `latest_bars` re-probes at most every `tz_reprobe_seconds` (60).
+  It fails only when neither the file nor the fallback exists.
 - `oms.py`: idempotent client ids, reconciliation (target vs actual), retries, rejects.
 - `state.py`: atomic (fsync + `os.replace`) JSON state files and JSONL logs; an unreadable
   state file raises `StateCorruptError` instead of silently starting empty.
@@ -411,5 +547,59 @@ parallel) and return memos. The Chief ends every cycle by calling `submit_decisi
   forecast of the last decision is persisted (`runner_state.json` `prev_final_forecast`) and
   passed to the desk as `previous_forecast` (so `on_failure="hold"` survives restarts);
   `backtest.stop_cooldown_bars` is honoured live.
-- `monitor.py`: feature drift (PSI) vs training stats, live vs backtest slippage, heartbeat,
-  optional webhook alerts.
+  `LiveConfig` (`LiveConfig.from_mapping` rejects unknown keys; the CLI builds it only
+  that way) adds `heartbeat_seconds` (None = `retry_poll_seconds`) and `desk_config` (the FULL
+  `DeskConfig` mapping, merged over the legacy flat `desk.config`; a key set to different
+  values in both is an error); `dry_run`, `allow_live_real`, `flatten_on_shutdown` and
+  `desk.enabled` must be real booleans, and `desk.on_error` is strictly one of
+  `DESK_ON_ERROR = ("follow_quant", "flat", "hold")`. With the desk enabled,
+  `check_desk_prerequisites` raises `RunnerConfigError` (exit 2, `CONFIG ERROR`) when
+  `anthropic` cannot be imported or `ANTHROPIC_API_KEY` is empty, before the state-dir lock
+  or any broker call. `heartbeat.json` is rewritten after every loop iteration AND every
+  `heartbeat_every_seconds` while sleeping (`status` running/degraded, `next_wake`,
+  `heartbeat_every_s`; `broker_time` may be null). Every decision record in
+  `decisions.jsonl` carries `attribution` = {method, fdm, strategies{name: forecast,
+  weight, contribution}, raw_combined, combined, clipped, unallocated = max(0, 1 − Σw),
+  exact, final_forecast, desk_delta = final − combined} (+ `venue_tz_confirmed` on MT5), and
+  the runner logs exactly one INFO line per decision.
+- `monitor.py`: feature drift (PSI) vs training stats, live vs backtest slippage, heartbeat
+  (`heartbeat_max_age(heartbeat_every_s, *, periods=3, grace_seconds=120)` =
+  `periods · heartbeat_every_s + grace_seconds`; `check_heartbeat(path, *,
+  max_age_seconds=None, ...)` derives it from the file; the grace must cover the longest
+  decision cycle), optional webhook alerts.
+- Operator CLI (read and clear state; never trades): `aurum live status -c C [--json]`
+  (read-only: lock probe, heartbeat, risk, OMS, paper book, last decision, last reset, last
+  5 alerts) and `aurum live reset-halt -c C [--confirm RESET] [--reason TEXT]` (refuses with
+  exit 2 while a runner holds `runner.lock`, exit 4 without the literal `RESET`; takes the
+  runner lock, re-reads the state, `reset_halt(confirm="RESET")`, appends a `halt_reset`
+  record to `decisions.jsonl` and a critical alert to `alerts.jsonl`, both fsynced).
+
+## 12. Configuration & CLI (`aurum.core.config`, `aurum.cli`)
+- One YAML (`extends` deep merge, lists replaced; `--set` dotted overrides) → typed
+  `AurumConfig`. Structural problems (unknown keys with did-you-mean, types, secrets in
+  YAML) raise first, all together. Semantic validation, `AurumConfig.check(*, strict=False)
+  -> ValidationReport(problems, warnings, checked, skipped; .ok, .raise_if_problems())`,
+  builds every downstream object and reports every problem at once: instrument ranges
+  (`triple_swap_weekday` 0..4, `rollover_hour_utc` 0..23, `margin_rate` in (0, 1], ...),
+  costs, the feature pipeline (groups, overrides, override params by signature), EVERY
+  `strategies[]` entry (unknown param or constructor error = problem; missing file =
+  warning), combiner, sizer, both risk limit sets, policy, `DeskConfig`, `live.use_desk`
+  requires `agents.enabled`, the live runner's `LiveConfig` dry-built (unknown
+  `live.options` keys = problem) and `rl.params` via `rl_config_from_aurum` (skipped when
+  the RL stack is missing). `strict=True` turns an unknown strategy name and a value the
+  runner refuses from warnings into problems. `validate(strict)`, `load_config(...,
+  strict=False)`, `config_from_dict(..., strict=False)`.
+- Secrets only from the environment (`SECRET_ENV`); `config_hash()` = SHA-256 of the
+  canonical JSON of every result-relevant field.
+- Every CLI command that takes `--config` validates with `strict=True` BEFORE loading data
+  (`live status` / `live reset-halt`: keys and types only). Exit codes: 0 ok, 1 runtime
+  error, 2 usage/configuration error (also a refused `live reset-halt`), 3 optional
+  component missing, 4 confirmation required (`desk replay` without `--yes`,
+  `live reset-halt` without `--confirm RESET`). `aurum --version`.
+- Paid desk commands (`desk run`, `desk replay` without `--fake`) require
+  `agents.enabled: true` and `ANTHROPIC_API_KEY`. `live artifact` / `train-final` refuse an
+  existing `--out` before loading data.
+- Extension hook: `aurum.cli_ext.register_all(subparsers)` is called at parser build with a
+  guarded proxy (core names cannot be replaced; on any exception its parsers are rolled
+  back and a WARNING logged). It adds `sweep`, `stress`, `explain [--run|--live]` and, via
+  `aurum.viz.cli.register`, `dashboard`. Reference: docs/cli.md, docs/configuration.md.

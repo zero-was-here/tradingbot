@@ -508,21 +508,26 @@ class SweepResult:
             "settings": self.settings, "table": self.table.to_dict(orient="records"), "out_dir": self.out_dir,
         })
 
-    def plot(self, *, x: str | None = None, y: str | None = None, metric: str | None = None) -> Any:
-        """Heatmap (2-D grids) or line chart (1-D) of ``metric`` (default the sweep metric)."""
+    def plot(self, *, x: str | None = None, y: str | None = None, metric: str | None = None,
+             mode: str | None = None) -> Any:
+        """Heatmap (2-D grids) or line chart (1-D) of ``metric`` (default the sweep metric).
+
+        ``mode``: ``"light"`` or ``"dark"`` (:mod:`aurum.viz.style`); ``None`` = the active
+        :func:`~aurum.viz.style.use_style` mode, i.e. light outside one."""
         m = metric or self.metric
         p = self.plateau
         sub = ""
         if m == self.metric and p.get("best"):
             ratio = p.get("plateau_ratio")
             rtxt = f"{ratio:.2f}" if isinstance(ratio, float) and math.isfinite(ratio) else "n/a"
-            sub = (f"box = best ({p['best']}), circle = plateau centre ({p.get('robust_best')}); plateau ratio "
-                   f"{rtxt}: {p.get('verdict')}; DSR {_num(self.best.get('dsr'))} at n_trials {self.n_trials}")
-        mode = "walk-forward OOS" if self.walkforward else "single split"
+            sub = (f"box = best ({p['best']}), circle = plateau centre ({p.get('robust_best')}), dashed outline = "
+                   f"its grid neighbours; plateau ratio {rtxt}: {p.get('verdict')}; DSR "
+                   f"{_num(self.best.get('dsr'))} at n_trials {self.n_trials}")
+        how = "walk-forward OOS" if self.walkforward else "single split"
         return plot_sweep(self.table, self.grid, m, maximize=_better(m, None) if m != self.metric else self.maximize,
                           x=x, y=y, best=p.get("best_params") if m == self.metric else None,
                           robust=p.get("robust_best_params") if m == self.metric else None,
-                          title=f"{self.strategy} sweep, {m} ({mode}, exploratory)", subtitle=sub)
+                          title=f"{self.strategy} sweep, {m} ({how}, exploratory)", subtitle=sub, mode=mode)
 
     def save(self, directory: str | Path) -> Path:
         """Write ``sweep.csv``, ``returns.csv``, ``sweep.json`` and ``sweep.png`` (+ ``sharpe.png``)."""
@@ -854,130 +859,194 @@ def _grid_pbo(returns: pd.DataFrame, n_splits: int) -> dict[str, Any] | None:
 
 
 # ============================================================================================
-# plots
+# plots (drawn with aurum.viz.style: one palette, light or dark)
 # ============================================================================================
-_INK, _INK2, _MUTED, _GRID, _SURFACE = "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#fcfcfb"
-_BLUE, _RED = "#2a78d6", "#e34948"
+#: label colours inside heatmap cells: chosen from the RENDERED cell colour (see _dark_fill)
+_ON_DARK = "#ffffff"
+
+
+def _palette(mode: str | None) -> dict[str, Any]:
+    from aurum.viz.style import current_mode, palette
+
+    return palette(current_mode() if mode is None else mode)
 
 
 def _figure(size: tuple[float, float]) -> Any:
+    """A pyplot-free constrained-layout Figure; call inside :func:`aurum.viz.style.use_style`
+    so the surface, fonts and ink come from the active mode."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
-    fig = Figure(figsize=size, dpi=110, facecolor=_SURFACE, layout="constrained")
+    fig = Figure(figsize=size, layout="constrained")
     FigureCanvasAgg(fig)
     return fig
 
 
-def _style(ax: Any) -> None:
-    ax.set_facecolor(_SURFACE)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color("#c3c2b7")
-    ax.tick_params(colors=_MUTED, labelcolor=_INK2, length=3, width=0.6)
-    ax.title.set_color(_INK)
+def _dark_fill(rgba: Sequence[float]) -> bool:
+    """True when a rendered fill is dark (luma of the sRGB values < 0.5): write white on it.
+    Works for the diverging and the sequential scale alike (|value| alone does not: on a
+    sequential scale the darkest cell can be the one closest to 0, and in dark mode the
+    diverging midpoint is the dark one)."""
+    r, g, b = rgba[0], rgba[1], rgba[2]
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.5
+
+
+def _cell_ink(rgba: Sequence[float]) -> str:
+    from aurum.viz.style import TEXT_PRIMARY
+
+    return _ON_DARK if _dark_fill(rgba) else TEXT_PRIMARY["light"]
+
+
+def _cell_label(v: float) -> str:
+    """Two decimals; a value that rounds to zero prints as ``0.00``, never ``-0.00``."""
+    s = f"{v:.2f}"
+    return "0.00" if s == "-0.00" else s
 
 
 def plot_sweep(table: pd.DataFrame, grid: Mapping[str, Sequence[Any]], metric: str = "sharpe", *,
                maximize: bool | None = None, x: str | None = None, y: str | None = None,
                best: Mapping[str, Any] | None = None, robust: Mapping[str, Any] | None = None,
-               title: str = "", subtitle: str = "") -> Any:
+               title: str = "", subtitle: str = "", neighbourhood: bool = True, mode: str | None = None) -> Any:
     """Matplotlib Figure: a heatmap of ``metric`` over two parameters (other parameters
-    aggregated by their best value), or a line chart for a 1-D grid. The best point is
-    boxed, the plateau centre circled; invalid / failed points are blank. Diverging colour
-    scale centred at 0 for signed metrics."""
-    from matplotlib.colors import TwoSlopeNorm
+    aggregated by their best value), or a line chart for a 1-D grid.
 
+    The best point is boxed, the plateau centre (``robust``) circled and, for a 2-parameter
+    grid with ``neighbourhood=True``, the best point's grid neighbours (Chebyshev distance 1,
+    the cells :func:`plateau_score` averages) are outlined with a dashed line; invalid /
+    failed points are blank (``n/a``). Signed metrics use the diverging scale of
+    :mod:`aurum.viz.style` (red negative, blue positive, gray 0, symmetric limits), one-signed
+    metrics the single-hue sequential scale; for a minimised metric both are reversed so
+    that "better" always reads the same way. Cell labels are white or ink depending on the
+    rendered cell colour. ``mode``: ``"light"`` / ``"dark"`` (``None`` = the active
+    :func:`~aurum.viz.style.use_style` mode, light outside one)."""
+    from aurum.viz.style import (
+        diverging_cmap,
+        sequential_cmap,
+        style_axes,
+        use_style,
+        zero_line,
+    )
+
+    pal = _palette(mode)
     mx = _better(metric, maximize)
     params = list(grid)
     t = table.copy()
     t[metric] = pd.to_numeric(t.get(metric), errors="coerce")
     if "status" in t:
         t.loc[t["status"] != "ok", metric] = np.nan
-    if len(params) == 1:
-        p = params[0]
-        fig = _figure((7.5, 3.6))
+    if len(params) != 1:
+        x = x or params[1]
+        y = y or params[0]
+        if x == y or x not in grid or y not in grid:
+            raise ValueError(f"x/y must be two different grid parameters of {params}")
+    with use_style(pal["mode"]):
+        if len(params) == 1:
+            p = params[0]
+            fig = _figure((7.5, 3.8))
+            ax = fig.add_subplot(1, 1, 1)
+            style_axes(ax, pal["mode"])
+            vals = [t.loc[t[p] == v, metric].max() if mx else t.loc[t[p] == v, metric].min() for v in grid[p]]
+            xs = np.arange(len(grid[p]))
+            ax.plot(xs, vals, color=pal["categorical"][0], marker="o")
+            zero_line(ax, mode=pal["mode"])
+            ax.set_xticks(xs, [str(v) for v in grid[p]])
+            ax.set_xlabel(p)
+            ax.set_ylabel(metric)
+            for pt, mk, col, ls in ((best, "s", pal["text"], "-"), (robust, "o", pal["text_secondary"], "--")):
+                if pt and p in pt and pt[p] in grid[p]:
+                    i = list(grid[p]).index(pt[p])
+                    if math.isfinite(vals[i]):
+                        ax.scatter([i], [vals[i]], s=180, facecolors="none", edgecolors=col, marker=mk,
+                                   linewidths=1.5, linestyle=ls, zorder=5)
+            _titles(fig, ax, title or f"{metric} by {p}", subtitle or "square = best, dashed circle = plateau "
+                    "centre", pal)
+            return fig
+        agg = "max" if mx else "min"
+        piv = t.pivot_table(index=y, columns=x, values=metric, aggfunc=agg, dropna=False)
+        piv = piv.reindex(index=list(grid[y]), columns=list(grid[x]))
+        z = piv.to_numpy(float)
+        nx, ny = len(grid[x]), len(grid[y])
+        fig = _figure((min(8.0, max(5.8, 1.1 * nx + 3.2)), max(4.0, 0.8 * ny + 2.4)))
         ax = fig.add_subplot(1, 1, 1)
-        _style(ax)
-        vals = [t.loc[t[p] == v, metric].max() if mx else t.loc[t[p] == v, metric].min() for v in grid[p]]
-        xs = np.arange(len(grid[p]))
-        ax.plot(xs, vals, color=_BLUE, marker="o", linewidth=1.8)
-        ax.axhline(0.0, color=_MUTED, linewidth=0.8, linestyle="--")
-        ax.set_xticks(xs, [str(v) for v in grid[p]])
-        ax.set_xlabel(p, color=_INK2)
-        ax.set_ylabel(metric, color=_INK2)
-        ax.grid(True, axis="y", color=_GRID, linewidth=0.6)
-        for pt, mk, col in ((best, "s", _RED), (robust, "o", _INK)):
-            if pt and p in pt and pt[p] in grid[p]:
-                i = list(grid[p]).index(pt[p])
-                if math.isfinite(vals[i]):
-                    ax.scatter([i], [vals[i]], s=140, facecolors="none", edgecolors=col, marker=mk,
-                               linewidths=1.6, zorder=5)
-        _titles(fig, ax, title or f"{metric} by {p}", subtitle)
-        return fig
-    x = x or params[1]
-    y = y or params[0]
-    if x == y or x not in grid or y not in grid:
-        raise ValueError(f"x/y must be two different grid parameters of {params}")
-    agg = "max" if mx else "min"
-    piv = t.pivot_table(index=y, columns=x, values=metric, aggfunc=agg, dropna=False)
-    piv = piv.reindex(index=list(grid[y]), columns=list(grid[x]))
-    z = piv.to_numpy(float)
-    fig = _figure((max(5.5, 1.1 * len(grid[x]) + 3.0), max(3.6, 0.8 * len(grid[y]) + 2.0)))
-    ax = fig.add_subplot(1, 1, 1)
-    _style(ax)
-    finite = z[np.isfinite(z)]
-    cmap = "RdBu" if mx else "RdBu_r"
-    if finite.size and finite.min() < 0 < finite.max():
-        lim = float(np.abs(finite).max())
-        norm = TwoSlopeNorm(vmin=-lim, vcenter=0.0, vmax=lim)
-        im = ax.imshow(np.ma.masked_invalid(z), cmap=cmap, norm=norm, aspect="auto", origin="lower")
-    else:
-        im = ax.imshow(np.ma.masked_invalid(z), cmap="Blues" if mx else "Blues_r", aspect="auto", origin="lower")
-    cb = fig.colorbar(im, ax=ax, shrink=0.9)
-    cb.set_label(metric, color=_INK2)
-    cb.ax.tick_params(colors=_MUTED, labelcolor=_INK2)
-    ax.set_xticks(range(len(grid[x])), [str(v) for v in grid[x]])
-    ax.set_yticks(range(len(grid[y])), [str(v) for v in grid[y]])
-    ax.set_xlabel(x, color=_INK2)
-    ax.set_ylabel(y, color=_INK2)
-    def dark_cell(v: float) -> bool:
-        """True when the cell's RENDERED colour is dark (white text/markers on it). Works for
-        the diverging and the sequential scale alike (|v| alone does not: on a sequential
-        scale the darkest cell can be the one closest to 0)."""
-        if not math.isfinite(v):
-            return False
-        r, g, b, _ = im.cmap(im.norm(v))
-        return 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.5
-
-    for i in range(z.shape[0]):
-        for j in range(z.shape[1]):
-            v = z[i, j]
-            txt = "n/a" if not math.isfinite(v) else f"{v:.2f}"
-            ax.text(j, i, txt, ha="center", va="center", fontsize=8.5,
-                    color="#ffffff" if dark_cell(v) else (_MUTED if not math.isfinite(v) else _INK))
-    from matplotlib.patches import Circle, Rectangle
-
-    for pt, kind in ((best, "box"), (robust, "circle")):
-        if not pt or x not in pt or y not in pt or pt[x] not in grid[x] or pt[y] not in grid[y]:
-            continue
-        j, i = list(grid[x]).index(pt[x]), list(grid[y]).index(pt[y])
-        v = z[i, j]
-        edge = "#ffffff" if dark_cell(v) else _INK
-        if kind == "box":
-            ax.add_patch(Rectangle((j - 0.46, i - 0.46), 0.92, 0.92, fill=False, edgecolor=edge, linewidth=2.4))
+        style_axes(ax, pal["mode"], grid=None)
+        finite = z[np.isfinite(z)]
+        signed = bool(finite.size and finite.min() < 0 < finite.max())
+        cmap = diverging_cmap(pal["mode"]) if signed else sequential_cmap(pal["mode"])
+        if not mx:
+            cmap = cmap.reversed()
+        if signed:
+            lim = float(np.abs(finite).max())
+            im = ax.imshow(np.ma.masked_invalid(z), cmap=cmap, vmin=-lim, vmax=lim, aspect="auto", origin="lower")
         else:
-            ax.add_patch(Circle((j, i), 0.34, fill=False, edgecolor=edge, linewidth=1.4, linestyle="--"))
-    extra = "" if len(params) == 2 else f" ({agg} over {', '.join(p for p in params if p not in (x, y))})"
-    _titles(fig, ax, (title or f"{metric} sweep") + extra, subtitle or "box = best, dashed circle = plateau centre")
-    return fig
+            im = ax.imshow(np.ma.masked_invalid(z), cmap=cmap, aspect="auto", origin="lower")
+        cb = fig.colorbar(im, ax=ax, shrink=0.9)
+        cb.set_label(metric, color=pal["text_secondary"])
+        cb.outline.set_visible(False)
+        cb.ax.tick_params(colors=pal["axis"], labelcolor=pal["text_secondary"])
+        ax.set_xticks(range(nx), [str(v) for v in grid[x]])
+        ax.set_yticks(range(ny), [str(v) for v in grid[y]])
+        ax.tick_params(axis="both", length=0)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_visible(False)
+        ax.set_xlabel(x)
+        ax.set_ylabel(y)
+
+        def rgba(v: float) -> tuple[float, ...]:
+            return tuple(im.cmap(im.norm(v)))
+
+        for i in range(ny):
+            for j in range(nx):
+                v = z[i, j]
+                if math.isfinite(v):
+                    ax.text(j, i, _cell_label(v), ha="center", va="center", fontsize=9, color=_cell_ink(rgba(v)))
+                else:
+                    ax.text(j, i, "n/a", ha="center", va="center", fontsize=9, color=pal["text_muted"])
+        from matplotlib.patches import Ellipse, Rectangle
+
+        def cell(pt: Mapping[str, Any] | None) -> tuple[int, int] | None:
+            if not pt or x not in pt or y not in pt or pt[x] not in grid[x] or pt[y] not in grid[y]:
+                return None
+            return list(grid[y]).index(pt[y]), list(grid[x]).index(pt[x])
+
+        b_cell = cell(best)
+        if neighbourhood and b_cell is not None and len(params) == 2:
+            i, j = b_cell
+            x0, x1 = max(j - 1, 0) - 0.5, min(j + 1, nx - 1) + 0.5
+            y0, y1 = max(i - 1, 0) - 0.5, min(i + 1, ny - 1) + 0.5
+            ax.add_patch(Rectangle((x0 + 0.03, y0 + 0.03), x1 - x0 - 0.06, y1 - y0 - 0.06, fill=False,
+                                   edgecolor=pal["text_secondary"], linewidth=1.5, linestyle=(0, (4, 3)), zorder=4))
+        ax.set_xlim(-0.5, nx - 0.5)
+        ax.set_ylim(-0.5, ny - 0.5)
+        extra = "" if len(params) == 2 else f" ({agg} over {', '.join(p for p in params if p not in (x, y))})"
+        _titles(fig, ax, (title or f"{metric} sweep") + extra,
+                subtitle or "box = best, dashed circle = plateau centre, dashed outline = grid neighbours", pal)
+        # Cells are not square (aspect="auto"): lay the figure out first, then size the plateau
+        # centre's ring in data units so that it is round on the page.
+        fig.draw_without_rendering()
+        bbox = ax.get_window_extent()
+        cw, ch = bbox.width / nx, bbox.height / ny          # pixels per cell
+        r_px = 0.33 * min(cw, ch)
+        for pt, kind in ((best, "box"), (robust, "circle")):
+            c = cell(pt)
+            if c is None:
+                continue
+            i, j = c
+            v = z[i, j]
+            edge = _cell_ink(rgba(v)) if math.isfinite(v) else pal["text"]
+            if kind == "box":
+                ax.add_patch(Rectangle((j - 0.44, i - 0.44), 0.88, 0.88, fill=False, edgecolor=edge, linewidth=2.2,
+                                       zorder=5))
+            else:
+                ax.add_patch(Ellipse((j, i), 2 * r_px / cw, 2 * r_px / ch, fill=False, edgecolor=edge, linewidth=1.3,
+                                     linestyle="--", zorder=5))
+        return fig
 
 
-def _titles(fig: Any, ax: Any, title: str, subtitle: str) -> None:
+def _titles(fig: Any, ax: Any, title: str, subtitle: str, pal: Mapping[str, Any]) -> None:
     import textwrap
 
-    fig.suptitle(title, x=0.01, ha="left", fontsize=10.5, fontweight="bold", color=_INK)
+    fig.suptitle(title, x=0.01, ha="left", color=pal["text"])
     if subtitle:
-        width = max(40, int(fig.get_figwidth() * 13))
-        ax.set_title(textwrap.fill(subtitle, width), loc="left", fontsize=8.5, color=_INK2)
+        width = max(40, int(fig.get_figwidth() * 14))
+        ax.set_title(textwrap.fill(subtitle, width), loc="left", fontsize=9, fontweight="normal",
+                     color=pal["text_secondary"])

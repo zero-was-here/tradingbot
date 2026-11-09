@@ -64,3 +64,59 @@ A strategy is recommended for live use only if **all** of the following hold:
 
 If nothing clears this bar, the honest conclusion is "no demonstrated edge". The system is then
 shipped as a research platform, with paper trading as the only recommended mode.
+
+## Addendum (v2.1, unreleased)
+
+*Added 2026-11-09, after the results in [RESULTS.md](RESULTS.md) were published. It records
+changes to the tools around this protocol and the trials run since. Nothing above this
+addendum has been modified: the protocol stays frozen as pre-registered.*
+
+### What changed in the holdout ledger
+
+The protocol relies on the holdout ledger to make every look at the holdout visible
+([research.md](research.md#the-holdout-and-the-ledger)). In v2.1:
+
+- **More writers.** Besides the walk-forward's own holdout evaluation, three more actions
+  append an entry: a single-split backtest that evaluates holdout bars
+  (`aurum backtest --include-holdout`, kind `backtest`), an LLM-desk replay whose window
+  reaches the holdout (kind `desk_replay`, under the config hash plus `:desk`, or
+  `:desk-fake` for the offline client, so it counts as a separate trial), and the public
+  `record_holdout_look`. In v2.0 the first two evaluated holdout bars without leaving an
+  entry.
+- **Counting by data source.** Entries record `data_source` (`real` or `synthetic`) and
+  `data_hash`. When a run counts earlier looks, entries with a different `data_source` are
+  ignored, so synthetic smoke tests no longer raise `n_trials` for real research, and the
+  other way round. Entries without the field still count for both.
+- **Benchmark excluded.** `metrics.strategy_sharpe` now lists strategies only; the
+  buy-and-hold Sharpe is recorded separately as `metrics.benchmark_sharpe`.
+
+Effect on this protocol: none. The protocol's holdout evaluation (`trend_core`, written
+2026-09-27) is the only entry in `runs/protocol/holdout_ledger.jsonl`, and the `fast.yaml`
+smoke look disclosed above is the only entry in `runs/holdout_ledger.jsonl`. Both were
+written by v2.0 (no `data_source`, benchmark inside `strategy_sharpe`), both are unchanged,
+and each ledger still holds exactly that one entry: no v2.1 run evaluated the holdout.
+
+### The exploratory v2.1 trials are not part of this protocol
+
+`configs/d1_trend.yaml`, `configs/managed_gold.yaml` and an `ema_cross` parameter sweep
+were run after the results were published. They are exploratory additional trials:
+
+- they were not pre-registered, and no selection or recommendation is based on them;
+- their data ends 2024-12-31 and their holdout is disabled, so they did not evaluate the
+  2025-01-01 → 2026-09-25 holdout and wrote no ledger entry;
+- they reuse the 2016–2024 walk-forward span this protocol already evaluated, so each new
+  configuration is a further trial on the same data.
+
+Their results are reported separately in
+[RESULTS.md](RESULTS.md#additional-trials-exploratory-v21).
+
+### n_trials is now 30, and at least 38 for anything new
+
+The exploratory D1 configs set `walkforward.n_trials: 30`: the 23 configurations counted
+above, the five new strategy configurations (daily `tsmom`, `ema_cross` and `donchian`,
+`managed_gold` and `regime_switch`) and their two combined books. `configs/default.yaml`
+and `configs/trend_core.yaml` keep the pre-registered 23, so re-running the protocol
+reproduces its numbers. The sweep counted only its own eight valid grid points
+(`n_trials` = 8); counting the 30 earlier trials as well gives 38. A future study on
+2016–2024 data should start its count at no less than 38, or use data that arrives after
+its own protocol is written.

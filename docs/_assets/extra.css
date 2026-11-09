@@ -1,0 +1,16 @@
+/* Documentation figures (tools/figures/README.md). docs/_hooks/mkdocs_hooks.py turns each
+   <picture> embed into <figure class="aurum-figure"> with a light and a dark image, of which
+   Material shows one (#only-light / #only-dark), and the italic caption as <figcaption>. */
+.md-typeset figure.aurum-figure {
+  margin: 1.6em auto;
+}
+
+/* Material's default caption box is 24rem wide: too narrow for a two-sentence caption. */
+.md-typeset figure.aurum-figure figcaption {
+  max-width: 42rem;
+  margin: 0.6em auto 0;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  text-align: left;
+  color: var(--md-default-fg-color--light);
+}

@@ -3,7 +3,8 @@
 One file, no external assets: charts are PNGs rendered with matplotlib's Agg canvas (the
 object-oriented ``Figure`` API - we never touch ``pyplot`` or the global backend, so the
 module is safe to import in notebooks and servers) and inlined as base64 data URIs. Every
-chart is rendered twice - for a light and a dark surface - and CSS shows the one matching
+chart is rendered twice - for a light and a dark surface, with the shared palette and chart
+style of :mod:`aurum.viz.style` - and CSS shows the one matching
 the reader's colour scheme (``prefers-color-scheme``, overridable with
 ``<html data-theme="light|dark">``).
 
@@ -43,6 +44,7 @@ from matplotlib.figure import Figure
 from aurum.backtest.result import BacktestResult
 from aurum.core.timeframes import infer_bars_per_year
 from aurum.research import stats as rstats
+from aurum.viz.style import LINE_WIDTH_PT, palette, style_axes, use_style
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +56,8 @@ _MAX_TABLE_ROWS = 60
 
 
 # --------------------------------------------------------------------------------------
-# themes (validated palette: series blue + loss red pass CVD/contrast checks in both modes)
+# themes: the shared palette of aurum.viz.style (series = categorical blue, loss = categorical
+# red; both pass the CVD/contrast checks in both modes)
 # --------------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class _Theme:
@@ -70,10 +73,15 @@ class _Theme:
     loss: str
 
 
-_LIGHT = _Theme("light", "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7",
-                "#2a78d6", "#898781", "#e34948")
-_DARK = _Theme("dark", "#1a1a19", "#ffffff", "#c3c2b7", "#898781", "#2c2c2a", "#383835",
-               "#3987e5", "#898781", "#e66767")
+def _theme(mode: str) -> _Theme:
+    """The chart theme of ``mode`` ("light" / "dark") from :func:`aurum.viz.style.palette`."""
+    p = palette(mode)
+    return _Theme(p["mode"], p["surface"], p["text"], p["text_secondary"], p["text_muted"], p["grid"],
+                  p["axis"], p["categorical"][0], p["text_muted"], p["categorical"][7])
+
+
+_LIGHT = _theme("light")
+_DARK = _theme("dark")
 
 DrawFn = Callable[[Figure, _Theme], None]
 
@@ -388,29 +396,19 @@ def _df_table(df: pd.DataFrame, *, max_rows: int = _MAX_TABLE_ROWS, index: bool 
 # --------------------------------------------------------------------------------------
 # chart rendering
 # --------------------------------------------------------------------------------------
+#: compact type for the tearsheet's wide, short charts (on top of aurum.viz.style's rcParams)
 _RC = {
-    "font.family": "sans-serif",
-    "font.sans-serif": ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"],
     "font.size": 9.0,
     "axes.titlesize": 10.0,
-    "axes.titleweight": "bold",
-    "axes.titlelocation": "left",
-    "legend.frameon": False,
+    "axes.labelsize": 9.0,
     "legend.fontsize": 8.5,
-    "svg.fonttype": "none",
+    "xtick.labelsize": 8.5,
+    "ytick.labelsize": 8.5,
 }
 
 
 def _style_ax(ax: Any, t: _Theme, *, date_axis: bool = False) -> None:
-    ax.set_facecolor(t.surface)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(t.axis)
-        ax.spines[side].set_linewidth(0.8)
-    ax.tick_params(colors=t.muted, labelcolor=t.ink2, length=3, width=0.6)
-    ax.grid(True, axis="y", color=t.grid, linewidth=0.6, linestyle="-")
-    ax.set_axisbelow(True)
+    style_axes(ax, t.name, grid="y")      # recessive chrome of aurum.viz.style
     if date_axis:
         loc = mdates.AutoDateLocator(minticks=4, maxticks=9)
         ax.xaxis.set_major_locator(loc)
@@ -423,24 +421,16 @@ def _legend(ax: Any, t: _Theme, **kw: Any) -> None:
         txt.set_color(t.ink2)
 
 
-def _render_png(draw: DrawFn, t: _Theme, size: tuple[float, float], dpi: int) -> bytes:
-    rc = {
-        **_RC,
-        "text.color": t.ink2,
-        "axes.titlecolor": t.ink,
-        "axes.labelcolor": t.ink2,
-        "axes.edgecolor": t.axis,
-        "xtick.color": t.muted,
-        "ytick.color": t.muted,
-        "xtick.labelcolor": t.ink2,
-        "ytick.labelcolor": t.ink2,
-    }
-    with rc_context(rc):
-        fig = Figure(figsize=size, dpi=dpi, facecolor=t.surface, layout="constrained")
+def _render_png(draw: DrawFn, t: _Theme | str, size: tuple[float, float], dpi: int) -> bytes:
+    """Render ``draw`` for one mode (a :class:`_Theme` or ``"light"`` / ``"dark"``) inside
+    :func:`aurum.viz.style.use_style`, with the tearsheet's compact type sizes on top."""
+    theme = _theme(t) if isinstance(t, str) else t
+    with use_style(theme.name), rc_context(_RC):
+        fig = Figure(figsize=size, dpi=dpi, facecolor=theme.surface, layout="constrained")
         FigureCanvasAgg(fig)
-        draw(fig, t)
+        draw(fig, theme)
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", facecolor=t.surface, metadata={"Software": None})
+        fig.savefig(buf, format="png", facecolor=theme.surface, metadata={"Software": None})
     return buf.getvalue()
 
 
@@ -504,7 +494,7 @@ def _draw_equity(eq: pd.Series, bench: pd.Series | None) -> DrawFn:
         if bp is not None:
             ax.plot(_x(bp.index), bp.to_numpy(), color=t.neutral, linewidth=1.3,
                     label="Benchmark (rebased)")
-        ax.plot(_x(eqp.index), eqp.to_numpy(), color=t.series, linewidth=1.8, label="Strategy")
+        ax.plot(_x(eqp.index), eqp.to_numpy(), color=t.series, linewidth=LINE_WIDTH_PT, label="Strategy")
         if positive:
             ax.set_yscale("log")
             lo = float(min(eq.min(), bench.min() if bench is not None else np.inf))
@@ -560,7 +550,7 @@ def _draw_rolling_sharpe(daily: pd.Series, window: int, full: float) -> DrawFn:
         ax.axhline(0.0, color=t.axis, linewidth=0.9)
         if np.isfinite(full):
             ax.axhline(full, color=t.neutral, linewidth=1.0, label=f"Full period {full:.2f}")
-        ax.plot(_x(rs.index), rs.to_numpy(), color=t.series, linewidth=1.6,
+        ax.plot(_x(rs.index), rs.to_numpy(), color=t.series, linewidth=LINE_WIDTH_PT,
                 label=f"Rolling {window}-day")
         ax.set_ylabel("Sharpe (annualised)")
         ax.set_title("Rolling Sharpe ratio")
@@ -658,7 +648,7 @@ def _draw_costs(totals: pd.Series, cum_cost: pd.Series) -> DrawFn:
         _money_axis(ax1, "x")
         ax1.set_title("Cost by component (USD)")
         _style_ax(ax2, t, date_axis=True)
-        ax2.plot(_x(cp.index), cp.to_numpy(), color=t.series, linewidth=1.6)
+        ax2.plot(_x(cp.index), cp.to_numpy(), color=t.series, linewidth=LINE_WIDTH_PT)
         _money_axis(ax2)
         ax2.set_ylabel("USD")
         ax2.set_title("Cumulative net cost")

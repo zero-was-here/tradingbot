@@ -1,4 +1,6 @@
-// MathJax settings for the MkDocs site (```math blocks, rendered by pymdownx.arithmatex).
+// MathJax settings for the MkDocs site. pymdownx.arithmatex (generic mode) turns ```math
+// fences into <div class="arithmatex">\[...\]</div> and inline $...$ into
+// <span class="arithmatex">\(...\)</span>; only those elements are typeset.
 window.MathJax = {
   tex: {
     inlineMath: [["\\(", "\\)"]],

@@ -1,54 +1,105 @@
 # Execution, costs and backtesting
 
-This page describes how Aurum turns approved positions into P&L. One bar-level simulator,
-`aurum.execution.simulator.ExecutionSimulator`, is the single source of truth for P&L. Research
-backtests, the RL environment and the LLM-desk replay drive it directly. The paper broker
-applies the same `CostModel` arithmetic and the same intrabar exit rule, and a test
-(`tests/test_live_paper.py`) requires its equity path to match the simulator's. So the
-economics of a strategy cannot differ between research and trading (SPEC §0.2). Orders decided
-at a bar's close fill at the next bar's open, at mid ± half the spread ± slippage. Protective
-stops and take-profits are resolved inside the bar (stop first), and overnight financing is
-charged at each rollover from a point-in-time benchmark rate. The page also covers the backtest
-engine (`run_backtest`, `run_target_lots`, `buy_and_hold_benchmark`), the `BacktestResult`
-container and every metric `compute_metrics` reports. All numbers in the examples come from
-running them against the current code on synthetic data.
+This page explains how Aurum turns an approved position into profit and loss: when an order
+fills, at what price, what happens inside a bar that touches a stop, what an overnight position
+pays in financing, and how all of that adds up in a real walk-forward. One bar-level simulator,
+[`ExecutionSimulator`](../aurum/execution/simulator.py), is the single source of truth for P&L.
+Research backtests, the RL environment and the LLM-desk replay drive it directly. The paper
+broker keeps broker-style books but reuses the same [`CostModel`](../aurum/execution/costs.py)
+arithmetic, the same financing model and the same intrabar exit rule, and a test holds its
+equity path to the simulator's, so the economics of a strategy cannot differ between research
+and trading. Every chart below is drawn by that code on real XAUUSD bars and real fed funds
+data up to 2024-12-31 ([figure code](../tools/figures/fig_execution.py)), and every example
+output was produced by running it.
 
 **On this page**
 
-- [Timing model](#timing-model)
+- [Timing: decide at the close, fill at the next open](#timing-decide-at-the-close-fill-at-the-next-open)
 - [ExecutionSimulator](#executionsimulator)
-- [Cost model](#cost-model)
+- [Fill prices: mid, half spread, slippage](#fill-prices-mid-half-spread-slippage)
+- [Intrabar stops and take-profits: stop first](#intrabar-stops-and-take-profits-stop-first)
 - [Overnight financing](#overnight-financing)
+- [From gross to net in a real walk-forward](#from-gross-to-net-in-a-real-walk-forward)
+- [Paper broker parity](#paper-broker-parity)
 - [Backtest engine](#backtest-engine)
 - [BacktestResult](#backtestresult)
 - [Metrics](#metrics)
 - [Limitations](#limitations)
 - [See also](#see-also)
 
-## Timing model
+## Timing: decide at the close, fill at the next open
 
-Bars are indexed by their **open** time (UTC). A bar becomes available at
-`available_at = open + timeframe`. OHLC are **mid** prices, and `spread` is the full bid/ask
-spread in USD/oz ([data.md](data.md)).
+**Intuition.** A backtest cheats most easily on timing: if a rule sees a bar's close and also
+trades at that close, it trades on information nobody had in time. Aurum separates the two
+moments. A decision is taken when bar `t` has closed and is published, using bars up to `t`
+only. The order it produces fills at the open of the next bar, `t+1`. Bar `t+1` is then used
+only to settle that order: its open is the fill, its range sets the slippage and triggers
+protective exits, and its close marks the position.
+
+**The math.** Bars are indexed by their open time $T_t$ (UTC) and become available one bar
+length later. OHLC are mid prices.
+
+```math
+A_t = T_t + \Delta, \qquad
+\text{decision}_t = f\left(\text{bars } 0..t,\ \text{macro with } a \le A_t\right), \qquad
+\text{fill price} = O_{t+1} \pm \left(\tfrac{1}{2}s^{\mathrm{eff}}_{t+1} + \mathrm{slip}_{t+1}\right)
+```
+
+Over the simulated bar the equity changes by exactly
+
+```math
+E_{t+1} - E_t = q_t K\,(O_{t+1} - C_t) + q'_{t+1} K\,(C_{t+1} - O_{t+1})
+ - C^{\mathrm{spread}}_{t+1} - C^{\mathrm{slip}}_{t+1} - C^{\mathrm{comm}}_{t+1} + S_{t+1}
+```
+
+where
+
+- $A_t$ is `available_at`, $\Delta$ the bar length (1 hour on H1);
+- $O, C$ are the mid open and close, $K$ = `contract_size` = 100 oz per lot;
+- $q_t$ is the position held before the fill and $q'_{t+1}$ the position right after it
+  (when a stop or take-profit fires at mid level $X$ inside the bar, the second term becomes
+  $q'_{t+1} K (X - O_{t+1})$ and the position is flat at the close);
+- the three $C$ terms are the positive USD costs of every fill in the bar (next sections) and
+  $S_{t+1}$ is the signed financing of rollovers in the gap and inside the bar
+  ([financing](#overnight-financing)).
+
+Positions are marked from the mid and costs are booked separately, so this identity holds to
+the cent on every bar (`BacktestResult.reconcile()` checks it).
+
+**The picture.**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/execution-and-costs/timing-dark.png">
+  <img src="_assets/figures/execution-and-costs/timing-light.png" alt="Six real H1 gold candles; the decision bar ending at 12:00 UTC is highlighted, a dashed line marks the decision time, and a dot on the next bar marks the buy fill at its open plus costs">
+</picture>
+
+*The decision at 12:00 UTC sees only the shaded bars; the buy fills at the 12:00 open of 2,132.59 plus half the spread and slippage (2,132.85), and bar t+1 only settles the order. Data: XAUUSD H1, Dukascopy bid/ask mid, 2024-03-06.*
 
 ```mermaid
 sequenceDiagram
-  participant E as Engine (close of bar t)
-  participant S as Simulator (bar t+1)
-  E->>E: forecast[t], vol[t], equity marked at close[t]
+  participant E as Engine at the close of bar t
+  participant S as Simulator, bar t+1
+  E->>E: forecast, vol and equity at close t
   E->>E: sizer.target_lots, then risk.evaluate
   E->>S: step(approved lots)
-  S->>S: 1. gap: old position from close[t] to open[t+1], swap for rollovers in the gap
-  S->>S: 2. fill at open[t+1] +/- half spread +/- slippage
-  S->>S: 3. intrabar stop / take-profit on bar t+1
-  S->>S: 4. mark at close[t+1], swap for rollovers inside the bar
-  S-->>E: StepResult (equity at close[t+1])
+  S->>S: 1. gap: old position from close t to open t+1, swap for rollovers in the gap
+  S->>S: 2. fill at open t+1 plus or minus half spread and slippage
+  S->>S: 3. intrabar stop or take-profit on bar t+1
+  S->>S: 4. mark at close t+1, swap for rollovers inside the bar
+  S-->>E: StepResult with equity at close t+1
 ```
 
-A decision at the close of bar `t` (time `available_at[t]`) can only use information up to that
-close. The simulator uses bar `t+1` only to settle the order that was decided at `t`: its
-range sets the slippage, its high/low trigger protective exits, and its close marks the
-position. None of that reaches a decision before `step()` is called.
+**Pitfalls and design choices.**
+
+- *Same-bar fills are look-ahead.* Filling at `close[t]` a decision computed from `close[t]`
+  assumes a zero-latency trader who already knew the close. Aurum always fills at the next open.
+- *The execution bar is not information.* The range of bar `t+1` feeds the slippage term and
+  the stop check, but it is consumed inside `step()`, after the decision. Nothing from `t+1`
+  reaches a forecast, a sizer or a risk check.
+- *Gaps are real costs.* A position held over a weekend is marked from Friday's close to
+  Sunday's open in the gap segment, and an order decided on Friday fills at the reopen, gap
+  included. The live runner reproduces this by deferring the order when the market is closed
+  ([live-trading.md](live-trading.md)).
 
 ## ExecutionSimulator
 
@@ -61,7 +112,7 @@ ExecutionSimulator(bars, instrument=XAUUSD, costs=None, initial_equity=100_000.0
 |---|---|
 | `bars` | Canonical bars frame (mid OHLC, `spread`, `available_at`), validated unless `validate=False` |
 | `instrument` | Contract spec: lot grid, contract size (100 oz), rollover hour (21 UTC), triple-swap weekday (Wednesday) |
-| `costs` | [`CostModel`](#cost-model). `None` means `CostModel()` defaults, including rate financing. |
+| `costs` | [`CostModel`](#fill-prices-mid-half-spread-slippage). `None` means `CostModel()` defaults, including rate financing. |
 | `initial_equity` | Starting equity in USD |
 | `rates` | Benchmark-rate source for rate financing: `md.macro`, a macro frame with `available_at`, a Series indexed by availability time, or a `RateCurve`. `None` uses `fallback_rate` for every rollover (warned once). |
 
@@ -85,10 +136,9 @@ step(target_lots, *, stop_price=None, take_profit=None, reason="signal",
 2. **Fill at the open.** The position is traded to `round_lots(target_lots)`, rounded toward
    zero and clipped to `max_lot`. A buy fills at `open + spread_eff/2 + slippage`, a sell at
    `open - spread_eff/2 - slippage`. Spread and slippage are booked as costs, and the position
-   is marked from the **mid**, so `equity change = price P&L at mid - costs + swap` holds
-   exactly every bar.
-3. **Intrabar protective exits** on bar `t+1` for the position held after the fill (next
-   section).
+   is marked from the **mid**.
+3. **Intrabar protective exits** on bar `t+1` for the position held after the fill
+   ([next sections](#intrabar-stops-and-take-profits-stop-first)).
 4. **Mark to market** at `close[t+1]`, plus swap for rollovers inside
    `(open[t+1], available_at[t+1]]`, charged on the position held at the close. Rate financing
    values it at `close[t+1]`.
@@ -96,32 +146,15 @@ step(target_lots, *, stop_price=None, take_profit=None, reason="signal",
 `stop_price` / `take_profit` are absolute mid levels and protect bar `t+1` only: pass them
 again on every step to keep them working. `stop_distance` / `take_profit_distance` are the
 alternative for a position being *entered* at this open. The level is then anchored at the
-fill (`open[t+1] ∓ distance` for a long, mirrored for a short), so a gap cannot put the stop on
-the wrong side of the market. The resolved levels come back in `StepResult.stop_price` /
-`take_profit`. Passing both a level and a distance for the same order raises `ValueError`.
-Calling `step()` when `done` is true (no next bar) raises `RuntimeError`.
+fill (`open[t+1] - distance` for a long stop, mirrored for a short), so a gap cannot put the
+stop on the wrong side of the market. The resolved levels come back in
+`StepResult.stop_price` / `take_profit`. Passing both a level and a distance for the same order
+raises `ValueError`. Calling `step()` when `done` is true (no next bar) raises `RuntimeError`.
 
 `StepResult` fields: `index`, `time`, `equity`, `pnl`, `ret`, `price_pnl`, `costs`
 (`spread`, `slippage`, `commission`, `swap`), `fills` (list of `aurum.core.types.Fill`),
 `position` (at the close), `position_open` (right after the fill), `done`, `exit_reason`,
 `stop_price`, `take_profit`.
-
-### Intrabar stops and take-profits
-
-OHLC bars do not reveal the path inside a bar. `intrabar_exit(pos, o, h, lo, sl, tp)` resolves
-it with fixed, conservative rules. The simulator, the paper broker and the live runner share
-this function, so all three resolve the same bar the same way. For a **long** position (shorts
-are mirrored), checked in this order:
-
-| Condition on bar `t+1` | Exit | Order type |
-|---|---|---|
-| `open <= stop` | At the **open** (gap through the stop) | Market: half spread + slippage |
-| `open >= take_profit` | At the **open** (gap through the take-profit) | Limit: half spread, no slippage |
-| `low <= stop` | At `stop`, i.e. `stop - spread_eff/2 - slippage` | Market |
-| `high >= take_profit` | At `take_profit`, i.e. `take_profit - spread_eff/2` | Limit |
-
-If both levels lie inside the bar's range, **the stop is assumed to fill first**. The exit
-level is a mid price, and the spread and slippage are applied on top, as for any fill.
 
 ### Example
 
@@ -173,44 +206,84 @@ for the two fills.
 A **trade** is a round trip from flat to flat. A reversal fill is split into a closing leg and
 an opening leg, with its costs split pro rata by lots. Scaling in or out stays within one trade:
 `entry_price` / `exit_price` are lot-weighted averages of executed prices (including spread
-and slippage), and `lots` is the largest absolute size held. Every dollar of price P&L, cost
+and slippage), and `lots` is the largest absolute size held. Every USD of price P&L, cost
 and swap is attributed to exactly one trade. A position still open at the end is closed
 virtually at the last close (`exit_reason="end"`, no liquidation cost), so
 `sum(trades.pnl) == equity[-1] - equity[0]`.
 
 There is no margin stop-out model. The only guard is bankruptcy: once equity is at or below
 zero, a warning is logged and every later step is forced flat with reason `"risk"`. Margin
-limits belong to the [risk manager](portfolio-and-risk.md#risk-manager).
+limits belong to the risk manager ([portfolio-and-risk.md](portfolio-and-risk.md)).
 
-## Cost model
+<a id="cost-model"></a>
 
-`aurum.execution.costs.CostModel` computes every dollar that leaves the account in a
-simulation. It is a frozen dataclass, configured under `costs.*`
+## Fill prices: mid, half spread, slippage
+
+**Intuition.** Bars carry the mid price, halfway between the bid and the ask. Nobody trades at
+the mid: a buyer lifts the ask and a seller hits the bid, so each market order pays half the
+spread. On top of that the price moves while the order travels, and it moves more in a fast
+market. Aurum charges a fixed slippage plus a share of the execution bar's high-low range, so
+an order sent into the US payrolls hour pays more than one sent at 3 a.m.
+
+**The math** ([`CostModel.fill_price`](../aurum/execution/costs.py)):
+
+```math
+s^{\mathrm{eff}} = \max\left(m\,s,\ s_{\min}\right), \qquad
+\mathrm{slip} = a + b\,(H - L) + c\sqrt{\lvert q \rvert}
+```
+
+```math
+P^{\mathrm{buy}} = M + \tfrac{1}{2}s^{\mathrm{eff}} + \mathrm{slip}, \qquad
+P^{\mathrm{sell}} = M - \tfrac{1}{2}s^{\mathrm{eff}} - \mathrm{slip}
+```
+
+```math
+C^{\mathrm{spread}} = \tfrac{1}{2}s^{\mathrm{eff}}\,\lvert q \rvert K, \qquad
+C^{\mathrm{slip}} = \mathrm{slip}\,\lvert q \rvert K, \qquad
+C^{\mathrm{comm}} = \kappa\,\lvert q \rvert
+```
+
+where
+
+- $s$ is the quoted spread of the execution bar (full bid/ask, USD/oz); a non-finite or
+  negative value counts as 0, so the floor applies;
+- $m$ = `spread_multiplier` (1.0), $s_{\min}$ = `min_spread` (0.10 USD/oz);
+- $a$ = `slippage_fixed` (0.02 USD/oz), $b$ = `slippage_range_frac` (0.02), $H - L$ the
+  execution bar's range, $c$ = `impact_coef` (0, square-root impact per lot);
+- $M$ is the mid the order executes at: the open of bar `t+1` for a decision, or the stop or
+  take-profit level for a protective exit;
+- $q$ is the signed size in lots, $K$ = 100 oz, $\kappa$ = commission per lot per side
+  (`commission_per_lot`, `None` defers to the instrument's 0.0);
+- a **limit** order (a take-profit) has $\mathrm{slip} = 0$: it pays half the spread only.
+
+**The picture.** The same model on two real bars, and on every H1 bar of 2012-2024 by hour of day:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/execution-and-costs/fill-ladder-dark.png">
+  <img src="_assets/figures/execution-and-costs/fill-ladder-light.png" alt="Two panels of stacked bars showing the buy and sell fill price minus the mid open, split into half spread, fixed slippage and two percent of the bar range, for a quiet 03:00 UTC bar and the US payrolls hour">
+</picture>
+
+*At 03:00 UTC a market order costs 0.303 USD/oz each way; in the payrolls hour (range 27.21) the range term alone is 0.544 and the order costs 0.762 USD/oz, 2.5 times as much. Data: XAUUSD H1 bars of 2024-08-28 03:00 and 2024-07-05 12:00 UTC, Dukascopy bid/ask mid.*
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/execution-and-costs/cost-by-hour-dark.png">
+  <img src="_assets/figures/execution-and-costs/cost-by-hour-light.png" alt="Top: median quoted spread by UTC hour with a 10 to 90 percent band and the 0.10 floor. Bottom: stacked bars of the median per-fill cost by hour, split into half spread, fixed slippage and range slippage">
+</picture>
+
+*The quoted spread is flattest from 07:00 to 19:00 UTC (median about 0.31 USD/oz) and widest around the 22:00 UTC reopen (0.417); the full cost of one fill is lowest at 04:00 (0.219) and highest at 13:00 UTC (0.297), when the US session's ranges inflate slippage. Data: XAUUSD H1, Dukascopy bid/ask mid, 2012-2024.*
+
+**In code.** `aurum.execution.costs.CostModel` is a frozen dataclass configured under `costs.*`
 ([configuration.md](configuration.md)).
 
 | Field | Default | Units | Meaning |
 |---|---|---|---|
-| `spread_multiplier` | 1.0 | x | Scales the bar's quoted spread (1.5–2.0 to stress-test) |
+| `spread_multiplier` | 1.0 | x | Scales the bar's quoted spread (1.5 to 2.0 to stress-test) |
 | `min_spread` | 0.10 | USD/oz | Floor on the effective spread |
 | `slippage_fixed` | 0.02 | USD/oz | Adverse slippage per fill |
-| `slippage_range_frac` | 0.02 | fraction | Share of the execution bar's high−low range added as slippage |
+| `slippage_range_frac` | 0.02 | fraction | Share of the execution bar's high-low range added as slippage |
 | `impact_coef` | 0.0 | USD/oz per sqrt(lot) | Square-root market impact |
 | `commission_per_lot` | `None` | USD per lot per side | `None` uses `instrument.commission_per_lot` (0.0 for the default XAUUSD instrument) |
 | `financing` | `FinancingModel()` | | [Overnight financing](#overnight-financing). A kwargs mapping or a mode name is also accepted. |
-
-The per-ounce components of one fill:
-
-```text
-spread_eff = max(spread * spread_multiplier, min_spread)
-slippage   = slippage_fixed + slippage_range_frac * (high - low) + impact_coef * sqrt(|lots|)
-buy  price = mid + spread_eff / 2 + slippage
-sell price = mid - spread_eff / 2 - slippage
-```
-
-Limit orders (take-profits) get `limit=True`: half the spread and no slippage. A non-finite or
-negative quoted spread is treated as 0, so `min_spread` applies. Fill prices are not rounded to
-the tick grid: the error is at most $0.005/oz and leaving them unrounded keeps the P&L identity
-exact. `CostModel.zero()` is fully frictionless (no spread, slippage, commission or financing).
 
 Methods: `effective_spread(spread)`, `slippage(bar_range, lots)`,
 `fill_price(side, mid, spread, bar_range, lots, *, instrument=XAUUSD, limit=False)` returning
@@ -218,7 +291,7 @@ Methods: `effective_spread(spread)`, `slippage(bar_range, lots)`,
 `swap(lots, nights, *, price=None, rate_nights=None)`,
 `swap_between(lots, start, end, *, price=None, rates=None)` and
 `round_trip_cost(lots, spread, bar_range=0.0)` (open and close with market orders, excluding
-swap).
+swap). `CostModel.zero()` is fully frictionless (no spread, slippage, commission or financing).
 
 ```python
 from aurum.execution.costs import CostModel
@@ -244,35 +317,170 @@ FillPrice(price=2009.85, spread_cost=15.0, slippage_cost=0.0)
 54.0
 ```
 
-The [forecast combiner](portfolio-and-risk.md#scoring-each-strategy-net-of-costs) uses the
-same fields to estimate a per-turnover cost when it weights strategies.
+**Pitfalls and design choices.**
+
+- *Vendor spreads flatter execution.* Dukascopy reports a bid/ask spread per bar, but a retail
+  account rarely fills that tightly. The 0.10 floor and `spread_multiplier` exist for that;
+  stress-test with 1.5 to 2.0.
+- *Slippage scales with the market, not with a constant.* The range term makes the cost of a
+  strategy that trades the US open visibly higher than one that trades in Asia (the bottom
+  panel above). The range is an input of the cost model only and never reaches a decision.
+- *Retail size has no impact.* `impact_coef` defaults to 0 because one lot is tiny next to the
+  gold market. Raise it to study large books.
+- *No tick rounding.* Fill prices are not rounded to the 0.01 grid: the error is at most
+  0.005 USD/oz and leaving prices unrounded keeps the P&L identity exact.
+- *Costs feed the combiner.* The [forecast combiner](portfolio-and-risk.md) uses the same
+  fields to score every strategy net of costs before it weights them.
+
+## Intrabar stops and take-profits: stop first
+
+**Intuition.** An OHLC bar tells you the open, the high, the low and the close, but not the
+order in which the high and the low happened. When a bar's range covers both a position's
+stop and its take-profit, the backtest cannot know which one filled. Aurum always assumes the
+worse outcome, the stop, so an ambiguous bar can only make results look worse than reality,
+never better.
+
+**The rules** ([`intrabar_exit`](../aurum/execution/simulator.py), checked in this order for a
+long position; shorts are mirrored):
+
+```math
+X =
+\begin{cases}
+O & \text{if } O \le \ell_{\mathrm{SL}} \quad \text{gap through the stop: market exit at the open}\\
+O & \text{if } O \ge \ell_{\mathrm{TP}} \quad \text{gap through the take-profit: limit exit at the open}\\
+\ell_{\mathrm{SL}} & \text{if } L \le \ell_{\mathrm{SL}} \quad \text{stop: market order}\\
+\ell_{\mathrm{TP}} & \text{if } H \ge \ell_{\mathrm{TP}} \quad \text{take-profit: limit order}\\
+\text{no exit} & \text{otherwise}
+\end{cases}
+```
+
+```math
+P^{\mathrm{exit}}_{\mathrm{long}} = X - \tfrac{1}{2}s^{\mathrm{eff}} - \mathrm{slip}\ \ \text{(stop)}, \qquad
+P^{\mathrm{exit}}_{\mathrm{long}} = X - \tfrac{1}{2}s^{\mathrm{eff}}\ \ \text{(take-profit)}
+```
+
+where $O, H, L$ are the mid open, high and low of the bar, $\ell_{\mathrm{SL}}$ and
+$\ell_{\mathrm{TP}}$ the stop and take-profit as mid levels, and the costs are those of the
+previous section (the take-profit is a limit order and does not slip). The function returns
+`(X, reason, is_limit)` or `None`.
+
+```mermaid
+flowchart TD
+    A["long held after the fill at open t+1"] --> B{"open at or below stop?"}
+    B -- yes --> X1["exit at the open, market"]
+    B -- no --> C{"open at or above take-profit?"}
+    C -- yes --> X2["exit at the open, limit"]
+    C -- no --> D{"low at or below stop?"}
+    D -- yes --> X3["exit at the stop, market"]
+    D -- no --> E{"high at or above take-profit?"}
+    E -- yes --> X4["exit at the take-profit, limit"]
+    E -- no --> F["hold to the close"]
+```
+
+**The picture.**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/execution-and-costs/intrabar-ambiguity-dark.png">
+  <img src="_assets/figures/execution-and-costs/intrabar-ambiguity-light.png" alt="Left: the US payrolls H1 bar of 5 July 2024 with a stop and take-profit two ATR from the open, and two possible paths through it. Right: on a log scale, the share of H1 bars that touch one level and the share that touch both, against the bracket width in ATR">
+</picture>
+
+*On the 2024-07-05 payrolls bar a bracket of 2 ATR around the open was hit on both sides, so aurum books the stop at 2,358.74 (path B). Across 2012-2024 a bracket of 1 ATR is ambiguous on 0.68% of H1 bars and one of 3 ATR on 0.012%. Data: XAUUSD H1, Dukascopy bid/ask mid, 2012-2024.*
+
+**In code.** The simulator, the paper broker and the live runner (to recognise a broker-side
+stop for the post-stop cooldown) all call the same function, so they resolve a bar the same
+way. The example in [ExecutionSimulator](#example) shows both an exit at the open and the
+stop-first case. Stops come from `backtest.stop_atr_mult` and `backtest.take_profit_atr_mult`
+(levels at `entry ∓ k × ATR[t]`, Wilder ATR over `atr_period` = 14 bars, see
+[Backtest engine](#backtest-engine)); they are off (`null`) in the shipped configs.
+
+**Pitfalls and design choices.**
+
+- *Why stop first is conservative.* Assuming the take-profit filled first would turn every
+  ambiguous bar into a win; assuming the stop makes it a loss. If the real path went the other
+  way, live results can only be better than the backtest on those bars.
+- *When it matters.* The right panel shows that ambiguity needs a bracket narrower than about
+  one ATR of the bar: at 1 ATR, 0.68% of all H1 bars touch both sides (2.8% of the bars that
+  touch either side); at 3 ATR, 0.012%. Tight scalping brackets and long bars (H4, D1) are where
+  the convention moves results.
+- *Gaps exit at the open, not at the level.* A long whose stop is above the open has already
+  lost more than the stop distance; filling at the stop level would understate the loss.
+- *Anchoring at the fill.* `stop_distance` places the level relative to the actual entry, so a
+  gap at the open cannot leave a stop on the wrong side of the market (which would enter and
+  exit at once, paying the spread twice).
 
 ## Overnight financing
 
-A CFD position held over the daily rollover is charged or credited financing by
-`aurum.execution.costs.FinancingModel` (`CostModel.financing`, config `costs.financing`).
+**Intuition.** A gold CFD held past the daily rollover is financed like a currency position:
+buying XAUUSD means borrowing dollars to hold gold, so a long pays the dollar interest rate plus
+the broker's markup, and a short earns the rate minus the markup. Aurum charges this from the
+real federal funds rate, using only the value that had been published when each rollover
+happened. The Wednesday rollover counts three nights because spot gold settles two days
+later, which spans the weekend.
 
-### Modes
+**The math** ([`FinancingModel.amount`](../aurum/execution/costs.py)). For every rollover
+instant $R$ that falls inside a holding interval, $t_0 < R \le t_1$:
+
+```math
+S(R) = -\,q\,K\,P_R\;w(R)\;\frac{r(R) - \lambda + \mu}{D}, \qquad
+\mu = \begin{cases} +\mu_{\mathrm{long}} & q > 0 \\ -\mu_{\mathrm{short}} & q < 0 \end{cases}
+```
+
+```math
+r(R) = v_{j^\star}, \qquad j^\star = \max\left\lbrace j : a_j \le R \right\rbrace, \qquad
+w(R) = \begin{cases} 3 & \text{Wednesday} \\ 1 & \text{Monday, Tuesday, Thursday, Friday} \\ 0 & \text{Saturday, Sunday} \end{cases}
+```
+
+where
+
+- $S(R)$ is signed financing in USD, positive when received;
+- $q$ is the signed position in lots and $K$ = 100 oz;
+- $P_R$ is the mid at the rollover: the close of the bar ending at or after $R$, or the previous
+  close for a rollover in a gap between bars;
+- $R$ is `rollover_hour_utc` (21:00 UTC) on each day, and $w$ uses `triple_swap_weekday` = 2
+  (Wednesday);
+- $v_j$ are the benchmark observations (`rate_series` = `fedfunds`, FRED DFF, in percent and
+  divided by 100) and $a_j$ their `available_at`; when several rows become available at the
+  same instant the last one wins, and before the first observation $r$ = `fallback_rate` (0.03);
+- $\lambda$ = `lease_rate` (0), $\mu_{\mathrm{long}}$ = `markup_long` (0.025),
+  $\mu_{\mathrm{short}}$ = `markup_short` (0.025), $D$ = `day_count` (360).
+
+A short therefore receives $r - \mu_{\mathrm{short}}$ and pays when that is negative, which is
+what every year with near-zero rates looked like at a retail broker.
+
+```mermaid
+flowchart LR
+    F["FRED DFF rows"] --> A["available_at: next US business day, 21:30 UTC"]
+    A --> C["RateCurve: latest value published by R"]
+    R["rollover R at 21:00 UTC"] --> C
+    R --> W["weekday weight: 1, 3 on Wednesday, 0 at weekends"]
+    C --> S["swap = -q x 100 x P x w x (r - lease + markup) / 360"]
+    W --> S
+    P["mid close at R"] --> S
+```
+
+**The picture.**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/execution-and-costs/financing-carry-dark.png">
+  <img src="_assets/figures/execution-and-costs/financing-carry-light.png" alt="Top: the fed funds rate as of each rollover from 2012 to 2024 with the long rate 2.5 points above and the short rate 2.5 points below. Bottom: the financing of one lot long and one lot short per night in USD">
+</picture>
+
+*In June 2013 (fed funds 0.08% to 0.12%) one lot paid about 8 to 10 USD a night whichever side it was on (long 8.6 to 10.3, short 8.0 to 9.5); on 2024-12-31 (4.33%, gold 2,623) a long paid 49.8 USD a night and a short received 13.3. Data: FRED DFF (publication-lagged); XAUUSD H1, Dukascopy bid/ask mid, 2012-2024.*
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/execution-and-costs/triple-roll-dark.png">
+  <img src="_assets/figures/execution-and-costs/triple-roll-light.png" alt="Left: bars of financing nights per weekday rollover, 1 on weekdays, 3 on Wednesday, 0 at weekends. Right: the cumulative financing of one lot long over one week of March 2024 as a step line">
+</picture>
+
+*Holding 1 lot long from Sunday 3 to Monday 11 March 2024 cost 326.7 USD: 46 to 47 USD for each ordinary night at 5.33% fed funds, 140.1 USD on Wednesday and nothing over the weekend. Data: FRED DFF (publication-lagged); XAUUSD H1, Dukascopy bid/ask mid, 2024-03-03 to 2024-03-11.*
+
+**In code.** The modes:
 
 | Mode | What is charged |
 |---|---|
-| `rate` (default) | Interest on the notional: the USD benchmark rate, minus the gold lease rate, plus or minus a broker markup |
-| `fixed` | The instrument's per-lot swap table: `instrument.swap_long_per_lot` (−45) and `swap_short_per_lot` (+15) USD per lot per night. This reproduces the pre-2026 behaviour exactly, and lets you replicate a specific broker's table. The −45/+15 defaults are roughly 9%/yr of a $1,800 notional for a long, far above 2012–2021 benchmark rates; they are kept for backward compatibility, not as realistic values. |
+| `rate` (default) | Interest on the notional, as above |
+| `fixed` | The instrument's per-lot swap table: `instrument.swap_long_per_lot` (−45) and `swap_short_per_lot` (+15) USD per lot per night. This reproduces the pre-2026 behaviour exactly, and lets you replicate a specific broker's table. The −45/+15 defaults are roughly 9%/yr of an 1,800 USD/oz notional for a long, far above 2012–2021 benchmark rates; they are kept for backward compatibility, not as realistic values. |
 | `none` | Nothing (frictionless benchmarks) |
-
-### The rate formula
-
-A long XAUUSD position is long gold and short USD, so it pays the USD rate. Per financing
-night:
-
-```text
-long  (lots > 0): swap = -lots * contract_size * P * (r - lease_rate + markup_long)  / day_count
-short (lots < 0): swap = -lots * contract_size * P * (r - lease_rate - markup_short) / day_count
-```
-
-Swap is signed: positive means received. `P` is the mid at the rollover, and `r` is the
-benchmark as of the rollover instant. A short *receives* `r - lease - markup_short`, and pays
-when that is negative (as in near-zero-rate years at a retail broker).
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -285,47 +493,21 @@ when that is negative (as in near-zero-rate years at a retail broker).
 | `fallback_rate` | 0.03 | Benchmark (fraction) before the series starts, or without it |
 | `day_count` | 360.0 | USD money-market convention |
 
-**Worked example.** One lot long (100 oz) at $2,000 is a $200,000 notional. With a 5.33%
-benchmark and the 2.5% markup, one night costs `200,000 × (0.0533 + 0.025) / 360 = $43.50`.
-The Wednesday rollover counts three nights: $130.50. The same short receives
-`200,000 × (0.0533 − 0.025) / 360 = $15.72` per night. These are illustrative inputs, not
-market data.
+When a night is charged: a rollover `R` is charged to whoever holds the position
+**immediately before** it, i.e. over an interval `(t0, t1]` when `t0 < R <= t1`. With H1 bars
+the bar opening at 20:00 closes exactly at the 21:00 rollover, so the position held through
+that bar pays it. A full week counts 7 nights. `rollover_nights(start, end)` and the vectorised
+`rollover_nights_ns` count nights in O(1) per interval, across weekends and holidays.
 
-### When a night is charged
-
-Rollovers happen at `instrument.rollover_hour_utc` (21:00 UTC) on each day. A rollover `R`
-is charged to whoever holds the position **immediately before** it, i.e. over an interval
-`(t0, t1]` when `t0 < R <= t1`. Weekday weights:
-
-| Rollover on | Nights charged |
-|---|---|
-| Monday, Tuesday, Thursday, Friday | 1 |
-| Wednesday (`triple_swap_weekday = 2`) | 3 (T+2 settlement spans the weekend) |
-| Saturday, Sunday | 0 |
-
-A full week therefore counts 7 nights. With H1 bars, the bar opening at 20:00 closes exactly at
-the 21:00 rollover, so the position held through that bar pays it. `rollover_nights(start, end)`
-and the vectorised `rollover_nights_ns` count nights in O(1) per interval, across weekends and
-holidays.
-
-### Point-in-time benchmark
-
-`RateCurve` is a step curve of the annual benchmark. For each rollover instant it returns the
-latest value whose `available_at <= R`. When several rows become available at the same instant
-(for example FRED's Friday, Saturday and Sunday DFF rows), the last one wins. A rate published
-after a rollover is never used for it. `RateCurve.from_source()` accepts `md.macro` (it picks
-`rate_series`), a macro frame with `available_at` and a `value` column, a Series indexed by
-availability time, or a `RateCurve`. A frame without `available_at`, or tz-naive availability
-times, is rejected.
-
-The simulator precomputes the rate for each bar interval at construction and settles each
-rollover only in the step that simulates it. It logs a one-time WARNING when there is no series
-(every rollover uses `fallback_rate`), when the series starts after the first bar, or when it
-ends more than 14 days before the last bar (the last value is carried forward). The provenance
-is in `BacktestResult.meta["financing"]`. The backtest engine passes `md.macro` by default, and
-`rates=` overrides it. Keep the same rate source for the RL environment (`GoldTradingEnv(...,
-rates=)`) and the paper broker (`PaperBroker(..., rates=)`) so they stay in parity with the
-engine.
+`RateCurve` is the point-in-time step curve. `RateCurve.from_source()` accepts `md.macro` (it
+picks `rate_series`), a macro frame with `available_at` and a `value` column, a Series indexed
+by availability time, or a `RateCurve`; a frame without `available_at`, or tz-naive
+availability times, is rejected. The simulator precomputes the rate for each bar interval at
+construction and settles each rollover only in the step that simulates it. It logs a one-time
+WARNING when there is no series (every rollover uses `fallback_rate`), when the series starts
+after the first bar, or when it ends more than 14 days before the last bar (the last value is
+carried forward). The provenance is in `BacktestResult.meta["financing"]`. The backtest engine
+passes `md.macro` by default, and `rates=` overrides it.
 
 ```python
 import pandas as pd
@@ -333,7 +515,7 @@ import pandas as pd
 from aurum.execution.costs import CostModel, FinancingModel, RateCurve, rollover_nights
 
 fin = FinancingModel()                     # rate mode: benchmark + 2.5% markup, /360
-# one night, 1 lot, mid $2,000, benchmark 5.33%
+# one night, 1 lot, mid 2,000 USD/oz, benchmark 5.33%
 print(round(fin.nightly(+1.0, 2_000.0, 0.0533), 2), round(fin.nightly(-1.0, 2_000.0, 0.0533), 2))
 
 # rollovers at 21:00 UTC; Wednesday counts 3 nights, Sat/Sun none
@@ -373,7 +555,12 @@ RateCurve('fedfunds', n=2, 2024-01-02 13:00:00+00:00 .. 2024-09-19 13:00:00+00:0
 -135.0
 ```
 
-### Configuration
+The first line is the worked example: 1 lot long at 2,000 USD/oz is a 200,000 USD notional, so
+one night at 5.33% plus the 2.5% markup costs 200,000 × 0.0783 / 360 = 43.50 USD, and the same
+short receives 200,000 × 0.0283 / 360 = 15.72 USD. The series in this snippet is illustrative
+(the real cut was published later, see below).
+
+Configuration (`costs.financing`):
 
 ```yaml
 costs:
@@ -390,7 +577,180 @@ costs:
 
 `run_backtest(..., financing=...)` and `buy_and_hold_benchmark(..., financing=...)` override
 `costs.financing` with a `FinancingModel`, its kwargs, or a mode name (`"rate"`, `"fixed"`,
-`"none"`).
+`"none"`). Keep the same rate source for the RL environment (`GoldTradingEnv(..., rates=)`)
+and the paper broker (`PaperBroker(..., rates=)`) so they stay in parity with the engine.
+
+**Pitfalls and design choices.**
+
+- *Publication lag is real.* FRED publishes a day's DFF the next US business day, and aurum
+  makes it available at 21:30 UTC, after that day's 21:00 rollover. The September 2024 cut is
+  a real example: DFF fell from 5.33% to 4.83% on 2024-09-19, that value became available on
+  Friday 2024-09-20 at 21:30, so the rollovers of 18, 19 and 20 September were charged at 5.33%
+  and the first charged rollover at 4.83% was Monday 23 September. A backtest that applied the
+  new rate on the 19th would use a number nobody had yet.
+- *Financing dominates buy-and-hold.* Over the 2015-2024 walk-forward the 1x buy-and-hold
+  benchmark paid 66.1k USD of financing on 144.2k USD of gross price gains (next section). A
+  long-only CFD book that ignores swap overstates its return by that much.
+- *The legacy table is unrealistic.* `fixed` mode's −45/+15 USD per lot is kept for backward
+  compatibility; it charges a long about 9% a year whatever the rates were.
+- *The markup is an estimate.* 2.5% approximates a retail CFD broker; prime brokers charge
+  less. To replicate your broker exactly, use `mode: fixed` with its quoted per-lot swaps.
+- *Fixed rollover hour.* 21:00 UTC does not move with New York daylight saving, so the
+  rollover can be an hour off for about half the year (see [Limitations](#limitations)).
+
+## From gross to net in a real walk-forward
+
+**Intuition.** A strategy's gross trading profit is not what it earns. Every rebalance pays the
+spread and slippage, and every night in the market pays financing. A fast strategy can have a
+positive gross edge and still lose money net. The walk-forward books every component
+separately, so the path from gross to net can be read off the results.
+
+**The math.** Summed over the out-of-sample bars of a book:
+
+```math
+\text{net} = \sum_t \Pi^{\mathrm{price}}_t - \sum_t C^{\mathrm{spread}}_t - \sum_t C^{\mathrm{slip}}_t
+ - \sum_t C^{\mathrm{comm}}_t + \sum_t S_t
+```
+
+where $\Pi^{\mathrm{price}}$ is the mark-to-mid price P&L (`pnl_price` in `timeseries.parquet`),
+the $C$ terms are the positive costs (`cost_spread`, `cost_slippage`, `cost_commission`) and
+$S$ the signed financing (`cost_swap`, negative when paid).
+
+**The picture.**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/execution-and-costs/cost-waterfall-dark.png">
+  <img src="_assets/figures/execution-and-costs/cost-waterfall-light.png" alt="Two waterfall charts. Left: the combined trend book goes from 10.7 thousand USD gross price profit down through spread, slippage and financing to a 6.8 thousand USD loss. Right: buy-and-hold goes from 144.2 thousand gross through negligible trading costs and 66.1 thousand of financing to 78.2 thousand net">
+</picture>
+
+*The combined trend book earned 10.7k USD of gross price P&L out of sample and lost 6.8k net after 7.2k of spread, 4.5k of slippage and 5.8k of financing; buy-and-hold paid only 26 USD to trade but 66.1k of financing. Data: runs/protocol/trend_core_selection, walk-forward OOS 2015-12-16 to 2024-12-31 (18 folds).*
+
+The same totals for every book of that run (`costs.csv`; USD on 100k starting equity,
+`costs / gross` is spread plus slippage plus commission over the absolute gross price P&L, the run's `costs_pct_gross`):
+
+| Book | Gross price P&L | Spread | Slippage | Financing | Net | Costs / gross |
+|---|---:|---:|---:|---:|---:|---:|
+| combined | 10,721.6 | 7,238.0 | 4,511.3 | −5,786.3 | −6,814.0 | 1.10 |
+| tsmom | 22,721.5 | 9,140.6 | 5,817.6 | −8,761.8 | −998.6 | 0.66 |
+| ema_cross | 21,346.2 | 5,348.9 | 3,373.5 | −9,213.7 | 3,410.1 | 0.41 |
+| donchian | 11,746.4 | 5,172.0 | 4,091.8 | −7,955.6 | −5,473.0 | 0.79 |
+| kalman_trend | 23,568.2 | 9,195.8 | 6,316.5 | −8,722.8 | −666.8 | 0.66 |
+| vol_squeeze | 22,560.8 | 11,584.6 | 7,122.8 | −1,976.2 | 1,877.3 | 0.83 |
+| macro_factor | −2,532.2 | 3,329.7 | 1,436.7 | −4,717.1 | −12,015.7 | 1.88 |
+| risk_off | −59.6 | 679.3 | 324.3 | −1,737.7 | −2,800.9 | 16.83 |
+| benchmark | 144,242.5 | 20.5 | 5.7 | −66,052.9 | 78,163.4 | 0.00 |
+
+Commission is 0 in every row (the default instrument charges none). These numbers describe one
+research run; whether any of them is evidence of an edge is the subject of
+[RESULTS.md](RESULTS.md) and [RESEARCH_PROTOCOL.md](RESEARCH_PROTOCOL.md).
+
+**Pitfalls and design choices.**
+
+- *Cost blindness.* Five of the seven trend strategies made more than 11k USD gross, and only
+  two kept a positive net. Judging a strategy by its gross P&L, or by a backtest with
+  `CostModel.zero()`, picks the strategies that trade the most.
+- *Combining does not remove costs.* The combined book pays the costs of trading the blended
+  position, which is why the combiner scores strategies net of costs before it weights them
+  ([portfolio-and-risk.md](portfolio-and-risk.md)).
+- The per-strategy split of a book's costs, and an interactive version of this waterfall, are
+  in [analytics.md](analytics.md) (`aurum explain --attribution`, `aurum dashboard`).
+
+## Paper broker parity
+
+**Intuition.** The paper broker keeps its book the way a real broker does: each position has
+an executed entry price, commission comes out of the balance, swap accrues on the position.
+The simulator instead marks everything at the mid and books spread and slippage as separate
+costs. The two bookkeepings are algebraically the same, so on the same orders they must agree
+to floating-point precision. If they ever disagree, either the paper broker or the simulator
+has a bug, and a test fails.
+
+**The math.** A position of $q$ lots filled around the mid $M_{\mathrm{fill}}$ and marked at
+mid $M_t$:
+
+```math
+P^{\mathrm{exec}} = M_{\mathrm{fill}} + \operatorname{sign}(q)\left(\tfrac{1}{2}s^{\mathrm{eff}} + \mathrm{slip}\right)
+\quad\Rightarrow\quad
+q K \left(M_t - P^{\mathrm{exec}}\right) = q K \left(M_t - M_{\mathrm{fill}}\right)
+ - \left(\tfrac{1}{2}s^{\mathrm{eff}} + \mathrm{slip}\right)\lvert q \rvert K
+```
+
+The left side is the broker's floating P&L; the right side is the simulator's mid-marked P&L
+minus its booked spread and slippage costs. Commission and financing use the same functions in
+both, with the same rollover instants and the same valuation price.
+
+```mermaid
+flowchart LR
+    CM["CostModel"] --> SIM["ExecutionSimulator"]
+    CM --> PB["PaperBroker"]
+    FM["FinancingModel and RateCurve"] --> SIM
+    FM --> PB
+    IE["intrabar_exit"] --> SIM
+    IE --> PB
+    IE --> LR["LiveRunner stop detection"]
+    SIM --> T["tests/test_live_paper.py"]
+    PB --> T
+```
+
+**The picture.**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/execution-and-costs/paper-parity-dark.png">
+  <img src="_assets/figures/execution-and-costs/paper-parity-light.png" alt="Top: the equity of the execution simulator and of the paper broker over the first half of 2024, drawn on top of each other as one line. Bottom: their absolute difference, of the order of one ten-billionth of a dollar">
+</picture>
+
+*On 2,938 real H1 bars with random targets, 127 stop-outs, a commission of 3.5 USD per lot per side and rate financing, the two equity paths never differ by more than 2.6e-10 USD. Data: XAUUSD H1, Dukascopy bid/ask mid, 2024-01-01 to 2024-06-30; FRED DFF (publication-lagged).*
+
+**In code.** [`aurum.live.paper.PaperBroker`](../aurum/live/paper.py) with a `ReplayFeed`
+fills an order placed just after the close of bar `t` at the open of bar `t+1` (the quote is
+that bar's open and spread), and rejects orders between bars with `market_closed`. The parity
+is enforced by `tests/test_live_paper.py` (`test_paper_equals_simulator` with and without
+stops, `test_paper_swap_matches_simulator_over_rollovers`). A minimal check:
+
+```python
+import pandas as pd
+
+from aurum.core.types import Side
+from aurum.data.synthetic import make_synthetic_bars
+from aurum.execution.costs import CostModel
+from aurum.execution.simulator import ExecutionSimulator
+from aurum.live.broker import OrderRequest, SimulatedClock
+from aurum.live.paper import PaperBroker, ReplayFeed
+
+bars = make_synthetic_bars(120, "H1", seed=3, weekend_gaps=False)   # 5 days of H1 bars
+costs = CostModel(commission_per_lot=3.5)          # no macro data: rate financing at fallback_rate
+sim = ExecutionSimulator(bars, costs=costs)
+clock = SimulatedClock(bars["available_at"].iloc[0] + pd.Timedelta(seconds=5))
+paper = PaperBroker(ReplayFeed(bars), costs=costs, clock=clock)
+
+# decided at the close of bar 0: buy 1 lot, which both venues fill at the open of bar 1
+paper.place_order(OrderRequest(client_id="demo-0", symbol="XAUUSD", side=Side.BUY, lots=1.0,
+                               time=clock.now(), magic=1))
+worst = 0.0
+for t in range(len(bars) - 1):
+    sim.step(1.0)                                   # hold 1 lot through bar t+1
+    clock.advance_to(bars["available_at"].iloc[t + 1] + pd.Timedelta(seconds=5))
+    worst = max(worst, abs(paper.account().equity - sim.equity))
+swap = sim.result(compute_metrics=False).costs["swap"].sum()
+print(round(sim.equity, 2), round(paper.account().equity, 2), round(swap, 2), worst)
+```
+
+Output (stdout; both venues also log a one-time WARNING that no `fedfunds` series was given):
+
+```text
+97934.34 97934.34 -190.93 5.820766091346741e-11
+```
+
+**Pitfalls and design choices.**
+
+- *Same inputs or no parity.* Pass the same `CostModel` and the same rate source to both
+  (`PaperBroker(..., rates=md.macro)`); with `rates=None` both fall back to 3%, but a paper
+  broker without rates next to a simulator with them will drift by the financing difference.
+  The runner refreshes the paper broker's rates whenever it reloads macro data.
+- *Market closed between bars.* The replay has no quote in a weekend or daily break, like an
+  MT5 server (retcode 10018). The runner defers the order and retries at the reopen; the
+  figure above does the same, which is why parity holds across real weekend gaps.
+- *The simulator has no append API.* It works over a fixed bars frame, so the paper broker
+  keeps its own incremental books with the same arithmetic.
 
 ## Backtest engine
 
@@ -411,8 +771,8 @@ Engine rules:
 - The forecast is aligned to the bars by label. Missing or NaN values become 0, and values are
   clipped to [-1, 1].
 - The default `vol` is `ewma_volatility(close)`, computed on the full history so the window
-  starts warmed up ([portfolio-and-risk.md](portfolio-and-risk.md#volatility-models)). A `vol`
-  Series is forward-filled, and remaining gaps are set to 0.20.
+  starts warmed up ([models.md](models.md)). A `vol` Series is forward-filled, and remaining
+  gaps are set to 0.20.
 - A non-finite requested size **holds** the current position rather than rounding to 0.
 - Any approval outside `[min(0, requested), max(0, requested)]` is clamped, recorded as a risk
   event and counted in `meta["n_risk_clamped"]`. The engine enforces reduce-only even for a
@@ -561,7 +921,8 @@ calendar.
 | `metrics` | The dict from [`compute_metrics`](#metrics) |
 | `meta` | Provenance: engine, sizer and risk `repr`, cost model, financing provenance, `bars_per_year`, stop settings, `n_risk_events`, `n_risk_clamped`, `bankrupt`, `timeframe`, `start`, `end`, `n_bars` |
 
-`reconcile()` checks the P&L identity and returns `equity_change`, `price_pnl`, `costs`, `swap`,
+`reconcile()` checks the P&L identity of [Timing](#timing-decide-at-the-close-fill-at-the-next-open)
+and returns `equity_change`, `price_pnl`, `costs`, `swap`,
 `residual = equity_change - (price_pnl - costs + swap)` and `trade_pnl` (the sum of
 `trades.pnl`). The residual should be about 0 (under 1e-6 USD), and `trade_pnl` should equal
 `equity_change`.
@@ -585,13 +946,29 @@ numbers (NaN when a statistic is undefined).
   `sharpe_bar`.
 - **Day of an equity mark.** `equity[t]` is marked at the close of bar `t`, so each mark is
   assigned to the UTC date on which that close falls (a close at exactly 00:00 belongs to the
-  previous day). The bar duration comes from `meta["timeframe"]` or the index spacing.
+  previous day). The bar duration comes from `meta["timeframe"]` or the index spacing. The
+  walk-forward statistics in `stats.csv` (`book_statistics`) call `daily_returns` without a
+  bar duration and so date each mark by the bar's **open** time instead. On H1 bars the two
+  conventions give the same days; on D1 bars that open at 22:00 UTC they do not (see the note
+  under [Sharpe convention](research.md#sharpe-convention)).
 - **Weekends are folded into Monday.** Gold reopens on Sunday around 22:00 UTC. Those short
   Sunday stubs (and any Saturday bars) join the following Monday instead of counting as
   near-zero "days". Days without bars are absent, not zero-return days.
 - The first day's return is measured against the initial equity.
 - **Risk-free rate = 0.** CFD P&L is already an excess return, because financing is paid
   through swap.
+
+The three headline formulas, on the daily returns $d_1..d_N$ and the equity curve $E_t$:
+
+```math
+\mathrm{Sharpe} = \frac{\bar d}{\operatorname{sd}(d)}\sqrt{252}, \qquad
+\mathrm{Sortino} = \frac{\bar d}{\sqrt{\tfrac{1}{N}\sum_i \min(d_i, 0)^2}}\sqrt{252}, \qquad
+\mathrm{maxDD} = \min_t \left(\frac{E_t}{\max_{u \le t} E_u} - 1\right)
+```
+
+where $\bar d$ is the mean daily return, $\operatorname{sd}$ the sample standard deviation
+(ddof 1), the Sortino denominator runs over all $N$ days with target 0, and maxDD is a
+negative fraction.
 
 ### Metric definitions
 
@@ -604,13 +981,13 @@ numbers (NaN when a statistic is undefined).
 | `sharpe_bar` | The same on per-bar returns, annualised with `bars_per_year` |
 | `sortino` | `mean(daily) / sqrt(mean(min(daily, 0)^2)) * sqrt(252)` (target 0, over all observations) |
 | `max_drawdown` | Most negative `equity / cummax(equity) - 1` (a **negative** fraction) |
-| `calmar` | `cagr / \|max_drawdown\|` |
+| `calmar` | `cagr / abs(max_drawdown)` |
 | `max_dd_duration_days` | Longest calendar time from a peak until it is regained (or the sample ends) |
 | `skew` | Bias-corrected skewness of daily returns (`pandas.Series.skew`) |
 | `kurtosis` | Bias-corrected **excess** kurtosis of daily returns (`pandas.Series.kurt`, normal = 0) |
 | `var_95_daily` | `-q5%(daily)`: historical 95% VaR, a positive loss fraction |
-| `cvar_95_daily` | `-mean(daily \| daily <= q5%)`: expected shortfall |
-| `tail_ratio` | `\|q95%\| / \|q5%\|` |
+| `cvar_95_daily` | Minus the mean of the daily returns at or below `q5%`: expected shortfall |
+| `tail_ratio` | `abs(q95%) / abs(q5%)` |
 | `best_day`, `worst_day` | Max and min daily return |
 | `n_trades` | Round trips, including the open one closed virtually at the end |
 | `trades_per_year` | `n_trades / years` |
@@ -638,7 +1015,8 @@ bar_duration=None)`, `daily_equity(...)`, `trading_dates(...)`, `drawdown_series
 
 Metrics describe what happened in one path. They are not evidence of an edge. The walk-forward
 adds PSR, the Deflated Sharpe Ratio, bootstrap intervals and PBO ([research.md](research.md)),
-and the results live in [RESULTS.md](RESULTS.md).
+the Monte Carlo and stress analyses are in [analytics.md](analytics.md), and the results live
+in [RESULTS.md](RESULTS.md).
 
 ## Limitations
 
@@ -663,12 +1041,17 @@ and the results live in [RESULTS.md](RESULTS.md).
 
 ## See also
 
-- [portfolio-and-risk.md](portfolio-and-risk.md): combiner, sizer, risk manager, volatility models
-- [data.md](data.md): the bars schema, `available_at`, macro data and the event calendar
-- [research.md](research.md): walk-forward protocol and statistics built on these backtests
-- [live-trading.md](live-trading.md): paper broker and live runner parity with the simulator
+- [index.md](index.md) and [architecture.md](architecture.md): where execution sits in the stack
+- [data.md](data.md): the bars schema, `available_at`, the spread column, macro data and the event calendar
+- [models.md](models.md): the EWMA and GARCH volatility models behind sizing
+- [portfolio-and-risk.md](portfolio-and-risk.md): combiner (scored net of these costs), sizer, risk manager
+- [strategies.md](strategies.md): the strategies whose books appear in the cost table
+- [research.md](research.md) and [RESEARCH_PROTOCOL.md](RESEARCH_PROTOCOL.md): walk-forward protocol and statistics built on these backtests
+- [analytics.md](analytics.md): attribution of costs per strategy, stress tests, the dashboard's cost waterfall
+- [live-trading.md](live-trading.md): paper broker, MT5 venue and live runner, which reuse this arithmetic
 - [llm-desk.md](llm-desk.md): the desk replay through `forecast_hook`
 - [configuration.md](configuration.md): the `costs`, `instrument` and `backtest` sections
 - [cli.md](cli.md): `aurum backtest` and `aurum walkforward`
+- [development.md](development.md): tests (`tests/test_live_paper.py`) and how the figures on this page are built
 - [INTERFACES.md](INTERFACES.md): module signatures
 - [RESULTS.md](RESULTS.md): research results

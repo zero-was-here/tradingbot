@@ -3,23 +3,28 @@
 Everything in Aurum reads market data through one shape: a **canonical bars frame**
 (UTC bar-open index, mid-price OHLC, a spread in USD/oz and an `available_at` timestamp),
 optionally bundled with daily macro series and an economic-event calendar in a
-`MarketData` object. This page covers that contract, the point-in-time join and resampling
-rules that keep research free of look-ahead, the data sources (Dukascopy bid/ask history,
-MT5 and CSV exports, Yahoo Finance and FRED macro series, a rule-based NFP/FOMC calendar),
-the parquet store with its content hashes, the data-quality report, and the synthetic
-generators the test suite runs on. The code lives in [`aurum/data/`](../aurum/data/) and
+`MarketData` object. The idea that holds the layer together is **point-in-time
+discipline**: every row carries the instant from which it may be used, and every join,
+resample and feature respects that instant, so a backtest can never see a number before a
+live process could have seen it. This page explains that rule with real gold data, then the
+resampling rules (including the v2.1 head rule), how Dukascopy bid/ask minute candles
+become bars and spreads, what the data looks like (spreads, coverage, gaps), the loaders,
+macro series and the event calendar, the parquet store and the synthetic generators the
+test suite runs on. The code lives in [`aurum/data/`](../aurum/data/) and
 [`aurum/core/types.py`](../aurum/core/types.py).
 
 **On this page**
 
+- [Point-in-time discipline](#point-in-time-discipline)
 - [The bars contract](#the-bars-contract)
 - [MarketData](#marketdata)
-- [Point-in-time alignment](#point-in-time-alignment)
+- [Point-in-time alignment: `asof_join`](#point-in-time-alignment-asof_join)
+- [Macro series and publication lags](#macro-series-and-publication-lags)
 - [Resampling to higher timeframes](#resampling-to-higher-timeframes)
 - [Dukascopy history](#dukascopy-history)
+- [Spreads, coverage and gaps in the real data](#spreads-coverage-and-gaps-in-the-real-data)
 - [`aurum data download` and `aurum data info`](#aurum-data-download-and-aurum-data-info)
 - [MT5 and CSV imports](#mt5-and-csv-imports)
-- [Macro series](#macro-series)
 - [Economic calendar](#economic-calendar)
 - [Storage, hashes and the manifest](#storage-hashes-and-the-manifest)
 - [Data-quality report](#data-quality-report)
@@ -43,11 +48,78 @@ flowchart LR
     MD --> USE["features, strategies, backtests (asof_join on available_at)"]
 ```
 
+All figures on this page are drawn by the real aurum code from
+[tools/figures/fig_data.py](../tools/figures/fig_data.py), on data cut at 2024-12-31
+(2025 onward is the research holdout; see [RESEARCH_PROTOCOL.md](RESEARCH_PROTOCOL.md)).
+
+## Point-in-time discipline
+
+**Intuition.** A backtest is only honest if each decision uses information that existed
+at that moment. Most leaks are not exotic: a daily bar labelled at midnight but only known
+at the close, a Friday macro print that is published on Monday, a resampled bar that is
+still forming. Aurum makes the moment explicit: every row carries `available_at`, the
+instant from which it may be used, and every consumer compares that instant with its
+decision time. The rule is SPEC §0.1: *a value may influence a decision at time $T$ only if
+it was available at $T$*.
+
+**The math.**
+
+```math
+x \text{ is usable at decision time } T \iff a(x) \le T, \qquad
+a_t = \tau_t + \Delta, \qquad T_t = a_t, \qquad \text{fill}_t = \tau_{t+1}
+```
+
+where
+
+- $a(x)$ is the `available_at` of a row $x$ (a bar, a macro print, a resampled bar),
+- $\tau_t$ is the open time of bar $t$ (the index label) and $\Delta$ the bar length
+  (one hour for H1),
+- $T_t$ is the decision time of bar $t$: decisions are made at the close of bar $t$,
+- the order that decision produces fills at the open of the next bar, at $\tau_{t+1}$,
+  which equals $a_t$ except across a break (the daily maintenance hour, weekends).
+
+**The picture.** Three timeframes of real gold bars around the daily break of Monday
+2024-03-04. Each bar is labelled by its open; it becomes usable at its `available_at`
+(the arrows), and a higher-timeframe bar reaches an H1 decision only once it is complete.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/data/pit-timeline-dark.png">
+  <img src="_assets/figures/data/pit-timeline-light.png" alt="Timeline of H1, H4 and New York close D1 bars from 16:00 on 4 March 2024 to 03:00 the next day, with arrows from each completed higher-timeframe bar to the first H1 decision that can see it and a gap at the 22:00 daily break">
+</picture>
+
+*The H4 bar opening at 20:00 holds the H1 bars of 20:00, 21:00 and 23:00 and is first visible to the H1 decision at 00:00; the D1 bar that ends at the New York close (22:00) is first visible to the decision of bar 21:00, at 22:00. Data: XAUUSD H1, H4 and D1 (New York close), Dukascopy bid/ask mid, 2024-03-04 to 2024-03-05.*
+
+```mermaid
+sequenceDiagram
+    participant B as Bar t
+    participant F as Features and strategy
+    participant X as Execution
+    B->>F: closes at available_at t
+    F->>F: use only rows with available_at at or before t
+    F->>X: target position decided at available_at t
+    X->>X: fill at the open of bar t+1
+```
+
+**In code.** The contract is enforced in three places: `make_bars` / `validate_bars`
+([aurum/data/schema.py](../aurum/data/schema.py)) attach and check `available_at`;
+`asof_join` ([aurum/data/pit.py](../aurum/data/pit.py)) aligns anything else onto the
+bars; `resample_bars` ([aurum/data/resample.py](../aurum/data/resample.py)) gives every
+higher-timeframe bar the instant its bucket ends. The feature library's leakage tests check
+the result end to end ([Features](features.md#leakage-testing)).
+
+**Pitfalls and design choices.**
+
+- *Labelling by the close* would make "the bar of 10:00" mean different things in
+  different tools. Aurum labels by the open like MT5 and stores the close separately.
+- *Joining on dates* is the most common macro leak (see the
+  [as-of join figure](#point-in-time-alignment-asof_join)).
+- *Trusting `attrs`*: pandas does not reliably carry `df.attrs` through operations, so no
+  timing logic reads it; timing always comes from `available_at`.
+
 ## The bars contract
 
-The rule behind every design choice here is SPEC §0.1: *a value may influence a decision
-at time `T` only if it was available at `T`*. Bars are labelled by their OPEN time and carry
-the instant they become complete, so no consumer has to guess.
+Bars are labelled by their OPEN time and carry the instant they become complete, so no
+consumer has to guess.
 
 | Field | Type | Units | Meaning |
 |---|---|---|---|
@@ -99,7 +171,7 @@ Extra columns are allowed after the canonical ones.
 
 Decisions are made at the close of bar `t` (`available_at[t]`) and fill at the open of bar
 `t+1` (SPEC §1). The [architecture page](architecture.md) shows how this timing flows through
-the system.
+the system, and [Execution and costs](execution-and-costs.md) how fills are priced.
 
 ## MarketData
 
@@ -109,7 +181,7 @@ backtest receives:
 | Field | Type | Contents |
 |---|---|---|
 | `bars` | DataFrame | Canonical bars of the trading timeframe. |
-| `macro` | `dict[str, DataFrame]` (default `{}`) | Daily series, each with a tz-aware UTC index, a `value` column and `available_at` ([Macro series](#macro-series)). |
+| `macro` | `dict[str, DataFrame]` (default `{}`) | Daily series, each with a tz-aware UTC index, a `value` column and `available_at` ([Macro series](#macro-series-and-publication-lags)). |
 | `events` | DataFrame or `None` | Economic calendar ([Economic calendar](#economic-calendar)). |
 
 `md.slice(end=None, start=None)` restricts the bars to open times in `[start, end]`
@@ -123,27 +195,57 @@ With a config file, `DataConfig.load()` builds the `MarketData` for you: bars fr
 path). `data.synthetic` swaps in generated data (see
 [Synthetic data](#synthetic-data)). See [Configuration](configuration.md) for every key.
 
-## Point-in-time alignment
+## Point-in-time alignment: `asof_join`
 
-`asof_join` is the sanctioned way (SPEC §0.1) to put a secondary frame (higher-timeframe bars,
-daily macro series, anything with an `available_at` column) onto trading bars. For each
-decision time it takes the latest `right` row with `available_at <= time`.
+**Intuition.** Trading bars arrive every hour; a macro series arrives once a day, at a time
+that depends on its publisher. To put the two side by side, each bar should see the most
+recent macro row *that had already been published* at the bar's decision time, never a row
+that would be published later in the day. That is an as-of join on `available_at`, looking
+backward only.
+
+**The math.** For each decision time $T$ (normally a bar's `available_at`):
+
+```math
+\operatorname{asof}(T) = v_{j^\ast}, \qquad j^\ast = \max\lbrace\, j : a_j \le T \,\rbrace
+```
+
+where
+
+- $v_j$ is the value of row $j$ of the right-hand frame and $a_j$ its `available_at`,
+- the result is NaN when no row qualifies (it is never back-filled), and also when a
+  `tolerance` $\tau$ is given and $T - a_{j^\ast} > \tau$ (a stale feed),
+- if two rows share the same $a_j$, the last one wins (the latest information).
+
+**The picture.** The real 10-year TIPS yield (FRED DFII10) as H1 decisions saw it in the
+week of Martin Luther King Day 2024, against the same series joined on its observation
+date.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/data/asof-join-dark.png">
+  <img src="_assets/figures/data/asof-join-light.png" alt="Step plot of the 10-year real yield on H1 decision times from 10 to 19 January 2024: the as-of join on available_at changes value only after each publication, while a join on the observation date shows each print up to five days earlier">
+</picture>
+
+*The Friday 12 January print (1.69%) is published on Tuesday 16 January at 21:30 UTC because Monday was a US holiday; a join on the observation date would have used it almost five days early. Data: FRED DFII10 (publication-lagged) on XAUUSD H1 decision times, Dukascopy bid/ask mid, 2024-01-10 to 2024-01-18.*
+
+**In code.**
 
 ```text
 asof_join(decision_times, right, *, columns=None, available_col="available_at",
           tolerance=None, index=None) -> pd.DataFrame
 ```
 
-| Parameter | Meaning |
-|---|---|
-| `decision_times` | Normally `bars["available_at"]` (a Series keeps the bars index on the result). |
-| `right` | Frame with a tz-aware `available_at` column. |
-| `columns` | Columns to return (default: all except `available_at`). |
-| `tolerance` | Optional maximum staleness (`pd.Timedelta`); older matches become NaN. |
-| `index` | Index for the result (default: the Series' index, or the times). |
+| Parameter | Default | Meaning |
+|---|---|---|
+| `decision_times` | required | Normally `bars["available_at"]` (a Series keeps the bars index on the result). Must be tz-aware. |
+| `right` | required | Frame with a tz-aware `available_at` column. |
+| `columns` | `None` | Columns to return (default: all except `available_at`). |
+| `available_col` | `"available_at"` | Name of the availability column in `right`. |
+| `tolerance` | `None` | Optional maximum staleness (`pd.Timedelta`); older matches become NaN. |
+| `index` | `None` | Index for the result (default: the Series' index, or the times). |
 
 Rows with no eligible `right` row are NaN and are never back-filled; so are rows whose
-decision time is `NaT`. If two `right` rows share an `available_at`, the last one wins.
+decision time is `NaT`, and every row when `right` is empty. Internally it is a
+`pandas.merge_asof(direction="backward", allow_exact_matches=True)` on the sorted times.
 
 ```python
 import pandas as pd
@@ -172,34 +274,257 @@ time
 ```
 
 Monday's print (available 22:30 UTC) first appears on the bar that closes at 23:00. The bar
-closing at 22:00 still sees Friday's value. Joining on the observation *date* instead would
-use the Monday close all day Monday; the feature leakage harness has a negative control for
-exactly that mistake (see [Features](features.md#leakage-testing)).
+closing at 22:00 still sees Friday's value.
+
+**Pitfalls and design choices.**
+
+- *Joining on the observation date* uses a daily close for the whole day before it
+  happened; the feature leakage harness has a negative control for exactly that mistake
+  (see [Features](features.md#leakage-testing)).
+- *Forward-filling forever*: a dead feed keeps its last value indefinitely unless you set
+  `tolerance`. The `macro` feature group uses a 10-day staleness limit.
+- *Non-monotone vendors*: a frame whose `available_at` is not sorted is sorted first;
+  the `macro` feature group additionally takes the running maximum of `available_at`, so a
+  derived value is never usable before all of its inputs.
+
+## Macro series and publication lags
+
+**Intuition.** A daily macro value is stamped with the date it describes, not the moment
+it became public. The S&P 500 close of a Friday is known on Friday evening; the Fed's
+H.15 release carries the previous business day's Treasury and TIPS yields, so FRED's
+Friday DFII10 value is only published on Monday (Tuesday after a Monday holiday). Aurum
+turns each source's publication habit into a fixed rule for `available_at`.
+
+**The math.**
+
+```math
+a_d =
+\begin{cases}
+\operatorname{BD}_1(d) + 21{:}30 & \text{FRED series} \\
+d + 21{:}30 & \text{Yahoo cash indices} \\
+d + 22{:}30 & \text{Yahoo futures and ICE quotes}
+\end{cases}
+```
+
+where
+
+- $d$ is the observation date (UTC midnight) and $a_d$ its `available_at` (UTC),
+- $\operatorname{BD}_1(d)$ is the first US federal business day after $d$, with $d$ first
+  rolled back to the preceding business day if it is a weekend or holiday
+  (`us_business_day_offset`, pandas `USFederalHolidayCalendar`), so a Friday, Saturday and
+  Sunday row all map to the next Monday (Tuesday after a Monday holiday),
+- FRED series are `DFII10`, `T10YIE` and `DFF` (`FRED_LAG = 1 day 21:30`, days counted in
+  business days); Yahoo cash indices are `^GSPC`, `^VIX`, `^TNX` (`YAHOO_CASH_LAG = 21:30`);
+  futures and ICE are tickers ending in `=F`, `.NYB` or `=X` (`YAHOO_FUTURES_LAG = 22:30`),
+  decided by `default_yahoo_lag(ticker)`.
+
+**The picture.** Six of the stored series in the MLK-day week of January 2024: each row
+is a line from its observation date (tick) to its `available_at` (dot).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/data/macro-lags-dark.png">
+  <img src="_assets/figures/data/macro-lags-light.png" alt="Six rows of horizontal arrows, one row per macro series, each arrow running from an observation date to the instant the value became usable; FRED arrows span one to five days, Yahoo arrows end on the evening of the observation date">
+</picture>
+
+*FRED rows wait for the next US business day (the Friday, weekend and MLK-day rows of DFF all become usable on Tuesday 16 January at 21:30 UTC); Yahoo cash indices are usable at 21:30 UTC and futures and ICE quotes at 22:30 UTC of the observation date. Data: FRED DFF, DFII10; Yahoo ^TNX, ^GSPC, DX-Y.NYB, GC=F, as stored in data_store/macro, 2024-01-10 to 2024-01-19.*
+
+[`aurum/data/macro.py`](../aurum/data/macro.py) downloads daily series from Yahoo Finance
+(through the optional `yfinance` package) and FRED. Gold's best-documented macro drivers are
+the US dollar and US real yields, with risk sentiment and inflation expectations as secondary
+factors; the module docstring gives the references.
+
+Every macro frame has:
+
+- an index of observation **dates** as tz-aware UTC midnights, named `date`;
+- `value`: the close or level (Yahoo frames also keep `open`, `high`, `low`, `volume`);
+- `available_at`: the tz-aware UTC instant from which the row may be used.
+
+### Default series
+
+| Name | Source | Ticker / series id | `available_at` | Feature treatment |
+|---|---|---|---|---|
+| `dxy` | Yahoo | `DX-Y.NYB` (ICE dollar index) | date + 22:30 UTC | price (log changes) |
+| `us10y` | Yahoo | `^TNX` | date + 21:30 UTC | yield (bp changes) |
+| `vix` | Yahoo | `^VIX` | date + 21:30 UTC | price |
+| `spx` | Yahoo | `^GSPC` | date + 21:30 UTC | price |
+| `silver` | Yahoo | `SI=F` | date + 22:30 UTC | price |
+| `gold_fut` | Yahoo | `GC=F` | date + 22:30 UTC | price |
+| `oil` | Yahoo | `CL=F` | date + 22:30 UTC | price |
+| `real10y` | FRED | `DFII10` | next US business day, 21:30 UTC | yield |
+| `breakeven10y` | FRED | `T10YIE` | next US business day, 21:30 UTC | yield |
+| `fedfunds` | FRED | `DFF` | next US business day, 21:30 UTC | yield |
+
+The "feature treatment" column is how the `macro` feature group transforms the series,
+decided from the name (see [Features](features.md#macro)). `fedfunds` also drives the default
+rate-based financing cost ([Execution and costs](execution-and-costs.md)).
+
+### Why these lags
+
+- **Yahoo cash indices** (`^GSPC`, `^VIX`, `^TNX`) close at 16:00 to 16:15 New York, so
+  21:30 UTC is safe in both EST and EDT.
+- **Yahoo futures and ICE** (tickers ending `=F`, `.NYB` or `=X`) end their session at
+  17:00 New York, which is 22:00 UTC in winter. 21:30 would be 30 minutes early for half the
+  year, so they use 22:30 UTC.
+- **FRED** publishes day D's observation on the **next US business day** (the Fed's H.15
+  release carries the previous business day's Treasury and TIPS yields; the NY Fed publishes
+  the effective fed funds rate the next business day). The whole-day part of the lag is
+  counted in US federal business days. With plain calendar days, a Friday print would become
+  "available" on Saturday and be used from the Sunday-evening open, although it is only
+  published on Monday: about one trading day of look-ahead every week and around every
+  holiday. Weekend and holiday rows of 7-day series such as DFF roll back to the preceding
+  business day's publication slot.
+
+```python
+import pandas as pd
+
+from aurum.data.macro import FRED_LAG, default_yahoo_lag, to_macro_frame
+
+# DFII10-like prints: Thursday, Friday, then Tuesday (Monday 2024-01-15 is MLK day)
+real10y = pd.Series([1.78, 1.74, 1.80],
+                    index=pd.to_datetime(["2024-01-11", "2024-01-12", "2024-01-16"]))
+frame = to_macro_frame(real10y, availability_lag=FRED_LAG, business_days=True, source="fred:DFII10")
+frame["weekday_available"] = frame["available_at"].dt.day_name()
+print(frame.to_string())
+print(default_yahoo_lag("^VIX"), "|", default_yahoo_lag("DX-Y.NYB"), "|", default_yahoo_lag("GC=F"))
+```
+
+```text
+                           value              available_at weekday_available
+date                                                                        
+2024-01-11 00:00:00+00:00   1.78 2024-01-12 21:30:00+00:00            Friday
+2024-01-12 00:00:00+00:00   1.74 2024-01-16 21:30:00+00:00           Tuesday
+2024-01-16 00:00:00+00:00   1.80 2024-01-17 21:30:00+00:00         Wednesday
+0 days 21:30:00 | 0 days 22:30:00 | 0 days 22:30:00
+```
+
+### Fetching and storing
+
+| Function | Notes |
+|---|---|
+| `fetch_yahoo_daily(tickers=None, start="2011-01-01", end=None, cache_dir="cache/macro", *, availability_lag=None, refresh=False, skip_errors=True)` | `tickers=None` means `DEFAULT_YAHOO`. `end=None` is yesterday (UTC). Raw histories are cached as parquet under `cache_dir/yahoo/`, keyed by ticker and date range. Rows whose `available_at` is still in the future at fetch time (today's unfinished session) are provisional: they are dropped and such a download is not cached. |
+| `fetch_fred(series=None, start="2011-01-01", end=None, cache_dir="cache/macro", *, availability_lag=None, refresh=False, skip_errors=True)` | `series=None` means `DEFAULT_FRED`. Downloads `fredgraph.csv`, caches the CSV text under `cache_dir/fred/`. |
+| `to_macro_frame(values, *, availability_lag, value_col="close", source="", business_days=False)` | Builds a frame from any date-indexed Series/DataFrame. The lag must be positive. |
+| `save_macro_dir(frames, path)` / `load_macro_dir(path)` | One `<name>.parquet` per series; both validate the frame contract. |
+
+`availability_lag` takes one `Timedelta` for all series or a `{name: Timedelta}` mapping; for
+FRED the days part of an override is again counted in business days. With `skip_errors` a
+failing ticker is logged and omitted instead of aborting the batch.
+
+`validate_macro_frame(df, name="")` raises unless the index is tz-aware, `value` and
+`available_at` exist, and every `available_at` is set and strictly after its observation
+date's midnight (a lag of zero would expose a close for the whole day before it happened).
+
+**Pitfalls.** FRED values are latest-vintage: the lag models publication delay, not
+revisions (that would need ALFRED vintages). Yahoo data comes through the unofficial
+`yfinance` API. `CL=F` traded negative in April 2020 and `real10y` was negative for long
+stretches; the `macro` feature group uses basis-point changes for yields and gives NaN log
+changes for non-positive prices.
 
 ## Resampling to higher timeframes
 
-`resample_bars(bars, to, *, daily_anchor_hour_utc=0, complete_until=None)` aggregates
-canonical bars to a coarser timeframe without leaking the future:
+**Intuition.** Higher-timeframe bars (H4, a trading day) are built from base bars by
+grouping them into fixed buckets. Two things can go wrong. At the **end** of the data the
+last bucket may still be forming: its high, low and close are not final, and a live system
+would not have them. At the **start** of the data the first bucket may hold only the tail of
+its period (a download that starts at 10:00, a live sliding window): its open, high, low and
+volume differ from the same bar computed on a longer history, so the value at a given time
+would depend on where the history happened to start. `resample_bars` emits a bucket only
+when it is complete at both ends. The **head rule** is new in v2.1.
 
-- **Labels and aggregation.** Output bars are labelled by their OPEN time. `open` is the
-  first open, `high` the max, `low` the min, `close` the last close, `volume` the sum and
-  `spread` the mean of the base bars.
-- **Buckets.** Boundaries are fixed-length (`Timedelta`) from UTC midnight.
-  `daily_anchor_hour_utc` (0 to 23) shifts H4 and D1 buckets, e.g. `22` aligns days to the
-  New York 17:00 close that most brokers use. A fixed-length rule is used because pandas 3
-  treats `"1D"` as a calendar-day offset and silently ignores `offset=`, which would lose the
-  anchor.
-- **Complete buckets only.** A bucket is emitted only if its last base bar ends exactly at
-  the bucket end, or if base data exists after the bucket (an early close, such as a Friday).
-  The trailing in-progress bucket is dropped.
-- **`available_at` = bucket end** (never earlier than the last base bar in it). An HTF bar is
-  therefore visible to a base bar only once it is finished. The v1 code labelled H1 bars at
-  00:00 and forward-filled them onto M5 bars from 00:00, which leaked 55 minutes of future.
-- **`complete_until`** (UTC, optional) asserts that the base data is final up to that
-  instant, as for a historical download of whole days. Buckets ending at or before it count
-  as complete even if their last base bar ends early, so a dataset ending on a Friday keeps
-  its Friday bar. It never makes a bar available earlier. Leave it `None` for live data.
-- Resampling into a *finer* timeframe raises `ValueError`.
+**The math.** For a target timeframe of length $\Delta_{\mathrm{htf}}$:
+
+```math
+B_k = [\,b_k,\ b_k + \Delta_{\mathrm{htf}}), \qquad b_k = d_0 + \theta + k\,\Delta_{\mathrm{htf}}
+```
+
+```math
+O_k = o_{\text{first}}, \quad H_k = \max_{i \in B_k} h_i, \quad L_k = \min_{i \in B_k} l_i, \quad
+C_k = c_{\text{last}}, \quad V_k = \sum_{i \in B_k} v_i, \quad S_k = \frac{1}{n_k} \sum_{i \in B_k} s_i
+```
+
+```math
+\text{tail: } \max_{i \in B_k} a_i \ \ge\ b_k + \Delta_{\mathrm{htf}} \ \ \text{or}\ \ b_k + \Delta_{\mathrm{htf}} \le D, \qquad
+\text{head } (k = k_0)\text{: } \tau_{\text{first}} = b_{k_0} \ \ \text{or}\ \ b_{k_0} \ge F
+```
+
+```math
+a^{\mathrm{htf}}_k = \max\left(b_k + \Delta_{\mathrm{htf}},\ \max_{i \in B_k} a_i\right)
+```
+
+where
+
+- $d_0$ is a UTC midnight and $\theta$ the anchor: `daily_anchor_hour_utc` hours for H4
+  and D1 (0 to 23, default 0; 22 aligns days to the New York 17:00 close), 0 for faster
+  timeframes; bucket boundaries are fixed-length `Timedelta` steps,
+- $B_k$ is a bucket and $n_k$ the number of base bars in it; $\tau_i$ is the open time of
+  base bar $i$ and $o_i, h_i, l_i, c_i, v_i, s_i, a_i$ its open, high, low, close, volume,
+  spread and `available_at` ($o_{\text{first}}$, $\tau_{\text{first}}$: the open price and
+  open time of the first base bar in the bucket, $c_{\text{last}}$: the close of the last),
+- $D$ is the end of the data: the latest base `available_at`, or `complete_until` if that is
+  later; "a later base bar exists" (an early close, such as a Friday) is the case
+  $b_k + \Delta_{\mathrm{htf}} \le D$,
+- $k_0$ is the first non-empty bucket and $F$ is `complete_from`; with the default
+  `complete_from="auto"` the head rule is strict ($F$ never satisfied) unless
+  `complete_until` is given, in which case the head is trusted (the Dukascopy build path,
+  whose files are byte-identical to v2.0),
+- $a^{\mathrm{htf}}_k$ is the resampled bar's `available_at`: the bucket end, never earlier than its
+  last base bar.
+
+Guarantee: with the defaults, resampling any window `bars[k:j]` yields a subset of the
+full-history bars, with identical values for every emitted bar.
+
+```mermaid
+flowchart TD
+    A["bucket of base bars"] --> T{"data reaches the bucket end?"}
+    T -- no --> D1["drop: forming tail"]
+    T -- yes --> H{"first bucket of the data?"}
+    H -- no --> K["emit at the bucket end"]
+    H -- yes --> S{"first bar at the bucket open, or bucket at or after complete_from?"}
+    S -- no --> D2["drop: partial head"]
+    S -- yes --> K
+```
+
+**The picture.** Real H1 bars from Tuesday 5 March 2024 at 10:00 to Friday 8 March at
+15:00, resampled to New York-close days. The first bucket misses its first eleven H1 bars,
+the last one is still forming.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/data/resample-head-tail-dark.png">
+  <img src="_assets/figures/data/resample-head-tail-light.png" alt="Gold H1 close from 5 to 8 March 2024 with the two complete D1 bars drawn as low-high bands, above a strip of four daily buckets: a partial head bucket and a forming tail bucket marked dropped, two complete buckets marked kept with arrows at their available_at">
+</picture>
+
+*The partial first day would have opened at 2,124.6 instead of the full-history 2,114.9, so it is dropped; the forming Friday bucket (data ends at 16:00) is dropped too, and each kept day becomes usable at its 22:00 UTC close. Data: XAUUSD H1, Dukascopy bid/ask mid, 2024-03-05 to 2024-03-08.*
+
+The head rule was checked on the real dataset: 40 random 30-day windows of H1 bars
+(2014-2024, seed 0) were resampled to D1 with the 22:00 anchor and compared with the
+full-history D1 bars.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/data/resample-window-check-dark.png">
+  <img src="_assets/figures/data/resample-window-check-light.png" alt="Dot plot over window start dates from 2014 to 2024: orange dots show the first D1 open error of the old head rule, up to about one percent, blue dots of the new rule all sit at zero">
+</picture>
+
+*With the old head rule 36 of 40 windows produced a first D1 bar that differs from the full-history bar (open error up to 1.03%); with the new rule none do, because the partial first day is dropped (in 38 of 40 windows). Data: XAUUSD H1, Dukascopy bid/ask mid, 2014-2024 (40 random 30-day windows, seed 0).*
+
+**In code.**
+
+```text
+resample_bars(bars, to, *, daily_anchor_hour_utc=0, complete_until=None,
+              complete_from="auto") -> pd.DataFrame
+align_htf(base, htf_frame, columns=None) -> pd.DataFrame
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `to` | required | Target timeframe (`"H4"`, `"D1"`, ...). Resampling into a *finer* timeframe raises `ValueError`. |
+| `daily_anchor_hour_utc` | `0` | Shifts H4 and D1 bucket boundaries (0 to 23). `22` aligns days to the New York 17:00 close that most brokers use. |
+| `complete_until` | `None` | UTC instant up to which the base data is known to be final (a historical download of whole days). Buckets ending at or before it are complete even if their last base bar ends early, so a dataset ending on a Friday keeps its Friday bar. It never makes a bar available earlier. Leave it `None` for live data. |
+| `complete_from` | `"auto"` (`COMPLETE_FROM_AUTO`) | UTC instant from which the base data is known to be complete. The first bucket is kept only if its first base bar opens at the bucket open or the bucket opens at or after this instant. `None`: strict. `"auto"`: strict, except when `complete_until` is given (the head is trusted). |
+
+A fixed-length bucket rule is used because pandas 3 treats `"1D"` as a calendar-day offset
+and silently ignores `offset=`, which would lose the anchor. `align_htf` maps any
+HTF-indexed frame with an `available_at` column onto base bars; it is
+`asof_join(base["available_at"], htf_frame, columns=columns)`.
 
 ```python
 from aurum.data import make_synthetic_bars, resample_bars
@@ -211,7 +536,19 @@ d1 = resample_bars(h1, "D1")                                  # buckets at 00:00
 print(d1[["open", "close", "available_at"]].tail(2).to_string())
 print(d1.index.day_name().tolist())
 print(resample_bars(h1, "D1", complete_until="2024-01-20").index.day_name().tolist())
+
+# 22:00 anchor: the first bucket opens Sunday 22:00 but the data starts Monday 00:00
 print(resample_bars(h1, "D1", daily_anchor_hour_utc=22).index[:2].tolist())
+print(resample_bars(h1, "D1", daily_anchor_hour_utc=22,
+                    complete_from="2024-01-14 22:00").index[:2].tolist())
+
+# a window that starts mid-day never yields a partial first bar, and any suffix of the
+# history resamples to a subset of the full-history bars with identical values
+full = resample_bars(h1, "D1", daily_anchor_hour_utc=22)
+for k in (3, 10, 37, 58):
+    part = resample_bars(h1.iloc[k:], "D1", daily_anchor_hour_utc=22)
+    assert part.equals(full.loc[part.index]), k
+    print(k, h1.index[k].strftime("%a %H:%M"), "->", len(part), "of", len(full), "bars")
 ```
 
 ```text
@@ -221,28 +558,93 @@ time
 2024-01-18 00:00:00+00:00  1819.703932  1834.767454 2024-01-19 00:00:00+00:00
 ['Monday', 'Tuesday', 'Wednesday', 'Thursday']
 ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+[Timestamp('2024-01-15 22:00:00+0000', tz='UTC'), Timestamp('2024-01-16 22:00:00+0000', tz='UTC')]
 [Timestamp('2024-01-14 22:00:00+0000', tz='UTC'), Timestamp('2024-01-15 22:00:00+0000', tz='UTC')]
+3 Mon 03:00 -> 3 of 3 bars
+10 Mon 10:00 -> 3 of 3 bars
+37 Tue 13:00 -> 2 of 3 bars
+58 Wed 10:00 -> 1 of 3 bars
 ```
 
 Friday is dropped without `complete_until` because nothing after it proves the session is
-over. With the 22:00 anchor the first bucket opens on Sunday 22:00, so it only contains
-Monday's bars here.
+over. With the 22:00 anchor the first bucket opens on Sunday 22:00 while the data starts on
+Monday 00:00, so the strict head rule drops it; `complete_from="2024-01-14 22:00"` asserts
+that nothing is missing from that instant (the synthetic market is closed until Sunday
+22:00) and keeps it.
 
-> **Leading partial bucket.** `resample_bars` cannot tell "not loaded" from "market
-> closed". If your base data starts inside a bucket (as in the anchored example above), the
-> first HTF bar covers only part of its period. Drop bars that open before your data start.
-> `build_dataset` and `download_dukascopy` do this for you.
+**Pitfalls and design choices.**
 
-`align_htf(base, htf_frame, columns=None)` maps any HTF-indexed frame with an
-`available_at` column onto base bars; it is `asof_join(base["available_at"], htf_frame)`.
-The `mtf` feature group maps its H4/D1 features onto the base bars this way, and the `macro`
-group builds its daily gold series with `resample_bars` (see [Features](features.md)).
+- *"Not loaded" and "market closed" look the same.* The head rule cannot tell a window that
+  starts at 23:00 because of the daily break from one that starts at 23:00 because the data
+  was cut there, so it drops both. In the window check above, 2 of the 38 dropped first
+  days were in fact complete: those windows started at 23:00 UTC, right after the US-winter
+  daily break and Sunday reopen. Pass `complete_from` when you know the history is
+  complete.
+- *The Dukascopy build is unchanged.* `download_dukascopy` and `build_dataset` pass
+  `complete_until` and drop buckets cut by the requested start themselves, so the `"auto"`
+  default trusts the head there; an offline rebuild reproduces the manifest hashes.
+- *Feature warm-up moves.* The `mtf` group's warm-up ends one HTF bar later on a history
+  that starts mid-bucket ([Features](features.md#mtf)).
+- *Legacy look-ahead.* The v1 code labelled H1 bars at 00:00 and forward-filled them onto M5
+  bars from 00:00, which leaked 55 minutes of future. Here an HTF bar is visible to a base
+  bar only once the base bar's `available_at` reaches the HTF bar's `available_at`.
 
 ## Dukascopy history
 
 Dukascopy Bank publishes free historical **bid** and **ask** candles for its ECN feed. It is
 the primary source for the research dataset
 ([`aurum/data/dukascopy.py`](../aurum/data/dukascopy.py)).
+
+### From bid/ask candles to mid bars and a spread
+
+**Intuition.** Every Dukascopy file holds one-minute candles for one side of the book.
+Aurum averages the bid and ask candles into a mid-price candle, measures the quoted spread
+at the minute's open and close, and drops the filler candles Dukascopy writes for minutes
+without any tick. Coarser bars are then built with `resample_bars`, whose spread is the
+average of the minute spreads.
+
+**The math.** For a minute candle $i$ with bid fields $\mathrm{bid}^{f}_i$ and ask fields
+$\mathrm{ask}^{f}_i$:
+
+```math
+m^{f}_i = \tfrac{1}{2}\left(\mathrm{bid}^{f}_i + \mathrm{ask}^{f}_i\right),\ \ f \in \lbrace O, H, L, C \rbrace, \qquad
+s_i = \max\left(0,\ \tfrac{1}{2}\left[\left(\mathrm{ask}^{O}_i - \mathrm{bid}^{O}_i\right) + \left(\mathrm{ask}^{C}_i - \mathrm{bid}^{C}_i\right)\right]\right)
+```
+
+```math
+\text{keep } i \iff V^{\mathrm{bid}}_i > 0 \ \lor\ V^{\mathrm{ask}}_i > 0 \ \lor\ \mathrm{bid}^{H}_i > \mathrm{bid}^{L}_i \ \lor\ \mathrm{ask}^{H}_i > \mathrm{ask}^{L}_i
+```
+
+where
+
+- $m^{f}_i$ are the mid open, high, low and close and $s_i$ the `spread` column, in USD/oz;
+  crossed quotes (negative raw spread) are floored at 0,
+- $V^{\mathrm{bid}}_i, V^{\mathrm{ask}}_i$ are the Dukascopy volumes; `volume` keeps the
+  bid-side volume,
+- an H1 bar's spread is then $S = \tfrac{1}{n}\sum_i s_i$ over its $n$ minutes
+  ([resampling](#resampling-to-higher-timeframes)).
+
+**The picture.** The raw minute candles of the US payrolls release on Friday 8 March 2024,
+decoded from the local cache.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/data/dukascopy-nfp-minutes-dark.png">
+  <img src="_assets/figures/data/dukascopy-nfp-minutes-light.png" alt="Two stacked panels for 13:00 to 14:00 UTC on 8 March 2024: the mid close with its minute low-high band jumping about 15 dollars at 13:30, and below it the quoted spread at each minute's open and close with their average, spiking at the release">
+</picture>
+
+*At the 13:30 UTC release the quoted spread jumps from a median 0.33 to 1.70 USD/oz at the minute open; the averaged spread column peaks at 1.05, and the 13:00 H1 bar's spread is the mean of its 60 minute spreads, 0.361. Data: Dukascopy XAUUSD BID/ASK minute candles from the raw cache, 2024-03-08 13:00 to 14:00 UTC.*
+
+| Output | Construction |
+|---|---|
+| `open/high/low/close` | `(bid + ask) / 2` for each field |
+| `spread` | `max(0, ((ask_open - bid_open) + (ask_close - bid_close)) / 2)`: the average of the opening and closing quoted spreads, floored at 0 for crossed quotes |
+| `volume` | bid-side Dukascopy volume (Dukascopy's own units) |
+
+**Pitfalls.** The mid high/low is a slight outer bound: bid and ask extremes need not
+print on the same tick, so `(bid_high + ask_high) / 2` can exceed the true mid-path
+maximum. Keeping the flat filler candles would create fake zero-range bars that bias
+volatility and cost estimates downward. The spread is sampled at two instants per minute,
+so it describes the quoted spread, not the price impact of a large order.
 
 ### File format
 
@@ -261,20 +663,7 @@ the primary source for the research dataset
   the closest plausible power of ten is chosen with a warning, and nothing plausible raises
   `ValueError` instead of guessing.
 - Every file holds every minute (hour) of its period. Periods without ticks (weekends, the
-  daily break, holidays) are flat zero-volume filler candles. They are dropped: a candle is
-  kept only if either side has non-zero volume or a non-degenerate range. Keeping them would
-  create fake zero-range bars that bias volatility and cost estimates downward.
-
-### From bid/ask to canonical bars
-
-| Output | Construction |
-|---|---|
-| `open/high/low/close` | `(bid + ask) / 2` for each field |
-| `spread` | `max(0, ((ask_open - bid_open) + (ask_close - bid_close)) / 2)`: the average of the opening and closing quoted spreads, floored at 0 for crossed quotes |
-| `volume` | bid-side Dukascopy volume (Dukascopy's own units) |
-
-The mid high/low is a slight outer bound: bid and ask extremes need not print on the same
-tick, so `(bid_high + ask_high) / 2` can exceed the true mid-path maximum.
+  daily break, holidays) are flat zero-volume filler candles, dropped by the rule above.
 
 The decoder is a pure function, so you can exercise it without the network:
 
@@ -397,17 +786,89 @@ highs and lows are a slightly looser outer bound than the minute-level construct
 uses `"M1"` if the minute cache already covers the whole range, else `"H1"`. It never
 starts a full minute download by itself: fill the cache with `prefetch_cache` first.
 
-To rebuild from an existing cache without the network:
+To rebuild from an existing cache without the network (here one week, into a temporary
+directory; pass `"data_store"` and the full range to rebuild the research files):
 
 ```python
+import tempfile
+
 from aurum.data import build_dataset
 
-manifest = build_dataset("data_store", start="2012-01-01", end="2026-09-25",
-                         cache_dir="cache/dukascopy", offline=True)
+with tempfile.TemporaryDirectory() as out:          # rebuild one week from the raw cache
+    manifest = build_dataset(out, start="2024-03-04", end="2024-03-08",
+                             cache_dir="cache/dukascopy", offline=True)
+for name, f in manifest["files"].items():
+    print(f"{name:18s} {f['rows']:4d}  {f['start']}  ->  {f['end']}")
 ```
 
+```text
+xauusd_M15          456  2024-03-04 00:00:00+00:00  ->  2024-03-08 21:45:00+00:00
+xauusd_H1           114  2024-03-04 00:00:00+00:00  ->  2024-03-08 21:00:00+00:00
+xauusd_H4            30  2024-03-04 00:00:00+00:00  ->  2024-03-08 20:00:00+00:00
+xauusd_D1             5  2024-03-04 00:00:00+00:00  ->  2024-03-08 00:00:00+00:00
+xauusd_D1_nyclose     4  2024-03-04 22:00:00+00:00  ->  2024-03-07 22:00:00+00:00
+```
+
+The New York-close file starts with the session that opens on Monday 22:00: the session
+that opened on Sunday 22:00 is cut by the requested start (2024-03-04 00:00) and dropped.
 The build is deterministic: rebuilding offline from the same raw cache reproduces the
-manifest's content hashes exactly.
+manifest's content hashes. For v2.1, an offline rebuild of 2012-01-01 to 2026-09-25 with the
+new resampling code matched all five files' hashes and row counts in
+`data_store/manifest.json` (the [changelog](../CHANGELOG.md) calls the build
+byte-identical).
+
+## Spreads, coverage and gaps in the real data
+
+What the H1 research file looks like up to 2024-12-31 (the figures read it through the
+hash-verified loader, cut at the holdout boundary).
+
+**Spread by hour and weekday.** The spread is the main cost input
+([Execution and costs](execution-and-costs.md)), and it has a strong clock.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/data/spread-heatmap-dark.png">
+  <img src="_assets/figures/data/spread-heatmap-light.png" alt="Heatmap of the median H1 spread in US cents per ounce by UTC hour and weekday from Sunday to Friday, flat near 31 cents during the day and darkest around 22:00 UTC and the Sunday reopen">
+</picture>
+
+*Spreads are flat at about 31 cents through the London and New York day and widen to 41-44 cents in the 22:00 UTC hour around the daily break and the Sunday reopen. Data: XAUUSD H1, Dukascopy bid/ask mid, 2012-2024.*
+
+**Spread over time.** In USD the median spread has stayed between about 0.23 and 0.40
+(yearly medians: 0.231 in 2018, 0.399 in 2020, 0.381 in 2024); relative to the price it has
+fallen as gold rose.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/data/spread-history-dark.png">
+  <img src="_assets/figures/data/spread-history-light.png" alt="Two stacked panels of the monthly median H1 spread from 2012 to 2024 with a 10th to 90th percentile band, in USD per ounce and in basis points of price, both with a sharp spike in spring 2020">
+</picture>
+
+*The monthly median spread peaked at 0.99 USD/oz in April 2020 (the largest single H1 spread, 7.10, was on 2020-03-24 at 12:00 UTC); relative to the price the yearly median fell from 2.15 bp in 2012 to 1.58 bp in 2024. Data: XAUUSD H1, Dukascopy bid/ask mid, 2012-2024.*
+
+**Coverage and gaps.** Gold trades 23 hours a day, Sunday evening to Friday evening.
+`quality_report` classifies every hole of at least 3 bars as a weekend, the daily break or
+an intraweek gap.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/data/coverage-gaps-dark.png">
+  <img src="_assets/figures/data/coverage-gaps-light.png" alt="Two stacked panels: H1 bars per week from 2012 to 2024, mostly 115 with dips in holiday weeks, and stems for each intraweek gap with its length in hours, the longest around 73 to 76 hours">
+</picture>
+
+*Most weeks hold 115 H1 bars (five sessions of 23 hours; 2012 and parts of 2013-2017 hold up to 120); the 105 intraweek gaps are holidays and early closes, the longest being Thursday-close to Sunday-reopen gaps around Good Friday, Christmas and New Year. Data: XAUUSD H1, Dukascopy bid/ask mid, 2012-2024.*
+
+On this file `quality_report(bars)` (defaults) returns, among others:
+
+| Key | Value (H1, 2012-01-01 to 2024-12-31) |
+|---|---|
+| `n_rows` | 77,562 |
+| `n_gaps` / `n_weekend_gaps` / `n_daily_break_gaps` / `n_intraweek_gaps` | 766 / 661 / 0 / 105 |
+| `zero_spread_frac` / `flat_bar_frac` | 0.0013 / 0.0032 |
+| `spread_quantiles` (1%, 50%, 99%, 99.9%) | 0.208, 0.324, 0.835, 2.316 USD/oz |
+| `max_spread` | 7.10 at 2020-03-24 12:00 UTC |
+| `n_return_outliers` | 89 |
+
+The daily break is a single missing H1 bar, shorter than the 3-bar gap threshold, so no
+H1 gap is classified as `daily_break`. The break sits at 22:00 UTC in US winter and 21:00
+UTC in US summer (17:00 New York), which is why the 21:00 and 22:00 UTC hours each hold only
+part of the year's bars.
 
 ## `aurum data download` and `aurum data info`
 
@@ -470,9 +931,11 @@ manifest: built 2026-09-27T00:43:45.881797+00:00 via M1 from dukascopy datafeed
 ```
 
 Note the Friday 2026-09-25 `breakeven10y` print: it becomes usable on Monday 2026-09-28 at
-21:30 UTC ([why](#macro-series)). Hash mismatches show up in the `check` column. For the
-per-file and per-year observations on this dataset (spreads, gaps, outliers), see the data
-section of [INTERFACES.md](INTERFACES.md#integration-notes).
+21:30 UTC ([why](#macro-series-and-publication-lags)). Hash mismatches show up in the
+`check` column. `data info` is an inventory of the whole file, so its `median_spread` column
+includes the 2025-26 holdout years; every spread and cost figure on these pages is cut at
+2024-12-31. For the per-file and per-year observations on this dataset (spreads, gaps,
+outliers), see the data section of [INTERFACES.md](INTERFACES.md#integration-notes).
 
 ## MT5 and CSV imports
 
@@ -480,6 +943,12 @@ section of [INTERFACES.md](INTERFACES.md#integration-notes).
 into canonical UTC bars. `load_mt5_csv` and `load_csv` sort, drop rows with unparseable
 timestamps, keep the last of duplicate timestamps, drop rows with missing or non-positive
 prices (each with a logged warning), clip negative volume/spread to 0 and validate.
+
+Every loader records `bars.attrs["source"]` as `"<kind>:<file name>"`: `"mt5:<name>"`
+or `"csv:<name>"`. For an anonymous in-memory buffer (`io.StringIO` / `io.BytesIO` without a
+`name`) the file name is the fixed token `"<buffer>"` (`BUFFER_SOURCE_NAME`), never the
+object's repr, which embeds a memory address and would make the attribute (and anything that
+records it) non-deterministic. `source_name(path_or_buffer)` returns that name.
 
 ### Timezone specifications
 
@@ -538,8 +1007,35 @@ reads History Center / "Bars" exports:
   seen in the bar, so it understates typical costs; keep the cost model's `min_spread` floor
   (see [Execution and costs](execution-and-costs.md)). Without a `<SPREAD>` column,
   `default_spread` (price units) is required;
-- timestamps are converted from `server_tz` to UTC. The default is a fixed UTC+2; pass
-  `server_tz="NY+7"` for New-York-close brokers.
+- timestamps are converted from `server_tz` to UTC. The default (`DEFAULT_MT5_SERVER_TZ`,
+  fixed UTC+2) is kept for backward compatibility, but **relying on it logs a WARNING**
+  (v2.1): on a New-York-close server it shifts every US-summer bar by one hour. Pass
+  `server_tz="NY+7"` for New-York-close brokers, or the broker's zone.
+
+```python
+import io
+import logging
+
+from aurum.data import load_mt5_csv
+
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+export = (
+    "<DATE>\t<TIME>\t<OPEN>\t<HIGH>\t<LOW>\t<CLOSE>\t<TICKVOL>\t<VOL>\t<SPREAD>\n"
+    "2024.07.15\t10:00:00\t2410.50\t2414.00\t2409.10\t2412.70\t5120\t0\t18\n"
+)
+default = load_mt5_csv(io.StringIO(export), "H1")                 # server_tz left at its default
+ny7 = load_mt5_csv(io.StringIO(export), "H1", server_tz="NY+7")
+print(default.index[0], "|", ny7.index[0], "|", ny7.attrs["source"])
+```
+
+```text
+WARNING aurum.data.loaders: load_mt5_csv: server_tz not given, assuming the fixed UTC+2 default 'Etc/GMT-2'. Most metals brokers run New-York-close servers (UTC+2 winter / UTC+3 US summer): pass server_tz='NY+7' for those, or the broker's zone, to avoid a 1-hour shift for ~8 months a year
+2024-07-15 08:00:00+00:00 | 2024-07-15 07:00:00+00:00 | mt5:<buffer>
+```
+
+The same July bar lands at 08:00 UTC with the default and at 07:00 UTC with `"NY+7"`; only
+the second is right for a New-York-close server. With both rows of a winter and a summer
+bar:
 
 ```python
 import io
@@ -597,102 +1093,23 @@ time
 already in memory (a `DatetimeIndex` or a `time` column of bar-open times; a naive index is
 read in `tz`).
 
-## Macro series
-
-[`aurum/data/macro.py`](../aurum/data/macro.py) downloads daily series from Yahoo Finance
-(through the optional `yfinance` package) and FRED. Gold's best-documented macro drivers are
-the US dollar and US real yields, with risk sentiment and inflation expectations as secondary
-factors; the module docstring gives the references.
-
-Every macro frame has:
-
-- an index of observation **dates** as tz-aware UTC midnights, named `date`;
-- `value`: the close or level (Yahoo frames also keep `open`, `high`, `low`, `volume`);
-- `available_at`: the tz-aware UTC instant from which the row may be used.
-
-### Default series
-
-| Name | Source | Ticker / series id | `available_at` | Feature treatment |
-|---|---|---|---|---|
-| `dxy` | Yahoo | `DX-Y.NYB` (ICE dollar index) | date + 22:30 UTC | price (log changes) |
-| `us10y` | Yahoo | `^TNX` | date + 21:30 UTC | yield (bp changes) |
-| `vix` | Yahoo | `^VIX` | date + 21:30 UTC | price |
-| `spx` | Yahoo | `^GSPC` | date + 21:30 UTC | price |
-| `silver` | Yahoo | `SI=F` | date + 22:30 UTC | price |
-| `gold_fut` | Yahoo | `GC=F` | date + 22:30 UTC | price |
-| `oil` | Yahoo | `CL=F` | date + 22:30 UTC | price |
-| `real10y` | FRED | `DFII10` | next US business day, 21:30 UTC | yield |
-| `breakeven10y` | FRED | `T10YIE` | next US business day, 21:30 UTC | yield |
-| `fedfunds` | FRED | `DFF` | next US business day, 21:30 UTC | yield |
-
-The "feature treatment" column is how the `macro` feature group transforms the series,
-decided from the name (see [Features](features.md)). `fedfunds` also drives the default
-rate-based financing cost ([Execution and costs](execution-and-costs.md)).
-
-### Why these lags
-
-A daily close is only known after the market closes, so `available_at = date + lag`:
-
-- **Yahoo cash indices** (`^GSPC`, `^VIX`, `^TNX`) close at 16:00 to 16:15 New York, so
-  21:30 UTC is safe in both EST and EDT.
-- **Yahoo futures and ICE** (tickers ending `=F`, `.NYB` or `=X`) end their session at
-  17:00 New York, which is 22:00 UTC in winter. 21:30 would be 30 minutes early for half the
-  year, so they use 22:30 UTC.
-- **FRED** publishes day D's observation on the **next US business day** (the Fed's H.15
-  release carries the previous business day's Treasury and TIPS yields; the NY Fed publishes
-  the effective fed funds rate the next business day). The whole-day part of the lag is
-  counted in US federal business days. With plain calendar days, a Friday print would become
-  "available" on Saturday and be used from the Sunday-evening open, although it is only
-  published on Monday: about one trading day of look-ahead every week and around every
-  holiday. Weekend and holiday rows of 7-day series such as DFF roll back to the preceding
-  business day's publication slot.
-
-```python
-import pandas as pd
-
-from aurum.data.macro import FRED_LAG, default_yahoo_lag, to_macro_frame
-
-# DFII10-like prints: Thursday, Friday, then Tuesday (Monday 2024-01-15 is MLK day)
-real10y = pd.Series([1.78, 1.74, 1.80],
-                    index=pd.to_datetime(["2024-01-11", "2024-01-12", "2024-01-16"]))
-frame = to_macro_frame(real10y, availability_lag=FRED_LAG, business_days=True, source="fred:DFII10")
-frame["weekday_available"] = frame["available_at"].dt.day_name()
-print(frame.to_string())
-print(default_yahoo_lag("^VIX"), "|", default_yahoo_lag("DX-Y.NYB"), "|", default_yahoo_lag("GC=F"))
-```
-
-```text
-                           value              available_at weekday_available
-date                                                                        
-2024-01-11 00:00:00+00:00   1.78 2024-01-12 21:30:00+00:00            Friday
-2024-01-12 00:00:00+00:00   1.74 2024-01-16 21:30:00+00:00           Tuesday
-2024-01-16 00:00:00+00:00   1.80 2024-01-17 21:30:00+00:00         Wednesday
-0 days 21:30:00 | 0 days 22:30:00 | 0 days 22:30:00
-```
-
-### Fetching and storing
-
-| Function | Notes |
-|---|---|
-| `fetch_yahoo_daily(tickers=None, start="2011-01-01", end=None, cache_dir="cache/macro", *, availability_lag=None, refresh=False, skip_errors=True)` | `tickers=None` means `DEFAULT_YAHOO`. `end=None` is yesterday (UTC). Raw histories are cached as parquet under `cache_dir/yahoo/`, keyed by ticker and date range. Rows whose `available_at` is still in the future at fetch time (today's unfinished session) are provisional: they are dropped and such a download is not cached. |
-| `fetch_fred(series=None, start="2011-01-01", end=None, cache_dir="cache/macro", *, availability_lag=None, refresh=False, skip_errors=True)` | `series=None` means `DEFAULT_FRED`. Downloads `fredgraph.csv`, caches the CSV text under `cache_dir/fred/`. |
-| `to_macro_frame(values, *, availability_lag, value_col="close", source="", business_days=False)` | Builds a frame from any date-indexed Series/DataFrame. The lag must be positive. |
-| `save_macro_dir(frames, path)` / `load_macro_dir(path)` | One `<name>.parquet` per series; both validate the frame contract. |
-
-`availability_lag` takes one `Timedelta` for all series or a `{name: Timedelta}` mapping; for
-FRED the days part of an override is again counted in business days. With `skip_errors` a
-failing ticker is logged and omitted instead of aborting the batch.
-
-`validate_macro_frame(df, name="")` raises unless the index is tz-aware, `value` and
-`available_at` exist, and every `available_at` is set and strictly after its observation
-date's midnight (a lag of zero would expose a close for the whole day before it happened).
-
 ## Economic calendar
 
 Scheduled US releases (NFP, CPI, FOMC) drive the largest intraday gold moves.
 [`aurum/data/calendar.py`](../aurum/data/calendar.py) defines the event frame used by the
-`calendar` feature group, the risk manager's event blackout (see
-[Portfolio and risk](portfolio-and-risk.md)) and the LLM desk.
+`calendar` feature group ([Features](features.md#calendar)), the risk manager's event
+blackout (see [Portfolio and risk](portfolio-and-risk.md)) and the
+[LLM desk](llm-desk.md).
+
+**How big are the moves?** Absolute M15 returns around the rule-based release times,
+against the same clock times on days without an event:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/data/event-study-dark.png">
+  <img src="_assets/figures/data/event-study-light.png" alt="Median absolute M15 log return from three hours before to two and a half hours after NFP and FOMC releases, with dashed baselines for the same clock times on days without an event; both event lines spike at the release bar">
+</picture>
+
+*The M15 bar that opens at an NFP release moves a median 32 bp against 7.6 bp at the same clock time on other days; FOMC statements move 23 bp (3.7 bp baseline), with a second peak of 20 bp 30 minutes later, when the Fed chair's press conference begins. Data: XAUUSD M15, Dukascopy bid/ask mid, 2013-2024; aurum rule-based calendar (144 NFP, 96 FOMC releases).*
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -714,6 +1131,10 @@ Frames built by this module have a `RangeIndex` and are sorted by `time`, then `
 uses them. If you build a surprise feature, give the outcome rows an `available_at` of at
 least `time` and join them with `asof_join`. Unscheduled events (emergency FOMC actions) were
 not known in advance and are excluded from the rule-based calendar.
+
+**Sessions.** The trading-session clock (Asia, London, New York, the New York rollover,
+DST handled per zone) is not stored data: it is computed from each bar's decision time by
+the `session` feature group ([Features](features.md#session)).
 
 ### Rule-based calendar
 
@@ -766,7 +1187,10 @@ print(events.loc[events["name"] == "CPI y/y", cols + ["actual", "forecast"]].to_
 1 2024-01-11 13:30:00+00:00  CPI y/y           3        False     3.4       3.2
 ```
 
-The first-Friday rule puts the March 2024 NFP on the 1st; the BLS rule gives the 8th.
+The first-Friday rule puts the March 2024 NFP on the 1st; the BLS rule gives the 8th (the
+release in the [Dukascopy figure](#from-bidask-candles-to-mid-bars-and-a-spread) above).
+The event study uses the default first-Friday rule, so a few NFP months are aligned to the
+wrong Friday, which dilutes its NFP line slightly.
 
 ### CSV import and merging
 
@@ -869,6 +1293,27 @@ field is the `frame_hash` of the stored frame, not a hash of the file's bytes, s
 
 ## Data-quality report
 
+**Intuition.** Before trusting a dataset, count what is unusual about it: holes, stale
+quotes, zero spreads and price jumps that are implausible given the recent volatility. The
+outlier test must itself be causal, so that the flag on a bar never depends on later bars.
+
+**The math.**
+
+```math
+z_t = \frac{r_t}{\hat\sigma_{t-1}}, \qquad
+\hat\sigma_{t-1} = \frac{\operatorname{median}\left(\lvert r_{t-W} \rvert, \ldots, \lvert r_{t-1} \rvert\right)}{0.6745}, \qquad
+\text{outlier} \iff \lvert z_t \rvert > k
+```
+
+where
+
+- $r_t = \ln C_t - \ln C_{t-1}$ is the close-to-close log return,
+- $W$ = `vol_window` (default 500) bars, with at least `max(20, W // 5)` values,
+- $0.6745$ is the median of $\lvert N(0,1) \rvert$, so $\hat\sigma$ estimates the standard
+  deviation robustly, and $k$ = `outlier_sigma` (default 12),
+- a gap is a hole of at least `gap_bars` (default 3) bar lengths between one bar's
+  `available_at` and the next bar's open.
+
 `quality_report(bars, *, gap_bars=3, outlier_sigma=12.0, vol_window=500, top=10)` returns a
 dict (it is stored per file in `manifest.json`):
 
@@ -878,7 +1323,7 @@ dict (it is stored per file in `manifest.json`):
 | `n_gaps`, `n_weekend_gaps`, `n_daily_break_gaps`, `n_intraweek_gaps`, `largest_intraweek_gaps` | Windows of at least `gap_bars` bar lengths between one bar's end and the next bar's open. `weekend` spans the Friday close to the Sunday reopen; `daily_break` is the roughly one-hour metals break (starting 20:00 to 22:59 UTC, at most 2 h); `intraweek` is everything else (holidays, early closes, feed outages) and is the kind worth inspecting. |
 | `zero_spread_frac`, `spread_quantiles`, `max_spread`, `median_spread_by_year` | Spread statistics. Zero spreads are suspicious for an OTC quote feed. |
 | `flat_bar_frac` | Share of O=H=L=C bars (stale quotes). |
-| `n_return_outliers`, `top_return_outliers` | Bars whose close-to-close log return exceeds `outlier_sigma` times a robust **trailing** volatility (rolling median absolute return / 0.6745 over `vol_window` bars, lagged one bar), so the flag never uses future data. Returns across a gap are marked `after_gap`. |
+| `n_return_outliers`, `top_return_outliers` | Bars whose close-to-close log return exceeds `outlier_sigma` times the robust **trailing** volatility above (lagged one bar), so the flag never uses future data. Returns across a gap are marked `after_gap`. |
 
 ```python
 from aurum.data import make_synthetic_bars, quality_report
@@ -901,6 +1346,10 @@ flat_bar_frac        0.0
 n_return_outliers    2
 {'time': '2020-01-21 19:00:00+00:00', 'log_return': -0.03634837951541492, 'robust_z': -17.419642866385633, 'after_gap': False}
 ```
+
+The real H1 numbers are in [Spreads, coverage and gaps](#spreads-coverage-and-gaps-in-the-real-data).
+The largest flagged H1 move to 2024 is the Sunday-evening reopen of 2021-08-08 22:00 UTC,
+a log return of -0.046 (robust z of -47, marked `after_gap`).
 
 ## Synthetic data
 
@@ -982,14 +1431,17 @@ Any command that takes `--config` can run on synthetic data instead of `data_sto
 aurum config validate -c configs/fast.yaml --set 'data.synthetic={model: trend, n: 5000, seed: 1}'
 ```
 
-The data tests run offline in a few seconds:
+The data tests run offline:
 
 ```bash
 pytest tests/test_data_*.py -m "not network"
 ```
 
 Two tests are marked `network` (they hit the live Dukascopy and macro endpoints and are slow
-because of the throttling); `-m "not network"` deselects them.
+because of the throttling); `-m "not network"` deselects them. On a clone without
+`data_store/` the documentation figures keep their committed PNGs, and
+`tools/figures/build.py --synthetic --out DIR` previews them on a synthetic GBM series (see
+[tools/figures/README.md](../tools/figures/README.md)).
 
 ## Known limitations
 
@@ -1001,7 +1453,10 @@ because of the throttling); `-m "not network"` deselects them.
   Dukascopy volume is bid-side volume in Dukascopy's own units.
 - **Dukascopy is a single ECN feed**, not your broker's. Its spreads are an input to the cost
   model, which applies a multiplier and a floor; your broker's spreads and fills can differ.
-- **MT5 `<SPREAD>` is the minimum spread** in the bar and understates costs.
+- **MT5 `<SPREAD>` is the minimum spread** in the bar and understates costs, and the default
+  `server_tz` is wrong for New-York-close servers in US summer (it now warns).
+- **The head rule is conservative.** A window that starts right after the daily break loses
+  a complete first day unless you pass `complete_from`.
 - **FRED values are latest-vintage.** Publication lag is modelled, revisions are not (that
   would need ALFRED vintages). Yahoo data comes through the unofficial `yfinance` API.
 - **Non-positive macro prints exist.** `CL=F` traded negative in April 2020 and `real10y` was
@@ -1015,10 +1470,14 @@ because of the throttling); `-m "not network"` deselects them.
 
 ## See also
 
+- [Overview](index.md) and [Strategies](strategies.md): where the data ends up.
 - [Features](features.md): what is computed from this data, and the leakage tests.
+- [Models](models.md): volatility and regime models fitted on these bars.
 - [Execution and costs](execution-and-costs.md): how `spread` and financing become costs.
 - [Configuration](configuration.md): the `data:` section.
 - [CLI reference](cli.md): every `aurum` command.
-- [Research](research.md) and [RESULTS.md](RESULTS.md): how the dataset is used and what came
-  out of it.
+- [Research](research.md), [Analytics](analytics.md) and [RESULTS.md](RESULTS.md): how the
+  dataset is used and what came out of it.
+- [Architecture](architecture.md) and [Getting started](getting-started.md): where the data
+  layer sits and how to download the dataset.
 - [SPEC.md §3](../SPEC.md#3-data-layer-aurumdata) is the binding contract for this layer.

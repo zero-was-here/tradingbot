@@ -629,100 +629,138 @@ def _gold_moves(bars: pd.DataFrame, windows: Sequence[int], lots: float, price: 
 
 
 # ============================================================================================
-# plots
+# plots (drawn with aurum.viz.style: one palette, light or dark)
 # ============================================================================================
-_INK, _INK2, _MUTED, _GRID, _SURFACE = "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#fcfcfb"
-_BLUE, _RED = "#2a78d6", "#e34948"
+def _palette(mode: str | None) -> dict[str, Any]:
+    from aurum.viz.style import current_mode, palette
+
+    return palette(current_mode() if mode is None else mode)
 
 
 def _figure(size: tuple[float, float]) -> Any:
+    """A pyplot-free constrained-layout Figure; call inside :func:`aurum.viz.style.use_style`
+    so the surface, fonts and ink come from the active mode."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
-    fig = Figure(figsize=size, dpi=110, facecolor=_SURFACE, layout="constrained")
+    fig = Figure(figsize=size, layout="constrained")
     FigureCanvasAgg(fig)
     return fig
 
 
-def _style(ax: Any) -> None:
-    ax.set_facecolor(_SURFACE)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color("#c3c2b7")
-    ax.tick_params(colors=_MUTED, labelcolor=_INK2, length=3, width=0.6)
-    ax.grid(True, axis="y", color=_GRID, linewidth=0.6)
-    ax.set_axisbelow(True)
+def plot_fan(mc: MonteCarloResult, *, n_sample_paths: int = 12, title: str = "", mode: str | None = None) -> Any:
+    """Fan chart: 5-95% and 25-75% bands, the median, a few sample paths (thin, muted) and
+    the start level. ``mode``: ``"light"`` / ``"dark"`` (``None`` = the active
+    :func:`~aurum.viz.style.use_style` mode, light outside one)."""
+    from aurum.viz.style import add_legend, style_axes, use_style
+
+    pal = _palette(mode)
+    blue = pal["categorical"][0]
+    with use_style(pal["mode"]):
+        fig = _figure((8.0, 4.5))
+        ax = fig.add_subplot(1, 1, 1)
+        style_axes(ax, pal["mode"])
+        f = mc.fan
+        years = f.index.to_numpy(float) / TRADING_DAYS
+        cols = list(f.columns)
+        lo, hi = cols[0], cols[-1]
+        inner = (cols[1], cols[-2]) if len(cols) >= 4 else None
+        rng = np.random.default_rng(mc.seed + 1)
+        if n_sample_paths:
+            for k in rng.choice(mc.paths.shape[0], size=min(n_sample_paths, mc.paths.shape[0]), replace=False):
+                ax.plot(years, mc.paths[k], color=pal["text_muted"], linewidth=0.6, alpha=0.5, zorder=1)
+        ax.fill_between(years, f[lo], f[hi], color=blue, alpha=0.16, linewidth=0, zorder=2,
+                        label=f"{int(lo[1:])}-{int(hi[1:])}% of paths")
+        if inner:
+            ax.fill_between(years, f[inner[0]], f[inner[1]], color=blue, alpha=0.32, linewidth=0, zorder=2,
+                            label=f"{int(inner[0][1:])}-{int(inner[1][1:])}% of paths")
+        mid = "q50" if "q50" in f else cols[len(cols) // 2]
+        ax.plot(years, f[mid], color=blue, zorder=3, label="median")
+        ax.axhline(mc.initial_equity, color=pal["text_secondary"], linewidth=0.9, linestyle="--", zorder=2.5,
+                   label="start")
+        if n_sample_paths:
+            ax.plot([], [], color=pal["text_muted"], linewidth=0.6, label=f"{min(n_sample_paths, mc.n_paths)} sample "
+                    "paths")
+        ax.set_xlim(0.0, float(years[-1]))
+        ax.set_xlabel("years ahead (252 trading days per year)")
+        ax.set_ylabel("equity" + (" (start = 1)" if mc.initial_equity == 1.0 else ""))
+        add_legend(ax, mode=pal["mode"], loc="lower left", ncol=2)
+        ax.set_title(title or (f"Monte Carlo fan chart: {mc.n_paths:,} stationary-bootstrap paths, "
+                               f"mean block {mc.mean_block:.1f} days"))
+        return fig
 
 
-def plot_fan(mc: MonteCarloResult, *, n_sample_paths: int = 12, title: str = "") -> Any:
-    """Fan chart: 5-95% and 25-75% bands, the median, a few sample paths and the start level."""
-    fig = _figure((9.0, 4.2))
-    ax = fig.add_subplot(1, 1, 1)
-    _style(ax)
-    f = mc.fan
-    years = f.index.to_numpy(float) / TRADING_DAYS
-    cols = list(f.columns)
-    lo, hi = cols[0], cols[-1]
-    inner = (cols[1], cols[-2]) if len(cols) >= 4 else None
-    rng = np.random.default_rng(mc.seed + 1)
-    if n_sample_paths:
-        for k in rng.choice(mc.paths.shape[0], size=min(n_sample_paths, mc.paths.shape[0]), replace=False):
-            ax.plot(years, mc.paths[k], color=_MUTED, linewidth=0.5, alpha=0.45)
-    ax.fill_between(years, f[lo], f[hi], color=_BLUE, alpha=0.15, linewidth=0,
-                    label=f"{lo[1:]}-{hi[1:]}% band")
-    if inner:
-        ax.fill_between(years, f[inner[0]], f[inner[1]], color=_BLUE, alpha=0.30, linewidth=0,
-                        label=f"{inner[0][1:]}-{inner[1][1:]}% band")
-    mid = "q50" if "q50" in f else cols[len(cols) // 2]
-    ax.plot(years, f[mid], color=_BLUE, linewidth=2.0, label="median")
-    ax.axhline(mc.initial_equity, color=_INK2, linewidth=0.9, linestyle="--", label="start")
-    ax.set_xlabel("years ahead", color=_INK2)
-    ax.set_ylabel("equity" + (" (start = 1)" if mc.initial_equity == 1.0 else ""), color=_INK2)
-    leg = ax.legend(loc="upper left", frameon=False, fontsize=8.5)
-    for t in leg.get_texts():
-        t.set_color(_INK2)
-    ax.set_title(title or (f"Monte Carlo fan chart: {mc.n_paths:,} stationary-bootstrap paths, "
-                           f"mean block {mc.mean_block:.1f} days"), loc="left", fontsize=10, fontweight="bold",
-                 color=_INK)
-    return fig
+def _quantile_marks(ax: Any, v: np.ndarray, pal: Mapping[str, Any], fmt: str) -> None:
+    for q, ls in ((0.05, ":"), (0.5, "-"), (0.95, ":")):
+        x = float(np.nanquantile(v, q))
+        ax.axvline(x, color=pal["text"], linewidth=1.0, linestyle=ls, zorder=3)
+        ax.annotate(f"q{round(q * 100):02d} {fmt.format(x)}".replace("-", "\N{MINUS SIGN}"), xy=(x, 1.0), xycoords=("data", "axes fraction"),
+                    xytext=(3, -4), textcoords="offset points", fontsize=8, color=pal["text_secondary"],
+                    rotation=90, va="top", ha="left", zorder=4,
+                    bbox={"boxstyle": "square,pad=0.15", "facecolor": pal["surface"], "edgecolor": "none",
+                          "alpha": 0.85})
 
 
-def plot_distributions(mc: MonteCarloResult) -> Any:
-    """Histograms of simulated CAGR, maximum drawdown (with their 5/50/95% quantiles) and the
-    time to recover from the maximum drawdown (recovered paths; the share of paths that did not
-    recover within the horizon is printed)."""
-    fig = _figure((13.0, 3.6))
+def plot_distributions(mc: MonteCarloResult, *, mode: str | None = None) -> Any:
+    """Four panels: histograms of the simulated CAGR and maximum drawdown (with their
+    5/50/95% quantiles), the time to recover from the maximum drawdown (recovered paths; the
+    share of paths that did not recover within the horizon is printed) and the exceedance
+    curves ``P(max drawdown deeper than x)`` (from the running peak) and ``P(equity ever <=
+    (1 - x) * start)`` (risk of ruin, from the start). ``mode`` as in :func:`plot_fan`."""
+    from aurum.viz.style import add_legend, percent_axis, style_axes, use_style
+
+    pal = _palette(mode)
+    blue = pal["categorical"][0]
     m = mc.metrics
-    for i, (col, label, color) in enumerate((("cagr", "CAGR over the horizon", _BLUE),
-                                             ("max_drawdown", "maximum drawdown", _RED))):
-        ax = fig.add_subplot(1, 3, i + 1)
-        _style(ax)
-        v = m[col].to_numpy(float) * 100.0
-        ax.hist(v[np.isfinite(v)], bins=60, color=color, alpha=0.75, linewidth=0)
-        for q, ls in ((0.05, ":"), (0.5, "-"), (0.95, ":")):
-            x = float(np.nanquantile(v, q))
-            ax.axvline(x, color=_INK, linewidth=1.0, linestyle=ls)
-            ax.annotate(f"q{round(q * 100):02d} {x:.1f}%", xy=(x, 1.0), xycoords=("data", "axes fraction"),
-                        xytext=(3, -4), textcoords="offset points", fontsize=8, color=_INK2, rotation=90,
-                        va="top", ha="left",
-                        bbox={"boxstyle": "square,pad=0.15", "facecolor": _SURFACE, "edgecolor": "none",
-                              "alpha": 0.85})
-        ax.set_xlabel(f"{label} (%)", color=_INK2)
-        ax.set_title(label, loc="left", fontsize=10, fontweight="bold", color=_INK)
-    ax = fig.add_subplot(1, 3, 3)
-    _style(ax)
-    rec = mc.recovery()
-    ttr = m["time_to_recover_days"].to_numpy(float)
-    ttr = ttr[np.isfinite(ttr)]
-    if ttr.size:
-        ax.hist(ttr, bins=min(60, max(5, int(ttr.max()) // 5 + 1)), color="#1f9e89", alpha=0.8, linewidth=0)
-        med = float(np.median(ttr))
-        ax.axvline(med, color=_INK, linewidth=1.0)
-        ax.annotate(f"median {med:.0f} d", xy=(med, 1.0), xycoords=("data", "axes fraction"), xytext=(3, -4),
-                    textcoords="offset points", fontsize=8, color=_INK2, rotation=90, va="top", ha="left")
-    ax.text(0.98, 0.95, f"not recovered within\nthe horizon: {rec['p_not_recovered']:.0%}", transform=ax.transAxes,
-            ha="right", va="top", fontsize=8.5, color=_INK2)
-    ax.set_xlabel("trading days from the trough to a new high", color=_INK2)
-    ax.set_title("time to recover from the max drawdown", loc="left", fontsize=10, fontweight="bold", color=_INK)
-    return fig
+    with use_style(pal["mode"]):
+        fig = _figure((8.0, 6.0))
+        axes = fig.subplots(2, 2)
+        for ax, (col, label, xlabel) in zip(axes[0], (
+                ("cagr", "CAGR over the horizon", "compound annual growth rate"),
+                ("max_drawdown", "Maximum drawdown", "deepest fall from the running peak")), strict=True):
+            style_axes(ax, pal["mode"])
+            v = m[col].to_numpy(float)
+            v = v[np.isfinite(v)]
+            ax.hist(v, bins=60, color=blue, alpha=0.85, linewidth=0)
+            _quantile_marks(ax, v, pal, "{:.1%}")
+            percent_axis(ax, "x")
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel("paths")
+            ax.set_title(label)
+        ax = axes[1, 0]
+        style_axes(ax, pal["mode"])
+        rec = mc.recovery()
+        ttr = m["time_to_recover_days"].to_numpy(float)
+        ttr = ttr[np.isfinite(ttr)]
+        if ttr.size:
+            ax.hist(ttr, bins=min(60, max(5, int(ttr.max()) // 5 + 1)), color=blue, alpha=0.85, linewidth=0)
+            med = float(np.median(ttr))
+            ax.axvline(med, color=pal["text"], linewidth=1.0, zorder=3)
+            ax.annotate(f"median {med:.0f} d", xy=(med, 1.0), xycoords=("data", "axes fraction"), xytext=(3, -4),
+                        textcoords="offset points", fontsize=8, color=pal["text_secondary"], rotation=90, va="top",
+                        ha="left", bbox={"boxstyle": "square,pad=0.15", "facecolor": pal["surface"],
+                                         "edgecolor": "none", "alpha": 0.85})
+        ax.text(0.98, 0.95, f"not recovered within\nthe horizon: {rec['p_not_recovered']:.0%}",
+                transform=ax.transAxes, ha="right", va="top", fontsize=8.5, color=pal["text_secondary"])
+        ax.set_xlabel("trading days from the trough to a new high")
+        ax.set_ylabel("recovered paths")
+        ax.set_title("Time to recover from the max drawdown")
+        ax = axes[1, 1]
+        style_axes(ax, pal["mode"])
+        dd = -m["max_drawdown"].to_numpy(float)
+        worst = float(np.nanmax(dd)) if dd.size else 0.0
+        xs = np.linspace(0.0, max(0.05, min(1.0, worst * 1.05)), 200)
+        p_dd = np.array([(dd > x).mean() for x in xs])
+        lo = mc.paths.min(axis=1) / mc.paths[:, 0]
+        p_ruin = np.array([(lo <= 1.0 - x).mean() for x in xs])
+        ax.plot(xs, p_dd, color=blue, label="max drawdown deeper than x (from the peak)")
+        ax.plot(xs, p_ruin, color=pal["categorical"][1], label="equity ever below (1 - x) start (ruin)")
+        percent_axis(ax, "x")
+        percent_axis(ax, "y")
+        ax.set_ylim(0.0, 1.02)
+        ax.set_xlim(0.0, float(xs[-1]))
+        add_legend(ax, mode=pal["mode"], loc="upper right", fontsize=8)
+        ax.set_xlabel("threshold x (% of equity)")
+        ax.set_ylabel("probability of exceeding x")
+        ax.set_title("Drawdown and ruin exceedance")
+        return fig

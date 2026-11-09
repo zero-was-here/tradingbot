@@ -6,8 +6,11 @@ coding rules the code relies on: [SPEC.md](../SPEC.md) principles, point-in-time
 pandas 3 compatibility, logging, determinism and the registries. It then walks through
 adding a strategy, a feature group or a broker adapter, including the tests each one needs.
 It ends with versioning, the status of `legacy/` and `mt5_ea/`, and how to report a
-security issue. The rule behind all of it: a change that could leak future information or
-touch the money path has to get past the leakage, random-walk and live-safety harnesses.
+security issue. A section on [figures and visual style](#figures-and-visual-style) explains
+how every chart in these pages is drawn from real data by `tools/figures` with
+`aurum.viz.style`, and how to add one. The rule behind all of it: a change that could leak
+future information or touch the money path has to get past the leakage, random-walk and
+live-safety harnesses.
 
 **On this page**
 
@@ -16,6 +19,7 @@ touch the money path has to get past the leakage, random-walk and live-safety ha
 - [Running the tests](#running-the-tests)
 - [Lint](#lint)
 - [Documentation](#documentation)
+- [Figures and visual style](#figures-and-visual-style)
 - [Continuous integration](#continuous-integration)
 - [Coding conventions](#coding-conventions)
 - [Adding a strategy](#adding-a-strategy)
@@ -30,26 +34,36 @@ touch the money path has to get past the leakage, random-walk and live-safety ha
 ## Repository layout
 
 ```text
-aurum/                  the package (about 35k lines); layer diagram in architecture.md
+aurum/                  the package (about 44k lines); layer diagram in architecture.md
   core/                 timeframes, instrument spec, shared types and protocols, typed YAML config
   data/                 schema, point-in-time joins, resampling, Dukascopy, MT5/CSV loaders,
                         macro, calendar, synthetic data, parquet store
   features/             12 causal feature groups + FeaturePipeline (scaler fitted on TRAIN only)
   models/               EWMA / GARCH / HAR volatility, Gaussian HMM
   labels/               triple-barrier labels, uniqueness weights
-  strategies/           Strategy base class, registry, 15 strategies
+  strategies/           Strategy base class, registry, 17 strategies (allocation.py and
+                        regime.py are new in v2.1)
   portfolio/            forecast combiner, sizers
   risk/                 risk manager (limits, blackouts, persistent kill switch), VaR/ES
   execution/            cost + financing model, the one ExecutionSimulator
   backtest/             engine, metrics, result container
-  research/             splits, statistics (PSR/DSR/PBO), walk-forward, tearsheet
+  research/             splits, statistics (PSR/DSR/PBO), walk-forward, tearsheet, and the
+                        v2.1 analytics: sweep.py, montecarlo.py, attribution.py
   rl/                   Gymnasium env on the shared simulator, PPO training
   agents/               LLM trading desk (Claude), scripted fake client for tests
   live/                 Broker protocol, paper + MT5 brokers, OMS, runner, monitor, state files
+  viz/                  style.py (one palette for matplotlib and Plotly), dashboard.py, cli.py
   cli.py, __main__.py   the `aurum` command (cli.md)
-tests/                  ~1,450 tests, one or more test_<area>_*.py per module; conftest.py guards
-configs/                default, trend_core, fast, live_paper, desk_overlay (configuration.md)
+  cli_ext.py            sweep, stress, explain and dashboard, registered into the parser
+tests/                  1,839 tests in 87 files, one or more test_<area>_*.py per module
+                        (test_v21_<area>_*.py for v2.1); conftest.py guards
+configs/                default, trend_core, fast, live_paper, desk_overlay, and the exploratory
+                        d1_trend and managed_gold (configuration.md)
 docs/                   this documentation, RESEARCH_PROTOCOL.md, RESULTS.md, INTERFACES.md
+  _assets/              figures/ (rendered PNGs), extra.css, mathjax.js
+  _hooks/               mkdocs_hooks.py: GitHub-first Markdown -> site (links, alerts, figures)
+tools/figures/          build.py and fig_<page>.py: the documentation figures (README.md inside)
+mkdocs.yml              the documentation site
 .github/workflows/ci.yml
 SPEC.md                 binding engineering contract between modules
 SECURITY.md             secrets, trading safety controls, vulnerability reporting
@@ -88,9 +102,10 @@ pip install -e ".[all]"            # also data, rl and agents (what the all-extr
 | `rl` | torch, gymnasium, stable-baselines3 | `aurum rl train`, the `rl_ppo` strategy |
 | `agents` | anthropic | live Claude calls (`desk run`, `desk replay` without `--fake`) |
 | `mt5` | MetaTrader5 (Windows only) | the MT5 broker adapter |
+| `viz` | plotly ≥ 5.20 | `aurum dashboard` and its tests (`aurum.viz.style` and the docs figures need only matplotlib) |
 | `dev` | pytest ≥ 8, ruff ≥ 0.13 | tests and lint |
 | `docs` | mkdocs ≥ 1.6, mkdocs-material ≥ 9.5 | building these pages as a site (see [Documentation](#documentation)) |
-| `all` | `data` + `rl` + `agents` + `dev` | the full suite (not `mt5` or `docs`) |
+| `all` | `data` + `rl` + `agents` + `dev` + `viz` | the full suite (not `mt5` or `docs`) |
 
 On Linux, the default torch wheel pulls in CUDA libraries. The all-extras CI job installs
 the CPU wheel first:
@@ -122,13 +137,20 @@ python -m pytest -m network                      # the two live-endpoint tests (
 python -m pytest tests/test_strategies_leakage.py -k tsmom   # one area while iterating
 ```
 
-The suite collects 1,458 tests. Timings measured for this page on a 10-core Apple Silicon
-Mac, with other jobs running at the same time. Expect different numbers on your machine.
+The suite collects 1,839 tests in 87 files (`pytest --collect-only -q`); `-m "not network
+and not slow"` selects 1,832 of them and deselects the 2 network and 5 slow tests. v2.1 added
+381 tests, most of them in the `tests/test_v21_<area>_*.py` files named after the area they
+cover (`analytics`, `config_cli`, `core_fixes`, `live`, `strategies`, `viz`, plus
+`test_v21_integration.py`), and `tests/test_docs_assets.py` for the documentation. The timings
+below were measured on a 10-core Apple Silicon Mac with all extras installed: the first row on
+the v2.1 tree (2026-11-09, `-p no:cacheprovider`), the others on the v2.0 tree (1,458 tests),
+with other jobs running at the same time. Expect different numbers on your machine.
 
 | Selection | Result | Wall time |
 |---|---|---|
-| `-m "not network and not slow"` (all extras installed) | 1,451 passed, 7 deselected | ~14 min |
-| `-m slow` | 4 passed, 1 skipped (the real-data audit) | ~3 min 45 s |
+| `-m "not network and not slow"` (v2.1 tree) | 1,832 passed, 7 deselected | ~6 min |
+| `-m "not network and not slow"` (v2.0 tree) | 1,451 passed, 7 deselected | ~14 min |
+| `-m slow` (v2.0 tree) | 4 passed, 1 skipped (the real-data audit) | ~3 min 45 s |
 | `-m network` | not run here (the INTERFACES notes put them at about 25 s, throttling included) | |
 
 The heaviest pieces are the setup of the end-to-end leakage audit (about 2.5 minutes), the
@@ -158,9 +180,9 @@ Opt-in environment variables:
   fails even if the library caught the error and fell back silently. Loopback and Unix
   sockets still work, so local servers and process pools are fine.
 - **Headless plotting**: `MPLBACKEND=Agg` unless you set a backend.
-- **Optional dependencies** (torch, gymnasium, stable-baselines3, anthropic, yfinance) are
-  handled per test with `pytest.importorskip`. The core-only install skips those tests
-  instead of failing.
+- **Optional dependencies** (torch, gymnasium, stable-baselines3, anthropic, yfinance,
+  plotly) are handled per test with `pytest.importorskip`. The core-only install skips those
+  tests instead of failing.
 
 ### Writing tests
 
@@ -183,6 +205,7 @@ Opt-in environment variables:
 ```bash
 ruff check aurum tests          # exactly what CI runs
 ruff check aurum tests --fix    # apply the safe autofixes
+ruff check tools                # the documentation figure modules (not run by CI)
 ```
 
 Settings (`pyproject.toml`): line length 110, target `py310`, rules `E`, `F`, `W`, `I`
@@ -204,17 +227,266 @@ mkdocs build --strict --site-dir /tmp/aurum-site   # what to run before committi
 
 The built site is not committed. Links from a page to files outside `docs/` (the source
 code, `SPEC.md`, `SECURITY.md`, the configs) are written as relative paths so they work on
-GitHub; a small build hook, `docs/_hooks/mkdocs_hooks.py`, rewrites them to GitHub URLs in
-the site and renders GitHub alert blocks (`> [!WARNING]`) as admonitions. Conventions for
-changes:
+GitHub. A build hook, `docs/_hooks/mkdocs_hooks.py`, adapts the GitHub-first Markdown for the
+site without changing the files: it rewrites those links to GitHub URLs, renders GitHub alert
+blocks (`> [!WARNING]`) as admonitions and `<details>` blocks as collapsible sections, turns
+each theme-aware `<picture>` figure into a Material figure that follows the light/dark toggle,
+and escapes currency dollars so they are not typeset as math. Conventions for changes:
 
 - Document only what the code does. Take flags from `aurum <command> --help` and defaults
   from the dataclasses and `default_params()`, not from memory.
 - Every code block fenced as `python` must run as shown against the current code, offline
   (use `aurum.data.synthetic` for data), and the `text` block after it must be its real
   output. Signatures that are not runnable go in `text` blocks.
-- Do not restate research numbers outside [RESULTS.md](RESULTS.md): link to it.
-- Add a new page to the `nav` in `mkdocs.yml` and to the table in [index.md](index.md).
+- Do not restate research numbers outside [RESULTS.md](RESULTS.md): link to it. (A figure
+  or worked example may show one decision or one run's output, with its source in the
+  caption.)
+- Equations go in ` ```math ` fences (LaTeX), with every symbol defined in a "where" list
+  below; inline `$...$` only for short symbols. Never write a currency amount with a dollar
+  sign: write `USD 5` or `105k USD`. Diagrams are ` ```mermaid ` fences without style or
+  colour directives, so they follow the reader's theme.
+  [tools/figures/README.md](../tools/figures/README.md) has the full writer guide.
+- Charts follow [Figures and visual style](#figures-and-visual-style).
+- Add a new page to the `nav` in `mkdocs.yml` and to the cards in [index.md](index.md).
+
+Before committing documentation changes, run the same checks the reviewers will:
+
+```bash
+python tools/figures/build.py --check          # PNGs, embeds and orphans
+python -m pytest tests/test_docs_assets.py -q  # the same checks plus every relative link and anchor
+mkdocs build --strict --site-dir /tmp/aurum-site
+```
+
+## Figures and visual style
+
+Every chart in these pages is drawn by the real aurum code, from real data where the caption
+says so, by a Python function in `tools/figures/`. Each is rendered twice, once per theme, and
+embedded in a block that shows the light image on a light page and the dark image on a dark
+one, on GitHub and on the site. The same style module also draws the tearsheet charts, the
+PNGs that `aurum stress`, `aurum explain` and `aurum sweep` write, and (through
+`plotly_template`) the interactive dashboard, so a chart reads the same everywhere. The
+complete writer guide, with a two-figure module template, is
+[tools/figures/README.md](../tools/figures/README.md); this section is the summary a
+contributor needs.
+
+### How tools/figures works
+
+**Intuition.** A documentation chart is code, not a picture: it is reviewed, re-rendered when
+the code or the data changes, and checked by tests, like everything else. A figure is a
+function `draw(pal)` registered with a decorator. `build.py` finds it, renders it in both
+themes and writes two PNGs; a checker makes sure every PNG is embedded correctly and nothing is
+orphaned.
+
+```mermaid
+flowchart LR
+    M["tools/figures/fig_page.py<br/>@register draw(pal)"] --> B["build.py imports it<br/>under the import guard"]
+    B --> R{"needs present?"}
+    R -- no --> S["skip, keep the<br/>committed PNGs"]
+    R -- yes --> D["draw(pal) in light,<br/>then dark (seed 7)"]
+    D --> P["docs/_assets/figures/<br/>page/name-light.png, -dark.png"]
+    P --> E["picture embed in docs/page.md"]
+```
+
+```mermaid
+flowchart LR
+    E["picture embed"] --> G["GitHub: the reader's OS theme<br/>picks the image"]
+    E --> H["site: mkdocs_hooks.py makes a figure<br/>with light and dark images"]
+    H --> T["Material's light/dark toggle<br/>shows one of them"]
+```
+
+| File | Role |
+|---|---|
+| [tools/figures/build.py](../tools/figures/build.py) | Discovers `fig_*.py`, renders (`--only PAGE`, `--name NAME`, `--jobs N`), lists (`--list`) and checks (`--check`). Exit 0 OK, 1 a render or check failed, 2 bad arguments. |
+| [tools/figures/_common.py](../tools/figures/_common.py) | The registry (`register`), the data loaders cut at 2024-12-31 (`bars`, `macro`, `market_data`, `run_table`, `run_json`), source labels for captions, and layout helpers (`panels`, `source_note`, `ink_on`, `signed`, the `FIGSIZE_*` constants) |
+| [tools/figures/_docscan.py](../tools/figures/_docscan.py) | Parses the Markdown for images, links, heading anchors and `<picture>` embeds (shared by `--check` and the tests) |
+| `tools/figures/fig_<page>.py` | One module per page, or one module for a group of pages such as [fig_platform.py](../tools/figures/fig_platform.py) (index, architecture, development) |
+| [tests/test_docs_assets.py](../tests/test_docs_assets.py) | The same checks as `--check`, plus every relative link and `#anchor` in `docs/*.md` and `README.md`; it needs no `data_store/` |
+| [docs/_hooks/mkdocs_hooks.py](../docs/_hooks/mkdocs_hooks.py), `docs/_assets/extra.css` | Turn each embed into a Material figure with a caption on the site |
+
+The rules `build.py` and the loaders enforce:
+
+| Rule | Why |
+|---|---|
+| **Cutoff 2024-12-31.** Every loader keeps only rows with `available_at` at or before 2025-01-01 00:00 UTC; `bars(..., end=...)` past it, or any `runs/.../holdout/...` path, raises `FigureDataError`. | 2025 onward is the research holdout. A figure must not become a second, unrecorded look at it. |
+| **No data at import time.** `build.py` imports modules under a guard that raises if `bars()`, `macro()` or `run_dir()` is called. | Discovery, `--list` and the tests stay fast and work on a clone without data. |
+| **Declare `needs`.** `needs=("data_store",)` for real bars or macro, `needs=("runs/<name>",)` per run directory. A missing entry skips the figure and keeps the committed PNGs. | `data_store/` and `runs/` are gitignored. A figure that silently fell back to synthetic data under a real caption would lie, so an undeclared fallback is an error. |
+| **Deterministic.** `random` and `numpy.random` are reseeded with 7 before each mode; PNG metadata is pinned, and a byte-identical render is not rewritten (`[same]`). | Re-rendering an unchanged figure produces no diff. Bytes depend on the local matplotlib and fonts, so commit renders made on one machine. |
+| **Under about 30 s per figure.** Never run a walk-forward or backtest inside a figure: read the run outputs. | Re-rendering stays quick enough to do on every change; `build.py` prints a note above 30 s. |
+| **Never commit synthetic renders over real ones.** `--synthetic` forces the synthetic fallback and only works with `--out DIR` outside `docs/_assets/figures`. | Preview a fresh clone without overwriting the real PNGs. |
+
+```bash
+python tools/figures/build.py --list --only index architecture development
+```
+
+```text
+figure                                           pngs     needs                                        doc
+architecture/decision-chain                      both     data_store, runs/protocol/trend_core_selection One real decision through the stack: 7 forecasts -> combiner -> sizer -> band -> risk -> fill.
+architecture/decision-timeline                   both     data_store, runs/protocol/trend_core_selection Decide at the close of bar t, fill at the open of bar t+1 (real H1 bars and run decisions).
+development/style-helpers                        both     -                                            Synthetic illustration of the aurum.viz.style helpers in a 2x2 grid.
+development/style-palette                        both     -                                            The aurum.viz.style palette for one mode: categorical, sequential, diverging and status.
+index/gold-research-timeline                     both     data_store, runs/protocol/trend_core_selection Gold 2012-2024 (log scale) with the 18 walk-forward folds and the untouched 2025+ holdout.
+
+5 figures in 1 modules
+```
+
+### aurum.viz.style: one palette, two modes
+
+**Intuition.** Good charts are mostly the absence of noise: a few colours used for identity,
+thin lines, quiet gridlines, text in ink colours, and the same colour meaning the same thing in
+every chart. [aurum/viz/style.py](../aurum/viz/style.py) encodes those choices once, for
+matplotlib (`rc_params`, `use_style`) and for Plotly (`plotly_template`). The dark mode is not
+an inverted light mode: each hue is stepped for the dark surface, and the sequential ramp runs
+dark to light so that values near zero recede into the background. Both figures below are
+drawn by [fig_platform.py](../tools/figures/fig_platform.py).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/development/style-palette-dark.png">
+  <img src="_assets/figures/development/style-palette-light.png" alt="Four rows of colour swatches with hex codes: eight categorical colours in fixed order from blue to red, a thirteen-step blue sequential ramp, a seven-step diverging scale from dark red through a gray midpoint to dark blue, and four status colours labelled good, warning, serious and critical">
+</picture>
+
+*The palette as `palette(mode)` returns it. Compare the light and dark variants of this image: the categorical hues shift for the dark surface, the sequential ramp reverses, and the diverging scale puts its strongest colours at the ends in both. Data: none (the colour values in `aurum.viz.style`).*
+
+The rules, all from the module docstring:
+
+- **Lines are 2 px** (`LINE_WIDTH_PT` 1.5 pt; matplotlib sizes are points and 1 CSS px is
+  0.75 pt) with round caps; markers are 8 px with a 2 px ring in the surface colour.
+- **Recessive chrome:** hairline (0.75 pt) y-grid only, no top or right spine, muted axis
+  lines, no tick marks on the value axis. Titles are left-aligned, 12 pt.
+- **Never two y-axes.** Two measures of different scale go in stacked panels (`panels()` in
+  `_common`) or are indexed to a common base.
+- **A legend only for 2 or more series** (`add_legend` draws nothing otherwise), and direct
+  end labels (`label_line_end`) are preferred for up to 4 series.
+- **Text wears ink colours** (`text`, `text_secondary`, `text_muted`), never a series colour.
+- **Categorical colours in fixed order, never cycled:** `categorical(9)` raises. Fold the tail
+  into "Other" or use small multiples. In light mode the aqua, yellow and magenta slots are
+  below 3:1 contrast on the surface, so give those series a direct label.
+- **Sequential is one hue; diverging is red (negative) and blue (positive) around a gray
+  midpoint**, with symmetric limits (`vmin = -vmax`). Heatmaps call `style_axes(ax, grid=None)`.
+- **Status colours are reserved** for good, warning, serious and critical, always with a word.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/development/style-helpers-dark.png">
+  <img src="_assets/figures/development/style-helpers-light.png" alt="Four small panels on synthetic data: three equity lines with direct end labels instead of a legend; daily return bars in blue and red around a zero line with a percent axis and a shaded holdout band; a three by four heatmap on the diverging scale with signed numbers in each cell; and blue sequential bars with an orange line and a two-entry legend">
+</picture>
+
+*What each helper draws: `label_line_end` (top left), `zero_line`, `percent_axis` and `shade_span` (top right), `diverging_cmap` with symmetric limits and `ink_on` cell text (bottom left), and a `sequential(5)` ramp with `add_legend` for two series (bottom right). Data: synthetic illustration (numpy seed 11), not market data.*
+
+| Name | Signature (defaults) | What it does |
+|---|---|---|
+| `palette` / `get_palette` | `palette(mode=None)` | The colour roles of a mode as a plain dict (`mode surface page text text_secondary text_muted grid axis border delta_good categorical sequential diverging diverging_mid status`) or a frozen `Palette`. `mode=None` means the active `use_style` mode. |
+| `use_style` | `use_style(mode="light")` | Context manager: applies `rc_params(mode)` with `matplotlib.rc_context` and yields `palette(mode)`. Nests and restores the previous settings. |
+| `save_figure` | `save_figure(fig_fn, path_stem, modes=("light", "dark"), dpi=150, *, formats=("png",), **savefig_kw)` | Calls `fig_fn(pal)` (or `fig_fn()`) once per mode inside `use_style` and writes `<stem>-<mode>.<fmt>`. `fig_fn` may return a Figure, an Axes, an array of Axes or `None` (the current pyplot figure). Returns the written paths. |
+| `figure` | `figure(nrows=1, ncols=1, *, figsize=None, sharex=False, sharey=False, squeeze=True, **subplot_kw)` | A styled `Figure` and its axes, without pyplot (safe on headless servers) |
+| `style_axes` | `style_axes(ax, mode=None, *, grid="y")` | Re-applies the chrome to an axes; `grid` is `"y"`, `"x"`, `"both"` or `None` |
+| `add_legend` | `add_legend(ax, *, mode=None, min_series=2, **kwargs)` | A frameless legend in ink colours, only when at least `min_series` labelled artists exist |
+| `label_line_end` | `label_line_end(ax, line, text=None, *, mode=None, dx_points=6.0, fmt="{:,.2f}", dot=True)` | Direct label at the right end of a line, in ink, with a coloured end-dot |
+| `zero_line` | `zero_line(ax, *, mode=None, axis="y")` | A hairline baseline at 0 in the axis colour |
+| `shade_span` | `shade_span(ax, start, end, label=None, *, mode=None, axis="x", alpha=1.0)` | A recessive band (holdout, regime, fold) in the gridline colour, with an optional muted label |
+| `percent_axis` | `percent_axis(ax, axis="y", *, decimals=0, xmax=1.0)` | Formats an axis as percentages (`xmax` is the value meaning 100%) |
+| `categorical`, `series_color` | `categorical(n, mode=None)`, `series_color(i, mode=None)` | The first `n` (at most 8) categorical colours / slot `i` (0 to 7) |
+| `sequential`, `diverging` | `sequential(n=None, mode=None)`, `diverging(n=7, mode=None)` | `n` steps of the blue ramp, near zero first; `n` (odd) colours from red through gray to blue |
+| `sequential_cmap`, `diverging_cmap` | `sequential_cmap(mode=None)`, `diverging_cmap(mode=None)` | The matching matplotlib colormaps (`aurum_sequential_<mode>`, `aurum_diverging_<mode>`) |
+| `plotly_template`, `rc_params` | `plotly_template(mode=None)`, `rc_params(mode=None)` | The same style as a Plotly layout template (used by `aurum.viz.dashboard`) and as matplotlib `rcParams` |
+
+In code (writes two PNGs to a temporary directory):
+
+```python
+import tempfile
+from pathlib import Path
+
+import numpy as np
+
+from aurum.viz.style import add_legend, categorical, palette, save_figure, zero_line
+from aurum.viz.style import figure as styled_figure
+
+
+def draw(pal):                                   # pal = palette(mode) of the mode being rendered
+    rng = np.random.default_rng(0)
+    fig, ax = styled_figure(figsize=(8, 4.5))
+    for i, name in enumerate(["tsmom", "ema_cross"]):
+        ax.plot(np.cumsum(rng.normal(0, 1, 200)), color=pal["categorical"][i], label=name)
+    zero_line(ax)
+    add_legend(ax)                               # drawn: there are 2 labelled series
+    ax.set_title("Two series")
+    ax.set_xlabel("bars")
+    ax.set_ylabel("cumulative return (synthetic)")
+    return fig
+
+
+paths = save_figure(draw, Path(tempfile.mkdtemp()) / "example")
+print([p.name for p in paths])
+print(palette("light")["categorical"][:3], palette("dark")["categorical"][:3])
+print(categorical(2, "dark"))
+try:
+    categorical(9)
+except ValueError as exc:
+    print("ValueError:", str(exc)[:60], "...")
+```
+
+```text
+['example-light.png', 'example-dark.png']
+['#2a78d6', '#eb6834', '#1baf7a'] ['#3987e5', '#d95926', '#199e70']
+['#3987e5', '#d95926']
+ValueError: 9 categorical series requested; the palette has 8 fixed slot ...
+```
+
+**Pitfalls and design choices.**
+
+- *Create the figure inside `draw`.* rcParams are read when artists are created, so a figure
+  built outside `use_style` (or reused across modes) keeps the wrong colours.
+- *Library plots take a mode.* `plot_fan`, `plot_distributions`, `plot_sweep` (and
+  `SweepResult.plot`), `plot_waterfall` and `plot_attribution` draw with this module and take
+  `mode="light"` or `"dark"` (default: the active `use_style` mode). In a docs figure, call
+  them inside `draw(pal)` or redraw from the data they return; never copy a PNG from `runs/`
+  into `docs/_assets/figures/`, because `--check` refuses files no registered figure
+  produces.
+- *Colour is not the only channel.* Every categorical series also gets a label or a legend
+  entry, and status colours always come with a word, so the charts survive colour-vision
+  deficiency and greyscale printing.
+
+### Adding a figure
+
+1. **Pick the page and the module.** Figures for `docs/<page>.md` live in
+   `docs/_assets/figures/<page-slug>/`, where the slug is the file stem in lowercase with `_`
+   replaced by `-`. Copy [tools/figures/_template.py](../tools/figures/_template.py) to
+   `tools/figures/fig_<page>.py` (the template is not discovered because its name does not
+   start with `fig_`) and set `PAGE`.
+2. **Write `draw(pal)`.** Load data inside it with the `_common` loaders, create the figure
+   with `aurum.viz.style.figure()` or `_common.panels()`, follow the rules above, give it a
+   title and axis labels with units, add `source_note(fig, "Data: " + source_label(...), pal)`
+   and return the figure.
+3. **Register it** with `@register(PAGE, "my-figure", needs=(...))`. Names are lowercase
+   slugs. Do not call the decorator `figure`: that is the style helper.
+4. **Render and look.** `python tools/figures/build.py --only <page>` prints one line per
+   figure (`[ok  ]` written, `[same]` unchanged, `[skip]` needs missing, `[FAIL]`). Open both
+   PNGs and fix overlapping or clipped labels, unreadable legends, empty panels and wrong
+   scales before you embed them.
+5. **Embed it** with the canonical block: one blank line before `<picture>`, the four lines
+   below, one blank line, then a one-line italic caption that says what to look at and ends
+   with `Data: <source>, <period>.` Alt text is plain words, without math or Markdown. Link
+   the code that draws it in the paragraph *before* the figure: the site hook copies the
+   caption into a `<figcaption>` without rewriting links that leave `docs/`, so a
+   `../tools/...` link inside a caption breaks `mkdocs build --strict`.
+
+   ```html
+   The figure below ([figure code](../tools/figures/fig_<page>.py)) shows ...
+
+   <picture>
+     <source media="(prefers-color-scheme: dark)" srcset="_assets/figures/<page>/my-figure-dark.png">
+     <img src="_assets/figures/<page>/my-figure-light.png" alt="What is drawn, in plain words">
+   </picture>
+
+   *What to look at. Data: XAUUSD H1, Dukascopy bid/ask mid, 2012-2024.*
+   ```
+
+6. **Check** with `python tools/figures/build.py --check --only <page>`,
+   `python -m pytest tests/test_docs_assets.py -q`, `mkdocs build --strict` and
+   `ruff check tools`. `--check` fails on a registered figure without both PNGs, a missing
+   image, a malformed `<picture>` block, a PNG that no registered figure produces, and a PNG
+   no page references.
+
+Images that cannot be drawn (a screenshot) go in `docs/_assets/static/` and are embedded the
+same way; everything under `docs/_assets/figures/` must come from a registered figure.
 
 ## Continuous integration
 
@@ -560,11 +832,17 @@ See [live-trading.md](live-trading.md) for the runtime side.
 
 ## Other extension points
 
-- **CLI commands**: add a `cmd_*` function and a subparser in `aurum/cli.py`. Raise
-  `CLIError(message, code)` with one of the `EXIT_*` codes for user-facing failures. Import
-  heavy or optional modules inside the command. Add a test in `tests/test_cli.py` that calls
-  `main([...])` on the synthetic data store fixture, and document the command in
-  [cli.md](cli.md).
+- **CLI commands**: add a `cmd_*` function and a subparser in `aurum/cli.py`, or, for a
+  command that should stay outside the core file, an `_add_<name>(subparsers)` function in
+  `aurum/cli_ext.py` that `register_all(subparsers)` calls (that is how `sweep`, `stress`,
+  `explain` and, through `aurum.viz.cli.register`, `dashboard` are added). `register_all`
+  refuses to replace a core command, and if it raises, the added parsers are removed and a
+  warning `aurum CLI extensions (aurum.cli_ext) failed to load and were skipped` is logged, so
+  the core CLI keeps working. A subcommand without `set_defaults(func=...)` exits 2 ("has
+  nothing to run"). Raise `CLIError(message, code)` with one of the `EXIT_*` codes for
+  user-facing failures. Import heavy or optional modules inside the command. Add a test that
+  calls `main([...])` on the synthetic data store fixture (`tests/test_cli.py`,
+  `tests/test_v21_analytics_cli.py`), and document the command in [cli.md](cli.md).
 - **Desk agents and tools**: see [llm-desk.md](llm-desk.md). Tests run against
   `FakeAnthropicClient` (`tests/test_agents_*.py`). The policy and the risk bounds are
   covered adversarially in `tests/test_final_live_safety.py`.
@@ -591,13 +869,15 @@ can explain why the check was vacuous. Weakening a comparison is not.
 
 ## Versioning and releases
 
-- The package version is `version = "2.0.0"` in `pyproject.toml`. `aurum/__init__.py` is
-  empty and has no `__version__`. Read the version with
-  `importlib.metadata.version("aurum")`, which is also what run provenance and artifact
-  manifests record.
+- The package version is `version = "2.0.0"` in `pyproject.toml`; the v2.1 changes are
+  listed under an unreleased `[2.1.0]` heading in [CHANGELOG.md](../CHANGELOG.md).
+  `aurum.__version__` resolves it on first import: `importlib.metadata.version("aurum")` for
+  an installed package, else the `[project] version` of the adjacent `pyproject.toml`, else
+  `"0+unknown"`. `aurum --version` prints it (`aurum 2.0.0`). Run provenance and artifact
+  manifests record `importlib.metadata.version("aurum")`.
 - There is no automated release process: no tags and no publishing workflow. Changes are
-  recorded by hand in [CHANGELOG.md](../CHANGELOG.md). The branch `aurum-v2` holds the v2 rebuild, and `main` is the default branch
-  of the public repository. Results are tied to commits rather than to version numbers.
+  recorded by hand in [CHANGELOG.md](../CHANGELOG.md). `main` is the default branch of the public repository and holds
+  Aurum v2 (the `aurum-v2` branch it was developed on is merged into it). Results are tied to commits rather than to version numbers.
   [RESULTS.md](RESULTS.md) quotes the git SHA and data hashes it was produced with, and
   every run's `provenance.json` records the git SHA and whether the tree was dirty.
 - On-disk formats carry version numbers. Live artifacts use
@@ -643,5 +923,5 @@ filled `.env`. `.gitignore` already excludes `.env`, `.env.*` (except `.env.exam
 `*.key`, `*.pem` and `credentials.json`.
 
 Next: [cli.md](cli.md) for the command reference, [architecture.md](architecture.md) for how
-the layers fit together, and [research.md](research.md) for the methodology the tests
-protect.
+the layers fit together, [research.md](research.md) for the methodology the tests protect,
+and [analytics.md](analytics.md) for the v2.1 analysis tools.

@@ -294,8 +294,9 @@ class DecisionExplanation:
             out.update(final_forecast=self.final_forecast, desk_delta=self.desk_delta, desk=self.desk)
         return _jsonable(out)
 
-    def plot(self) -> Any:
-        return plot_waterfall(self)
+    def plot(self, *, mode: str | None = None) -> Any:
+        """:func:`plot_waterfall` (``mode``: ``"light"`` / ``"dark"``, default the active style)."""
+        return plot_waterfall(self, mode=mode)
 
 
 def _resolve_at(index: pd.DatetimeIndex, at: Any) -> int:
@@ -470,8 +471,9 @@ class PnLAttribution:
                           "by_component": self.by_component.to_dict(orient="index"),
                           "by_year": {str(k): v for k, v in self.by_year.to_dict(orient="index").items()}})
 
-    def plot(self) -> Any:
-        return plot_attribution(self)
+    def plot(self, *, mode: str | None = None) -> Any:
+        """:func:`plot_attribution` (``mode``: ``"light"`` / ``"dark"``, default the active style)."""
+        return plot_attribution(self, mode=mode)
 
 
 def pnl_attribution(source: Any, *, phase: str = "research", component: str = "net") -> PnLAttribution:
@@ -837,168 +839,220 @@ def _jsonable(obj: Any) -> Any:
     return obj
 
 
-_INK, _INK2, _MUTED, _GRID, _SURFACE = "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#fcfcfb"
-_BLUE, _RED, _NEUTRAL = "#2a78d6", "#e34948", "#898781"
-_SERIES = ("#2a78d6", "#e8a33d", "#1f9e89", "#9467bd", "#e34948", "#8c564b", "#bcbd22", "#17becf", "#e377c2",
-           "#4c4c9d")
+# ---- plots (drawn with aurum.viz.style: one palette, light or dark) --------------------------
+#: strategies drawn individually by plot_attribution (categorical slots 0..6; slot 7 = red is
+#: kept free so that red keeps meaning "negative" in the waterfall)
+_MAX_LINES = 7
+
+
+def _palette(mode: str | None) -> dict[str, Any]:
+    from aurum.viz.style import current_mode, palette
+
+    return palette(current_mode() if mode is None else mode)
 
 
 def _figure(size: tuple[float, float]) -> Any:
+    """A pyplot-free constrained-layout Figure; call inside :func:`aurum.viz.style.use_style`
+    so the surface, fonts and ink come from the active mode."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
-    fig = Figure(figsize=size, dpi=110, facecolor=_SURFACE, layout="constrained")
+    fig = Figure(figsize=size, layout="constrained")
     FigureCanvasAgg(fig)
     return fig
 
 
-def _style(ax: Any) -> None:
-    ax.set_facecolor(_SURFACE)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color("#c3c2b7")
-    ax.tick_params(colors=_MUTED, labelcolor=_INK2, length=3, width=0.6)
-    ax.grid(True, axis="y", color=_GRID, linewidth=0.6)
-    ax.set_axisbelow(True)
+def _signed(x: float, fmt: str = "{:+.3f}") -> str:
+    return fmt.format(x).replace("-", "\N{MINUS SIGN}")
 
 
-def plot_waterfall(ex: DecisionExplanation) -> Any:
+def _pct(x: Any) -> str:
+    v = _f(x)
+    return f"{v:.1%}" if math.isfinite(v) else "n/a"
+
+
+def plot_waterfall(ex: DecisionExplanation, *, mode: str | None = None) -> Any:
     """Waterfall from 0 through each strategy's contribution to the raw sum, the clip step and
-    the final combined forecast; the sizing chain is printed underneath. Strategies with a zero
-    contribution (zero weight or a flat forecast) are listed in the caption instead of drawn."""
+    the final combined forecast (plus the LLM desk's step and the final forecast for a live
+    decision); the sizing chain is printed underneath. Strategies with a zero contribution
+    (zero weight or a flat forecast) are listed in the caption instead of drawn. Positive
+    steps are blue, negative red (the diverging pair of :mod:`aurum.viz.style`); totals are
+    ink. ``mode``: ``"light"`` / ``"dark"`` (``None`` = the active
+    :func:`~aurum.viz.style.use_style` mode, light outside one)."""
     import textwrap
 
-    fig = _figure((10.5, 5.6))
-    gs = fig.add_gridspec(2, 1, height_ratios=[4.0, 1.3])
-    ax = fig.add_subplot(gs[0])
-    _style(ax)
-    t = ex.table
-    live = t.loc[t["contribution"].abs() > 1e-12]
-    idle = t.loc[t["contribution"].abs() <= 1e-12]
-    labels, bottoms, heights, colors = [], [], [], []
-    level = 0.0
-    for _, r in live.iterrows():
-        labels.append(f"{r['strategy']}\nf {r['forecast']:+.2f}\nw {r['weight']:.2f}")
-        bottoms.append(level)
-        heights.append(r["contribution"])
-        colors.append(_BLUE if r["contribution"] >= 0 else _RED)
-        level += r["contribution"]
-    fdm = float(t["fdm"].iloc[0]) if len(t) else 1.0
-    labels.append(f"raw sum\n(FDM {fdm:.2f})")
-    bottoms.append(0.0)
-    heights.append(ex.raw_combined)
-    colors.append(_NEUTRAL)
-    clip = ex.clip_adjustment
-    if abs(clip) > 1e-12:
-        labels.append("clip to\n[-1, 1]")
-        bottoms.append(ex.raw_combined)
-        heights.append(clip)
-        colors.append("#c3c2b7")
-    labels.append("combined\nforecast")
-    bottoms.append(0.0)
-    heights.append(ex.combined)
-    colors.append(_INK)
-    if ex.final_forecast is not None and abs(ex.desk_delta) > 1e-12:   # live: the LLM desk's step
-        action = (ex.desk or {}).get("action") or (ex.desk or {}).get("status") or "desk"
-        labels.append(f"LLM desk\n({action})")
-        bottoms.append(ex.combined)
-        heights.append(ex.desk_delta)
-        colors.append("#9467bd")
-        labels.append("final\nforecast")
+    from aurum.viz.style import style_axes, use_style
+
+    pal = _palette(mode)
+    pos, neg = pal["categorical"][0], pal["categorical"][7]
+    with use_style(pal["mode"]):
+        fig = _figure((8.0, 5.4))
+        gs = fig.add_gridspec(2, 1, height_ratios=[4.0, 1.2])
+        ax = fig.add_subplot(gs[0])
+        style_axes(ax, pal["mode"])
+        t = ex.table
+        live = t.loc[t["contribution"].abs() > 1e-12]
+        idle = t.loc[t["contribution"].abs() <= 1e-12]
+        labels, bottoms, heights, colors = [], [], [], []
+        level = 0.0
+        for _, r in live.iterrows():
+            labels.append(f"{r['strategy']}\nf {_signed(r['forecast'], '{:+.2f}')}\nw {r['weight']:.2f}")
+            bottoms.append(level)
+            heights.append(r["contribution"])
+            colors.append(pos if r["contribution"] >= 0 else neg)
+            level += r["contribution"]
+        fdm = float(t["fdm"].iloc[0]) if len(t) else 1.0
+        labels.append(f"raw sum\n(FDM {fdm:.2f})")
         bottoms.append(0.0)
-        heights.append(float(ex.final_forecast))
-        colors.append(_INK)
-    xs = np.arange(len(labels))
-    ax.bar(xs, heights, bottom=bottoms, color=colors, width=0.6, edgecolor="none")
-    for k in range(len(xs) - 1):
-        y = bottoms[k] + heights[k]
-        ax.plot([xs[k] + 0.3, xs[k + 1] - 0.3], [y, y], color=_MUTED, linewidth=0.7, linestyle=":")
-    tops = [b0 + h for b0, h in zip(bottoms, heights, strict=True)]
-    lo = min(0.0, *bottoms, *tops)
-    hi = max(0.0, *bottoms, *tops)
-    pad = 0.12 * max(hi - lo, 0.05)
-    ax.set_ylim(lo - pad, hi + pad)
-    for x, b0, h in zip(xs, bottoms, heights, strict=True):
-        end = b0 + h
-        ax.text(x, end + (pad * 0.15 if h >= 0 else -pad * 0.15), f"{h:+.3f}", ha="center",
-                va="bottom" if h >= 0 else "top", fontsize=8, color=_INK2)
-    ax.axhline(0.0, color=_INK2, linewidth=0.8)
-    ax.set_xticks(xs, labels, fontsize=7.5)
-    ax.set_ylabel("forecast units", color=_INK2)
-    where = f"{ex.fold}, {ex.phase}" if ex.phase == "live" else f"fold {ex.fold}, {ex.phase}"
-    head = f"combined forecast {ex.combined:+.3f}"
-    if ex.final_forecast is not None and abs(ex.desk_delta) > 1e-12:
-        head += f", final {ex.final_forecast:+.3f} after the desk"
-    fig.suptitle(f"Decision at the close of the {ex.time:%Y-%m-%d %H:%M} UTC bar ({where}): {head}", x=0.01,
-                 ha="left", fontsize=10.5, fontweight="bold", color=_INK)
-    cap = "contribution = weight x forecast x FDM; bars stack from 0 to the raw sum"
-    if len(idle):
-        cap += "; zero contribution: " + ", ".join(idle["strategy"])
-    ax.set_title(textwrap.fill(cap, 150), loc="left", fontsize=8.5, color=_INK2)
-    tx = fig.add_subplot(gs[1])
-    tx.axis("off")
-    s = ex.sizing
-    parts = []
-    if math.isfinite(_f(s.get("vol_ann"))):
-        parts.append(f"inputs: vol forecast {s['vol_ann']:.1%}, price {s.get('price', math.nan):,.2f}, equity "
-                     f"{s.get('equity', math.nan):,.0f}, drawdown {s.get('drawdown', 0):.1%}")
-        parts.append(f"notional = {ex.combined:+.3f} x {s.get('target_vol', math.nan):.0%} / {s['vol_ann']:.1%} x "
-                     f"equity = {s.get('raw_notional', math.nan):,.0f} USD; caps {s.get('caps_hit') or 'none'}; "
-                     f"drawdown multiplier {s.get('drawdown_mult', 1.0):.2f}")
-        parts.append(f"lots {s.get('raw_lots', math.nan):+.3f} -> rounded {s.get('rounded_lots', math.nan):+.2f}"
-                     + (" -> rebalance band kept the current position" if s.get("kept_current_band") else "")
-                     + f" -> requested {s.get('replayed_lots', math.nan):+.2f}")
-    elif "equity" in s:
-        parts.append(f"equity {s['equity']:,.0f}, drawdown {s.get('drawdown', 0):.1%} (bars unavailable: sizing "
-                     "not replayed)")
-    if "current_lots" in s:
-        line = f"position {s['current_lots']:+.2f} lots -> requested {s.get('saved_requested_lots', math.nan):+.2f}"
-        if "approved_lots" in s:
-            line += f" -> risk-approved {_f(s.get('approved_lots')):+.2f}"
-        if "filled_lots_next_bar" in s:
-            line += f" -> filled at the next open {s.get('filled_lots_next_bar', math.nan):+.2f}"
-        if s.get("orders_status"):
-            line += f" (orders: {s['orders_status']})"
-        parts.append(line)
-    for iv in ex.risk.get("interventions", []):
-        parts.append(f"risk manager: {iv.get('reasons', '')}")
-    text = "\n".join(textwrap.fill(x, 128, subsequent_indent="    ") for x in parts) or "(no sizing information)"
-    tx.text(0.0, 1.0, text, va="top", ha="left", fontsize=8, color=_INK2, family="monospace",
-            transform=tx.transAxes)
-    return fig
+        heights.append(ex.raw_combined)
+        colors.append(pal["text_muted"])
+        clip = ex.clip_adjustment
+        clip_at = -1
+        if abs(clip) > 1e-12:
+            clip_at = len(labels)
+            labels.append("clip to\n[\N{MINUS SIGN}1, 1]")
+            bottoms.append(ex.raw_combined)
+            heights.append(clip)
+            colors.append("none")
+        labels.append("combined\nforecast")
+        bottoms.append(0.0)
+        heights.append(ex.combined)
+        colors.append(pal["text"])
+        if ex.final_forecast is not None and abs(ex.desk_delta) > 1e-12:   # live: the LLM desk's step
+            action = (ex.desk or {}).get("action") or (ex.desk or {}).get("status") or "desk"
+            labels.append(f"LLM desk\n({action})")
+            bottoms.append(ex.combined)
+            heights.append(ex.desk_delta)
+            colors.append(pal["categorical"][6])
+            labels.append("final\nforecast")
+            bottoms.append(0.0)
+            heights.append(float(ex.final_forecast))
+            colors.append(pal["text"])
+        xs = np.arange(len(labels))
+        ax.bar(xs, heights, bottom=bottoms, color=colors, width=0.62, edgecolor="none", zorder=2)
+        if clip_at >= 0:      # the clip removes forecast: a hatched outline, not a filled step
+            ax.bar([xs[clip_at]], [heights[clip_at]], bottom=[bottoms[clip_at]], width=0.62, fill=False,
+                   hatch="////", edgecolor=pal["text_secondary"], linewidth=0.8, zorder=2)
+        for k in range(len(xs) - 1):
+            y = bottoms[k] + heights[k]
+            ax.plot([xs[k] + 0.31, xs[k + 1] - 0.31], [y, y], color=pal["text_muted"], linewidth=0.75,
+                    linestyle=":", zorder=1)
+        tops = [b0 + h for b0, h in zip(bottoms, heights, strict=True)]
+        lo = min(0.0, *bottoms, *tops)
+        hi = max(0.0, *bottoms, *tops)
+        pad = 0.14 * max(hi - lo, 0.05)
+        ax.set_ylim(lo - pad, hi + pad)
+        for x, b0, h in zip(xs, bottoms, heights, strict=True):
+            end = b0 + h
+            ax.text(x, end + (pad * 0.12 if h >= 0 else -pad * 0.12), _signed(h), ha="center",
+                    va="bottom" if h >= 0 else "top", fontsize=8, color=pal["text_secondary"])
+        ax.axhline(0.0, color=pal["text_secondary"], linewidth=0.8, zorder=1.5)
+        ax.set_xticks(xs, labels, fontsize=8 if len(xs) <= 8 else 7)
+        ax.tick_params(axis="x", length=0)
+        ax.set_ylabel("forecast units")
+        where = f"{ex.fold}, {ex.phase}" if ex.phase == "live" else f"fold {ex.fold}, {ex.phase}"
+        head = f"combined forecast {_signed(ex.combined)}"
+        if ex.final_forecast is not None and abs(ex.desk_delta) > 1e-12:
+            head += f", final {_signed(float(ex.final_forecast))} after the desk"
+        fig.suptitle(f"Decision at the close of the {ex.time:%Y-%m-%d %H:%M} UTC bar ({where})", x=0.01,
+                     ha="left", fontsize=11.5, color=pal["text"])
+        cap = head + ". Contribution = weight x forecast x FDM; bars stack from 0 to the raw sum"
+        if len(idle):
+            cap += "; zero contribution: " + ", ".join(idle["strategy"])
+        ax.set_title(textwrap.fill(cap, 120), loc="left", fontsize=8.5, fontweight="normal",
+                     color=pal["text_secondary"])
+        tx = fig.add_subplot(gs[1])
+        tx.axis("off")
+        s = ex.sizing
+        parts = []
+        if math.isfinite(_f(s.get("vol_ann"))):
+            parts.append(f"inputs: vol forecast {s['vol_ann']:.1%}, price {s.get('price', math.nan):,.2f}, equity "
+                         f"{s.get('equity', math.nan):,.0f}, drawdown {_pct(s.get('drawdown'))}")
+            sized = _f(s.get("forecast", ex.combined))          # live: the forecast after the desk
+            parts.append(f"notional = {sized:+.3f} x {s.get('target_vol', math.nan):.0%} / {s['vol_ann']:.1%} x "
+                         f"equity = {s.get('raw_notional', math.nan):,.0f} USD; caps {s.get('caps_hit') or 'none'}; "
+                         f"drawdown multiplier {s.get('drawdown_mult', 1.0):.2f}")
+            parts.append(f"lots {s.get('raw_lots', math.nan):+.3f} -> rounded {s.get('rounded_lots', math.nan):+.2f}"
+                         + (" -> rebalance band kept the current position" if s.get("kept_current_band") else "")
+                         + f" -> requested {s.get('replayed_lots', math.nan):+.2f}")
+        elif "equity" in s:
+            parts.append(f"equity {s['equity']:,.0f}, drawdown {_pct(s.get('drawdown'))} (no sizing breakdown: "
+                         "sizing not replayed)")
+        if "current_lots" in s:
+            line = f"position {s['current_lots']:+.2f} lots -> requested {s.get('saved_requested_lots', math.nan):+.2f}"
+            if "approved_lots" in s:
+                line += f" -> risk-approved {_f(s.get('approved_lots')):+.2f}"
+            if "filled_lots_next_bar" in s:
+                line += f" -> filled at the next open {s.get('filled_lots_next_bar', math.nan):+.2f}"
+            if s.get("orders_status"):
+                line += f" (orders: {s['orders_status']})"
+            parts.append(line)
+        for iv in ex.risk.get("interventions", []):
+            parts.append(f"risk manager: {iv.get('reasons', '')}")
+        text = "\n".join(textwrap.fill(x, 100, subsequent_indent="    ") for x in parts) or "(no sizing information)"
+        tx.text(0.0, 1.0, text, va="top", ha="left", fontsize=7.5, color=pal["text_secondary"], family="monospace",
+                transform=tx.transAxes)
+        return fig
 
 
-def plot_attribution(att: PnLAttribution, *, top: int = 10) -> Any:
-    """Cumulative attributed PnL per strategy (lines) and the book total; per-strategy totals
-    as horizontal bars."""
-    fig = _figure((11.0, 4.4))
-    gs = fig.add_gridspec(1, 2, width_ratios=[2.4, 1.0])
-    ax = fig.add_subplot(gs[0])
-    _style(ax)
-    cum = att.per_bar.cumsum()
-    order = att.totals.abs().sort_values(ascending=False).index[:top]
-    k = 0
-    for col in order:
-        if col == "unattributed":
-            ax.plot(cum.index, cum[col], linewidth=0.9, color=_MUTED, linestyle="--", label=col)
-            continue
-        ax.plot(cum.index, cum[col], linewidth=1.3, color=_SERIES[k % len(_SERIES)], label=col)
-        k += 1
-    ax.plot(cum.index, cum.sum(axis=1), color=_INK, linewidth=2.0, label="book total")
-    ax.axhline(0.0, color=_INK2, linewidth=0.7)
-    ax.set_ylabel(f"cumulative {att.component} PnL (USD)", color=_INK2)
-    leg = ax.legend(loc="upper left", frameon=False, fontsize=7.5, ncol=2)
-    for txt in leg.get_texts():
-        txt.set_color(_INK2)
-    ax.set_title(f"PnL attribution by strategy ({att.phase}): total {att.total_pnl:,.0f} USD", loc="left",
-                 fontsize=10, fontweight="bold", color=_INK)
-    bx = fig.add_subplot(gs[1])
-    _style(bx)
-    tot = att.totals.sort_values()
-    bx.barh(range(len(tot)), tot.to_numpy(), color=[_BLUE if v >= 0 else _RED for v in tot], height=0.6)
-    bx.set_yticks(range(len(tot)), list(tot.index), fontsize=8)
-    bx.axvline(0.0, color=_INK2, linewidth=0.7)
-    bx.grid(True, axis="x", color=_GRID, linewidth=0.6)
-    bx.set_title("total by strategy (USD)", loc="left", fontsize=10, fontweight="bold", color=_INK)
-    return fig
+def plot_attribution(att: PnLAttribution, *, top: int = _MAX_LINES, mode: str | None = None) -> Any:
+    """Cumulative attributed PnL per strategy (lines, the book total in ink, ``unattributed``
+    dashed) above the per-strategy totals (horizontal bars in the same identity colours, so the
+    bar chart doubles as a directly labelled key). The ``top`` strategies by absolute total
+    (at most 7: categorical slots in fixed order) are drawn individually; the rest are summed
+    into ``other strategies``. ``mode`` as in :func:`plot_waterfall`."""
+    from aurum.viz.style import add_legend, style_axes, use_style, zero_line
+
+    pal = _palette(mode)
+    cat = pal["categorical"]
+    with use_style(pal["mode"]):
+        fig = _figure((8.0, 6.4))
+        gs = fig.add_gridspec(2, 1, height_ratios=[3.0, 2.0])
+        ax = fig.add_subplot(gs[0])
+        style_axes(ax, pal["mode"])
+        per_bar = att.per_bar
+        strat = [c for c in att.totals.abs().sort_values(ascending=False).index if c != "unattributed"]
+        shown = strat[:max(0, min(int(top), _MAX_LINES))]
+        rest = [c for c in strat if c not in shown]
+        series: dict[str, pd.Series] = {c: per_bar[c] for c in shown}
+        if rest:
+            series["other strategies"] = per_bar[rest].sum(axis=1)
+        colours = {c: cat[i] for i, c in enumerate(shown)}
+        colours["other strategies"] = pal["text_muted"]
+        for name, s in series.items():
+            ax.plot(s.index, s.cumsum(), color=colours[name], linewidth=1.3, label=name)
+        if "unattributed" in per_bar:
+            ax.plot(per_bar.index, per_bar["unattributed"].cumsum(), color=pal["text_muted"], linewidth=0.9,
+                    linestyle="--", label="unattributed")
+        ax.plot(per_bar.index, per_bar.sum(axis=1).cumsum(), color=pal["text"], label="book total")
+        zero_line(ax, mode=pal["mode"])
+        ax.set_ylabel(f"cumulative {att.component} PnL (USD)")
+        ax.yaxis.set_major_formatter(_usd_formatter())
+        add_legend(ax, mode=pal["mode"], loc="upper left", ncol=3, fontsize=8)
+        ax.set_title(f"PnL attribution by strategy ({att.phase}): total {_signed(att.total_pnl, '{:,.0f}')} USD")
+        bx = fig.add_subplot(gs[1])
+        style_axes(bx, pal["mode"], grid="x")
+        tot = pd.Series({**{c: float(att.totals[c]) for c in shown},
+                         **({"other strategies": float(att.totals[rest].sum())} if rest else {}),
+                         **({"unattributed": float(att.totals["unattributed"])} if "unattributed" in att.totals
+                            else {})}).sort_values()
+        cols = [colours.get(c, pal["text_muted"]) for c in tot.index]
+        ys = np.arange(len(tot))
+        bx.barh(ys, tot.to_numpy(), color=cols, height=0.62)
+        bx.set_yticks(ys, list(tot.index), fontsize=8.5)
+        bx.axvline(0.0, color=pal["text_secondary"], linewidth=0.8)
+        span = float(np.abs(tot.to_numpy()).max()) or 1.0
+        for y, v in zip(ys, tot.to_numpy(), strict=True):
+            bx.annotate(_signed(v, "{:,.0f}" if abs(v) >= 1 else "{:,.2f}"), xy=(v, y), xytext=(4 if v >= 0 else -4, 0), textcoords="offset points",
+                        va="center", ha="left" if v >= 0 else "right", fontsize=8, color=pal["text_secondary"])
+        bx.set_xlim(min(0.0, float(tot.min())) - 0.28 * span, max(0.0, float(tot.max())) + 0.28 * span)
+        bx.xaxis.set_major_formatter(_usd_formatter())
+        bx.set_xlabel(f"total {att.component} PnL (USD)")
+        bx.set_title("Total by strategy")
+        return fig
+
+
+def _usd_formatter() -> Any:
+    from matplotlib.ticker import FuncFormatter
+
+    return FuncFormatter(lambda v, _: f"{v:,.0f}".replace("-", "\N{MINUS SIGN}"))

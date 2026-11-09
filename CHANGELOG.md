@@ -129,6 +129,36 @@ daily trend (`d1_trend`) combined Sharpe -0.29 (DSR 0.002); `managed_gold` combi
 point 16/64 Sharpe 0.24 with DSR 0.19 and a knife-edge plateau (ratio 0.49). No book comes
 close to the protocol's bar.
 
+### Documentation
+
+- **Every algorithm explained with its math and a picture.** Each mechanism on the
+  component pages follows one pattern: the intuition, the exact formula the code evaluates
+  (display equations with every symbol defined, matching the code's windows, clipping,
+  annualisation and defaults), a figure, the function with a runnable example and its real
+  output, a parameter table, and the pitfalls. 205 display equations and 83 Mermaid diagrams
+  (flows, sequences, state machines) across the pages.
+- **New pages:** [docs/models.md](docs/models.md) (EWMA, GARCH(1,1), HAR-RV, the variance
+  blend and the Gaussian HMM, moved out of the portfolio page and extended) and
+  [docs/analytics.md](docs/analytics.md) (sweeps and plateau scores, Monte Carlo stress,
+  decision explanations and PnL attribution, the dashboard). Both are in the MkDocs nav.
+- **Figure pipeline** (`tools/figures`). 126 figures, each drawn by the real aurum code from
+  a registered function in `tools/figures/fig_<page>.py`, rendered in a light and a dark
+  variant (252 PNGs, about 30 MB) with `aurum.viz.style`. Data figures read the real data
+  store and run outputs through loaders that stop at 2024-12-31 and refuse the holdout, a
+  figure whose inputs are missing is skipped and keeps its committed PNGs, and re-renders
+  are byte-identical (`python tools/figures/build.py`, `--check`). A writer guide is in
+  [tools/figures/README.md](tools/figures/README.md).
+- **Theme-aware embeds.** Figures are embedded as `<picture>` blocks that follow the
+  reader's theme on GitHub; the MkDocs hook turns them into light/dark image pairs with a
+  caption that follow the site's theme toggle, and escapes stray currency dollars so they
+  are not read as math.
+- **Docs asset test** (`tests/test_docs_assets.py`): every registered figure has both PNGs,
+  every PNG is registered and referenced, every image reference and relative link (with
+  `#anchor`) resolves, the embeds are well formed, figure modules load no data at import,
+  and the figure loaders stop at the cutoff.
+- The README has a visual documentation section, and the site's links to the source now
+  point at the `main` branch.
+
 ## [2.0.0] - 2026-09-28
 
 Aurum v2 is a ground-up rebuild of this repository as the `aurum` Python package, a

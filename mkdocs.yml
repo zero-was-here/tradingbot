@@ -3,7 +3,8 @@
 #   mkdocs serve                                     # http://127.0.0.1:8000
 #   mkdocs build --strict --site-dir /tmp/aurum-site # the built site is not committed
 # The Markdown is written for GitHub first; docs/_hooks/mkdocs_hooks.py adapts links that
-# leave docs/, GitHub alert blocks and <details> blocks for the site.
+# leave docs/, GitHub alert blocks, <details> blocks, theme-aware <picture> figures and
+# currency dollars for the site. Figures are drawn by tools/figures (see its README.md).
 
 site_name: Aurum v2
 site_description: >-
@@ -12,7 +13,7 @@ site_description: >-
 site_author: zero-was-here
 repo_url: https://github.com/zero-was-here/tradingbot
 repo_name: zero-was-here/tradingbot
-edit_uri: edit/aurum-v2/docs/
+edit_uri: edit/main/docs/
 docs_dir: docs
 copyright: MIT License. Research software, not investment advice.
 
@@ -54,11 +55,14 @@ hooks:
 
 extra:
   # Git ref used for links from the site to files outside docs/ (source code, SPEC.md, ...).
-  source_ref: aurum-v2
+  source_ref: main
 
 extra_javascript:
   - _assets/mathjax.js
   - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+extra_css:
+  - _assets/extra.css
 
 markdown_extensions:
   - abbr
@@ -105,11 +109,13 @@ nav:
       - Research: research.md
       - Research protocol: RESEARCH_PROTOCOL.md
       - Results: RESULTS.md
+      - Analytics: analytics.md
   - Components:
       - Data: data.md
       - Features: features.md
       - Strategies: strategies.md
       - ML and RL: ml-and-rl.md
+      - Volatility and regime models: models.md
       - Portfolio and risk: portfolio-and-risk.md
       - Execution and costs: execution-and-costs.md
       - LLM desk: llm-desk.md
@@ -119,8 +125,8 @@ nav:
   - Reference:
       - Configuration: configuration.md
       - Module interfaces: INTERFACES.md
-      - SPEC.md: https://github.com/zero-was-here/tradingbot/blob/aurum-v2/SPEC.md
+      - SPEC.md: https://github.com/zero-was-here/tradingbot/blob/main/SPEC.md
   - Project:
       - Development: development.md
-      - Changelog: https://github.com/zero-was-here/tradingbot/blob/aurum-v2/CHANGELOG.md
-      - Security: https://github.com/zero-was-here/tradingbot/blob/aurum-v2/SECURITY.md
+      - Changelog: https://github.com/zero-was-here/tradingbot/blob/main/CHANGELOG.md
+      - Security: https://github.com/zero-was-here/tradingbot/blob/main/SECURITY.md

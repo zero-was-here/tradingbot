@@ -16,19 +16,51 @@ new agents on demand**, and makes the call. It can never bypass the risk manager
 > paper-trading platform. The v1 README's claims of "80–120% annual returns" had no evidence
 > behind them and have been removed.
 
-**📚 Documentation:** start at [docs/index.md](docs/index.md). The docs cover:
-[Getting started](docs/getting-started.md), [Architecture](docs/architecture.md),
-[Data](docs/data.md), [Features](docs/features.md), [Strategies](docs/strategies.md),
-[ML & RL](docs/ml-and-rl.md), [Portfolio & risk](docs/portfolio-and-risk.md),
-[Execution & costs](docs/execution-and-costs.md), [Research](docs/research.md),
-[LLM trading desk](docs/llm-desk.md), [Live trading](docs/live-trading.md),
-[Configuration](docs/configuration.md), [CLI reference](docs/cli.md),
-[Development](docs/development.md) and [Results](docs/RESULTS.md).
+## Documentation
+
+The documentation starts at [docs/index.md](docs/index.md) and can also be browsed as a site
+(`pip install -e ".[docs]"`, then `mkdocs serve`). Each algorithm is explained in the same
+order: the intuition, the exact formula the code evaluates (same windows, clipping and
+defaults), a figure, the function with a runnable example, and the pitfalls. Every chart is
+drawn by the aurum code itself from [tools/figures](tools/figures/README.md), in a light and
+a dark variant, on real gold data cut at 2024-12-31, so no chart shows the holdout. Flows,
+sequences and state machines are drawn as Mermaid diagrams.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/_assets/figures/index/gold-research-timeline-dark.png">
+  <img src="docs/_assets/figures/index/gold-research-timeline-light.png" alt="Top panel: gold's daily close from 2012 to 2024 on a log scale, from a 2012 high of 1,793 to a 2015 low of 1,053 and 2,625 at the end of 2024, with the walk-forward out-of-sample period from December 2015 shaded and the 2025 onward holdout shown as an empty hatched band. Bottom panel: 18 walk-forward folds as rows, each a 3-year gray training bar followed by a 6-month blue test bar, stepping forward to the end of 2024">
+</picture>
+
+*The research data and how it is split: every model is refitted on three years and trades the next six months out of sample, and the 18 test windows tile 2015-12-16 to 2024-12-31. Data: XAUUSD D1 (UTC days), Dukascopy bid/ask mid, 2012-2024; folds from `runs/protocol/trend_core_selection`.*
+
+| Topic | Pages |
+|---|---|
+| Start | [Getting started](docs/getting-started.md), [Architecture](docs/architecture.md) (one real decision traced from forecasts to a fill) |
+| Data and signals | [Data](docs/data.md) (point-in-time timing, resampling, macro publication lags), [Features](docs/features.md) (12 causal groups, leakage tests), [Strategies](docs/strategies.md) (all 17, with their math) |
+| Models | [Volatility and regime models](docs/models.md) (EWMA, GARCH, HAR-RV, Gaussian HMM), [ML and RL](docs/ml-and-rl.md) (triple barrier, meta-labelling, the skill gate, the RL environment and PPO) |
+| Portfolio, risk, costs | [Portfolio and risk](docs/portfolio-and-risk.md) (combiner, FDM, HRP, volatility targeting, kill switch, VaR/ES), [Execution and costs](docs/execution-and-costs.md) (fill timing, spread, slippage, financing) |
+| Research | [Research](docs/research.md) (walk-forward, purge and embargo, bootstrap, PSR, DSR, PBO, holdout ledger), [Analytics](docs/analytics.md) (sweeps, Monte Carlo stress, attribution), [Research protocol](docs/RESEARCH_PROTOCOL.md), [Results](docs/RESULTS.md) |
+| Operations | [LLM desk](docs/llm-desk.md), [Live and paper trading](docs/live-trading.md), [CLI reference](docs/cli.md), [Configuration](docs/configuration.md), [Development](docs/development.md) |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/_assets/figures/architecture/decision-chain-dark.png">
+  <img src="docs/_assets/figures/architecture/decision-chain-light.png" alt="Two panels. Top: horizontal bars of the seven strategy forecasts and their weighted contributions for the decision at the close of the 2020-08-11 13:00 UTC bar, with vol_squeeze at minus 1 contributing minus 0.51 and a dashed line at the combined forecast of minus 0.521. Bottom: a chain of dots in lots from the held position of minus 0.10 to the sizer's minus 0.1217, rounded to minus 0.12, outside the shaded no-trade band, approved by risk and filled">
+</picture>
+
+*One decision through the stack ([architecture](docs/architecture.md#one-decision-through-the-stack)): each contribution is weight x FDM x forecast and they add up to the combined forecast of −0.521; at 23.1% volatility the 10% volatility target asks for −0.1217 lots, rounded to −0.12, so 0.02 lots are sold at the next open. Data: `runs/protocol/trend_core_selection` (walk-forward OOS, fold 9), sizing replayed on XAUUSD H1, Dukascopy bid/ask mid, 2013-2024.*
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/_assets/figures/research/dsr-null-dark.png">
+  <img src="docs/_assets/figures/research/dsr-null-light.png" alt="Left: histogram of the best annualised Sharpe among 23 simulated noise strategies over 2,346 days, centred near 0.6, with an orange line at SR0 0.643 and a dashed line at 0.094, the best trend_core book. Right: SR0 against the number of trials on a log axis for 2,346 and 1,862 days, with points at N 23 equal 0.643 and N 30 equal 0.763">
+</picture>
+
+*Why the deflated Sharpe ratio matters ([research](docs/research.md)): the best of 23 skill-less strategies over 2,346 days reaches an annualised Sharpe of about 0.64 by luck alone, far above the best `trend_core` strategy book (0.094), and the bar rises with the number of trials. Data: synthetic null (exact sampling of the Sharpe of iid normal returns, seed 23), not market data.*
 
 ---
 
 ## Contents
 
+- [Documentation](#documentation)
 - [What's inside](#whats-inside)
 - [Architecture](#architecture)
 - [Quick start](#quick-start)
@@ -58,7 +90,7 @@ new agents on demand**, and makes the call. It can never bypass the risk manager
 | **LLM desk** | Claude CIO plus specialists (macro, quant, risk, execution) plus **ad-hoc agents created at runtime**; overlay/advisory/discretionary policies bounded by risk; JSONL audit journal; cost caps |
 | **Live** | Paper broker, MetaTrader 5 adapter (magic-number isolation, retcode handling, filling-mode fallback, persisted server time zone with orders deferred until confirmed), idempotent OMS, bar-close runner with per-decision attribution and in-sleep heartbeats, drift (PSI) and slippage monitoring, webhook alerts, `aurum live status` and a logged, confirmed `aurum live reset-halt` |
 
-About 35k lines of library code and about 1,450 tests.
+About 44k lines of library code and 1,839 tests.
 
 ## Architecture
 
@@ -66,7 +98,7 @@ About 35k lines of library code and about 1,450 tests.
 flowchart LR
   D[("Dukascopy bid/ask<br/>Yahoo · FRED · calendar")] --> PIT["Point-in-time<br/>MarketData"]
   PIT --> F["Feature pipeline<br/>12 causal groups"]
-  PIT --> S["Strategies ×15<br/>forecasts in [-1, 1]"]
+  PIT --> S["Strategies ×17<br/>forecasts in [-1, 1]"]
   F --> S
   S --> C["Combiner<br/>net-of-cost weights · FDM"]
   C --> DESK{{"LLM desk<br/>CIO + specialists<br/>+ ad-hoc agents"}}
@@ -162,9 +194,9 @@ aurum desk replay -c configs/desk_overlay.yaml --start 2024-10-01 --end 2024-12-
 ```
 
 `desk replay` prints the cycle count and cost estimate and refuses to start without `--yes`.
-The per-cycle cost cap is `agents.desk.max_cost_usd_per_cycle` ($2 in `desk_overlay.yaml`,
-$3 if unset), and a replay also stops calling the desk once its total budget
-`agents.replay_max_cost_usd` ($25) is spent. Keep replays before 2025: a window inside the
+The per-cycle cost cap is `agents.desk.max_cost_usd_per_cycle` (USD 2 in `desk_overlay.yaml`,
+USD 3 if unset), and a replay also stops calling the desk once its total budget
+`agents.replay_max_cost_usd` (USD 25) is spent. Keep replays before 2025: a window inside the
 holdout spends it, and the CLI warns. In replay, LLMs may have memorised historical prices;
 `anonymise: true` shifts dates and rebases prices to reduce this, but it cannot remove it.
 Treat desk replays as illustrative, not as evidence.
@@ -269,7 +301,9 @@ aurum/
   cli.py       `aurum` command
   cli_ext.py   analytics commands: sweep, stress, explain (+ dashboard)
 configs/       default, trend_core, fast, live_paper, desk_overlay, d1_trend, managed_gold (exploratory, end 2024)
-docs/          RESEARCH_PROTOCOL, RESULTS, INTERFACES
+docs/          the documentation (index.md, one page per component), RESEARCH_PROTOCOL, RESULTS,
+               INTERFACES; figures in docs/_assets/figures
+tools/figures/ the scripts that draw every documentation figure (light and dark)
 SPEC.md        binding engineering contract between modules
 mt5_ea/        GoldHedgerPro v4 (standalone MQL5 grid EA from v1, see warning below)
 legacy/        the v1 Python code, kept for reference (not maintained)
@@ -278,7 +312,7 @@ legacy/        the v1 Python code, kept for reference (not maintained)
 ## Testing
 
 ```bash
-pytest -m "not network and not slow"   # ~1,900 tests, 10-15 minutes
+pytest -m "not network and not slow"   # 1,832 tests, about 6 minutes on a 10-core machine
 ruff check aurum tests
 ```
 
