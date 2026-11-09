@@ -1552,6 +1552,17 @@ def _check_features(f: FeaturesConfig, rep: ValidationReport) -> None:
     rep.checked.append(f"features (FeaturePipeline, {len(active)} groups)")
 
 
+#: top-level module of an optional dependency -> the pyproject extra that installs it
+_OPTIONAL_EXTRAS: dict[str, str] = {"gymnasium": "rl", "stable_baselines3": "rl", "torch": "rl",
+                                    "anthropic": "agents", "yfinance": "data", "plotly": "viz",
+                                    "MetaTrader5": "mt5"}
+
+
+def _optional_extra(module: str | None) -> str | None:
+    """The extra that provides ``module`` when it is an optional dependency, else None."""
+    return _OPTIONAL_EXTRAS.get((module or "").split(".")[0])
+
+
 def _check_strategies(cfg: AurumConfig, rep: ValidationReport, *, strict: bool) -> None:
     """Every ``strategies[]`` entry (enabled or not) through the registry: unknown parameter
     names and constructor errors are problems; an unknown NAME is a problem when ``strict``
@@ -1587,6 +1598,16 @@ def _check_strategies(cfg: AurumConfig, rep: ValidationReport, *, strict: bool) 
             params["seed"] = cfg.seed
         try:
             cls(**params)
+        except ModuleNotFoundError as exc:
+            extra = _optional_extra(exc.name)
+            if extra is None:
+                rep.problems.append(f"strategies[{i}] ({s.key}): {_exc_text(exc)}")
+            elif s.enabled:
+                rep.problems.append(f"strategies[{i}] ({s.key}): needs the optional package {exc.name!r}, which is "
+                                    f"not installed (pip install 'aurum[{extra}]', or disable the strategy)")
+            else:                                 # a disabled entry cannot fail a run: say what was not checked
+                rep.skipped.append(f"strategies[{i}] ({s.key}, disabled): not built, the optional package "
+                                   f"{exc.name!r} is not installed (pip install 'aurum[{extra}]')")
         except OSError as exc:
             rep.warnings.append(f"strategies[{i}] ({s.key}): {_exc_text(exc)} (commands that build this strategy "
                                 "fail until the file exists)")

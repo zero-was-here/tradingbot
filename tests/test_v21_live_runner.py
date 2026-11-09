@@ -3,10 +3,12 @@ per-decision INFO line and decision attribution (no network, paper broker, fake 
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import re
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -209,7 +211,16 @@ class SpyBroker:
         return wrapped
 
 
-def test_desk_without_api_key_is_refused_before_any_broker_call(world: dict, tmp_path: Path) -> None:
+def _stub_anthropic_if_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The key check runs after the package check: give core installs (no aurum[agents]) an
+    importable stand-in so these tests reach the ANTHROPIC_API_KEY check."""
+    if importlib.util.find_spec("anthropic") is None:
+        monkeypatch.setitem(sys.modules, "anthropic", types.ModuleType("anthropic"))
+
+
+def test_desk_without_api_key_is_refused_before_any_broker_call(world: dict, tmp_path: Path,
+                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_anthropic_if_missing(monkeypatch)
     bars = world["bars"]
     clock = SimulatedClock(bars["available_at"].iloc[600])
     spy = SpyBroker(PaperBroker(ReplayFeed(bars), costs=COSTS, clock=clock))
@@ -262,6 +273,7 @@ def test_main_refuses_desk_without_key_before_connecting(world: dict, tmp_path: 
         raise AssertionError("the broker must not be built when the desk cannot run")
 
     monkeypatch.setattr(runner_mod, "_build_broker", no_broker)
+    _stub_anthropic_if_missing(monkeypatch)
     doc = {"live": {"artifact_dir": str(world["art"]), "state_dir": str(tmp_path / "state"), "calendar": None},
            "desk": {"enabled": True}}
     (tmp_path / "live.yaml").write_text(yaml.safe_dump(doc))

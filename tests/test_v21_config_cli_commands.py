@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import importlib.util
 import logging
 import re
 import sys
@@ -83,10 +84,14 @@ def test_module_docstring_lists_every_command(monkeypatch):
 def test_config_validate_strict_reports_checked_warnings_and_skips(capsys, tmp_path, monkeypatch):
     code, out, _ = run(capsys, "config", "validate", "-c", str(REPO / "configs" / "fast.yaml"))
     assert code == EXIT_OK and "# checked:" in out and "strategies (7 of 7" in out and "# config OK" in out
+    has_rl = all(importlib.util.find_spec(m) is not None for m in ("gymnasium", "stable_baselines3", "torch"))
     cfg = _cfg(tmp_path, {"strategies": [{"name": "rl_ppo", "params": {"artifact_dir": str(tmp_path / "x")}}]})
     monkeypatch.setitem(sys.modules, "aurum.live.runner", None)
-    code, out, _ = run(capsys, "config", "validate", "-c", cfg)
-    assert code == EXIT_OK and "# warning:" in out and "# skipped: live runner settings" in out
+    code, out, err = run(capsys, "config", "validate", "-c", cfg)
+    if has_rl:                       # a missing artifact is only a warning
+        assert code == EXIT_OK and "# warning:" in out and "# skipped: live runner settings" in out
+    else:                            # without aurum[rl] the enabled rl_ppo entry cannot run: a problem
+        assert code == EXIT_USAGE and "needs the optional package" in err and "aurum[rl]" in err
     bad = _cfg(tmp_path, {"strategies": [{"name": "tsmomentum"}, {"name": "ema_cross", "params": {"fst": 2}}],
                           "instrument": {"triple_swap_weekday": 7}}, "bad.yaml")
     code, out, err = run(capsys, "config", "show", "-c", bad)

@@ -4,6 +4,7 @@ ranges, the live runner's own settings, rl.params via rl_config_from_aurum)."""
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import sys
 import types
@@ -15,6 +16,9 @@ import yaml
 from aurum.core.config import ConfigError, ValidationReport, load_config
 
 REPO = Path(__file__).resolve().parents[1]
+
+#: the RL stack (aurum[rl]) is optional: the core and minimum-versions CI jobs do not install it
+HAS_RL = all(importlib.util.find_spec(m) is not None for m in ("gymnasium", "stable_baselines3", "torch"))
 
 
 def _problems(data: dict, *, strict: bool = True) -> list[str]:
@@ -38,10 +42,11 @@ def test_every_problem_is_reported_at_once():
     for needle in ("instrument.triple_swap_weekday", "instrument.rollover_hour_utc", "'trnd'", "did you mean 'trend'",
                    "features.overrides.returns.horizon", "features.warmup", "strategies[0].params (tsmom)",
                    "'horizon' -> 'horizons'", "strategies[1].name: unknown strategy 'emacross'", "ema_cross",
-                   "live.options.on_eror", "did you mean 'on_error'", "rl.params", "n_env",
-                   "walkforward.pbo_splits"):
+                   "live.options.on_eror", "did you mean 'on_error'", "walkforward.pbo_splits"):
         assert needle in text, needle
-    assert len(problems) >= 10
+    if HAS_RL:                       # rl.params are checked through aurum.rl.train (skipped without it)
+        assert "rl.params" in text and "n_env" in text
+    assert len(problems) >= 10 if HAS_RL else len(problems) >= 9
 
 
 def test_check_returns_a_report_without_raising():
@@ -49,8 +54,12 @@ def test_check_returns_a_report_without_raising():
     rep = cfg.check(strict=True)
     assert isinstance(rep, ValidationReport) and rep.ok and rep.problems == []
     joined = " | ".join(rep.checked)
-    for part in ("instrument", "features (FeaturePipeline", "strategies (7 of 7", "live runner settings", "rl.params"):
+    for part in ("instrument", "features (FeaturePipeline", "strategies (7 of 7", "live runner settings"):
         assert part in joined, part
+    if HAS_RL:
+        assert "rl.params" in joined
+    else:                            # listed as skipped, with the extra to install
+        assert any(x.startswith("rl.params") and "aurum[rl]" in x for x in rep.skipped), rep.skipped
     assert rep.raise_if_problems() is rep
     broken = load_config({"strategies": [{"name": "tsmom", "params": {"nope": 1}}]}, env={}, validate=False)
     rep2 = broken.check()
@@ -98,6 +107,7 @@ def test_constructor_errors_and_disabled_entries_are_checked():
     assert len(problems) == 2
 
 
+@pytest.mark.skipif(not HAS_RL, reason="needs the optional RL stack (aurum[rl])")
 def test_missing_rl_artifact_is_only_a_warning(tmp_path):
     data = {"strategies": [{"name": "rl_ppo", "params": {"artifact_dir": str(tmp_path / "not_trained_yet")}}]}
     cfg = load_config(data, env={}, strict=True)              # `aurum rl train` may create it from this config
@@ -252,3 +262,19 @@ def test_validation_writes_nothing(tmp_path, monkeypatch):
     cfg = load_config(p, env={}, strict=True)
     cfg.check(strict=True)
     assert sorted(x.relative_to(tmp_path) for x in tmp_path.rglob("*")) == before
+
+
+def test_missing_optional_package_is_named_with_its_extra(monkeypatch, tmp_path):
+    """Without the RL stack an ENABLED rl_ppo entry is a problem that says what to install; a
+    DISABLED one is listed as skipped (it cannot fail a run)."""
+    monkeypatch.setitem(sys.modules, "gymnasium", None)          # import gymnasium -> ModuleNotFoundError
+    for mod in [m for m in sys.modules if m == "aurum.rl" or m.startswith("aurum.rl.")]:
+        monkeypatch.delitem(sys.modules, mod)                    # re-imported (and refused) on first use
+    rl = {"name": "rl_ppo", "params": {"artifact_dir": str(tmp_path / "policy")}}   # loading it needs the RL stack
+    rep = load_config({"strategies": [rl, {"name": "tsmom"}]}, env={}, validate=False).check(strict=True)
+    assert any("strategies[0] (rl_ppo): needs the optional package 'gymnasium'" in p and "aurum[rl]" in p
+               for p in rep.problems), rep.problems
+    rep2 = load_config({"strategies": [{**rl, "enabled": False}, {"name": "tsmom"}]}, env={},
+                       validate=False).check(strict=True)
+    assert not [p for p in rep2.problems if "rl_ppo" in p], rep2.problems
+    assert any("rl_ppo, disabled" in x and "aurum[rl]" in x for x in rep2.skipped), rep2.skipped

@@ -4,6 +4,7 @@ package exports and the macro requirement in ``aurum features list`` (no network
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
 import types
@@ -244,8 +245,11 @@ def test_new_apis_are_exported_lazily() -> None:
                  "explain_live_decision", "live_decisions", "pnl_attribution", "desk_journal_summary",
                  "record_holdout_look", "forecast_contributions"):
         assert name in research.__all__ and callable(getattr(research, name))
+    has_rl = all(importlib.util.find_spec(m) is not None for m in ("gymnasium", "stable_baselines3", "torch"))
     for name in ("rl_config_from_aurum", "artifact_data_ranges"):
-        assert name in rl.__all__ and callable(getattr(rl, name))
+        assert name in rl.__all__                       # exported lazily: resolving it needs aurum[rl]
+        if has_rl:
+            assert callable(getattr(rl, name))
 
 
 def test_features_list_shows_the_macro_requirement(capsys: pytest.CaptureFixture) -> None:
